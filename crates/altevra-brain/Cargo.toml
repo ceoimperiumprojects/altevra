@@ -1,0 +1,22 @@
+[package]
+name = "altevra-brain"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+altevra-core = { workspace = true }
+altevra-db = { workspace = true }
+altevra-memory = { workspace = true }
+altevra-vault = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

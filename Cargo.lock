@@ -76,11 +76,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "altevra-brain"
+version = "0.1.0"
+dependencies = [
+ "altevra-core",
+ "altevra-db",
+ "altevra-memory",
+ "altevra-vault",
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "altevra-cli"
 version = "0.1.0"
 dependencies = [
  "altevra-adapters",
  "altevra-bootstrap",
+ "altevra-brain",
  "altevra-core",
  "altevra-db",
  "altevra-hooks",

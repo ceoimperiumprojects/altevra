@@ -14,6 +14,7 @@ members = [
     "crates/altevra-research",
     "crates/altevra-secrets",
     "crates/altevra-watcher",
+    "crates/altevra-brain",
 ]
 
 [workspace.dependencies]
@@ -59,4 +60,5 @@ altevra-memory = { path = "crates/altevra-memory" }
 altevra-research = { path = "crates/altevra-research" }
 altevra-secrets = { path = "crates/altevra-secrets" }
 altevra-watcher = { path = "crates/altevra-watcher" }
+altevra-brain = { path = "crates/altevra-brain" }
 tempfile = "3"

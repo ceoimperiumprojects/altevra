@@ -19,6 +19,7 @@ altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
 altevra-secrets = { workspace = true }
 altevra-watcher = { workspace = true }
+altevra-brain = { workspace = true }
 altevra-db = { workspace = true }
 sqlx = { workspace = true }
 libc = "0.2"

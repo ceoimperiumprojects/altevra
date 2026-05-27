@@ -102,6 +102,10 @@ enum Commands {
     /// Continuous embedder worker (drains pending_indexing → Gemini → vectors)
     #[command(subcommand)]
     Embed(commands::embed::EmbedCommands),
+
+    /// Autonomous brain daemon (periodic jobs: observer, classifier, indexer, ...)
+    #[command(subcommand)]
+    Brain(commands::brain::BrainCommands),
 }
 
 #[tokio::main]
@@ -138,5 +142,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,
         Commands::Embed(cmd) => commands::embed::run(cmd).await,
+        Commands::Brain(cmd) => commands::brain::run(cmd).await,
     }
 }
