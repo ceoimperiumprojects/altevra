@@ -13,6 +13,7 @@ members = [
     "crates/altevra-memory",
     "crates/altevra-research",
     "crates/altevra-secrets",
+    "crates/altevra-watcher",
 ]
 
 [workspace.dependencies]
@@ -45,6 +46,7 @@ chacha20poly1305 = "0.10"
 rpassword = "7"
 walkdir = "2"
 strsim = "0.11"
+notify = "6"
 altevra-core = { path = "crates/altevra-core" }
 altevra-db = { path = "crates/altevra-db" }
 altevra-skills = { path = "crates/altevra-skills" }
@@ -56,4 +58,5 @@ altevra-vault = { path = "crates/altevra-vault" }
 altevra-memory = { path = "crates/altevra-memory" }
 altevra-research = { path = "crates/altevra-research" }
 altevra-secrets = { path = "crates/altevra-secrets" }
+altevra-watcher = { path = "crates/altevra-watcher" }
 tempfile = "3"

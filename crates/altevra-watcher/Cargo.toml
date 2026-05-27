@@ -1,0 +1,23 @@
+[package]
+name = "altevra-watcher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+altevra-core = { workspace = true }
+altevra-db = { workspace = true }
+notify = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

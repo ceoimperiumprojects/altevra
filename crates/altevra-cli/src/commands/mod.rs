@@ -18,3 +18,4 @@ pub mod setup;
 pub mod skill;
 pub mod turn;
 pub mod updates;
+pub mod watch;

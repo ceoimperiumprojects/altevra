@@ -94,6 +94,10 @@ enum Commands {
 
     /// Handle a tool hook event (reads JSON from stdin)
     HookHandle(commands::hook_handle::HookHandleArgs),
+
+    /// File watcher daemon — emits FileChanged events and queues for embedding
+    #[command(subcommand)]
+    Watch(commands::watch::WatchCommands),
 }
 
 #[tokio::main]
@@ -128,5 +132,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Session(cmd) => commands::session::run(cmd).await,
         Commands::Turn(args) => commands::turn::run(args).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
+        Commands::Watch(cmd) => commands::watch::run(cmd).await,
     }
 }

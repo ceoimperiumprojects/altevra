@@ -18,8 +18,10 @@ altevra-vault = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
 altevra-secrets = { workspace = true }
+altevra-watcher = { workspace = true }
 altevra-db = { workspace = true }
 sqlx = { workspace = true }
+libc = "0.2"
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
