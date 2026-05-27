@@ -22,6 +22,7 @@ members = [
     "crates/altevra-secrets",
     "crates/altevra-watcher",
     "crates/altevra-brain",
+    "crates/altevra-llm",
 ]
 
 [workspace.dependencies]
@@ -69,4 +70,7 @@ altevra-research = { path = "crates/altevra-research" }
 altevra-secrets = { path = "crates/altevra-secrets" }
 altevra-watcher = { path = "crates/altevra-watcher" }
 altevra-brain = { path = "crates/altevra-brain" }
+altevra-llm = { path = "crates/altevra-llm" }
 tempfile = "3"
+indicatif = "0.17"
+rusqlite = { version = "0.29", features = ["bundled"] }

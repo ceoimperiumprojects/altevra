@@ -91,6 +91,8 @@ async fn handle_session_start(
         cost_usd_estimate: 0.0,
         turn_count: 0,
         metadata: serde_json::json!({"started_via": "hook"}),
+        external_id: None,
+        imported_from: None,
     };
     repo.start_session(&row).await?;
     write_current_session(&row.id)?;

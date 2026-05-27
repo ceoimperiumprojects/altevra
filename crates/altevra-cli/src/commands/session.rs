@@ -135,6 +135,8 @@ async fn run_start(args: SessionStartArgs) -> anyhow::Result<()> {
         cost_usd_estimate: 0.0,
         turn_count: 0,
         metadata: serde_json::json!({}),
+        external_id: None,
+        imported_from: None,
     };
     repo.start_session(&row).await?;
 

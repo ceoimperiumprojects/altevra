@@ -12,6 +12,34 @@ pub enum SetupCommands {
     Repair(SetupRepairArgs),
     /// Show overall setup status for a tool
     Status(SetupStatusArgs),
+    /// v0.3.8 Analyze Everything — import all historical sessions and Obsidian
+    /// vault content into Altevra in one shot
+    AnalyzeEverything(AnalyzeEverythingArgs),
+}
+
+#[derive(Args)]
+pub struct AnalyzeEverythingArgs {
+    /// Show what would be imported without writing anything
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Skip interactive confirmation
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Disable automatic Gemini Flash session summaries
+    #[arg(long)]
+    pub no_llm_summary: bool,
+    /// Only import from a specific tool (claude-code | codex | cursor | antigravity | hermes)
+    #[arg(long)]
+    pub only_tool: Option<String>,
+    /// Limit number of sessions per tool (for testing / partial runs)
+    #[arg(long)]
+    pub limit_per_tool: Option<usize>,
+    /// Path to the Altevra SQLite database
+    #[arg(long, default_value = ".altevra/altevra.db")]
+    pub db: std::path::PathBuf,
+    /// Emit JSON report instead of human-readable text
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -50,7 +78,104 @@ pub async fn run(cmd: SetupCommands) -> anyhow::Result<()> {
         SetupCommands::Verify(args) => run_verify(args).await,
         SetupCommands::Repair(args) => run_repair(args).await,
         SetupCommands::Status(args) => run_status(args).await,
+        SetupCommands::AnalyzeEverything(args) => run_analyze_everything(args).await,
     }
+}
+
+async fn run_analyze_everything(args: AnalyzeEverythingArgs) -> anyhow::Result<()> {
+    use crate::commands::analyze::orchestrator::{
+        open_pool, print_report, run_analyze, AnalyzeOpts,
+    };
+
+    if let Some(parent) = args.db.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let opts = open_pool(&args.db);
+    let pool = sqlx::SqlitePool::connect_with(opts).await?;
+    altevra_db::run_migrations(&pool).await?;
+
+    let analyze_opts = AnalyzeOpts {
+        dry_run: args.dry_run,
+        no_llm_summary: args.no_llm_summary,
+        limit_per_tool: args.limit_per_tool,
+        only_tool: args.only_tool.clone(),
+    };
+
+    // Always run discovery first.
+    let report = crate::commands::analyze::discovery::discover();
+    if !args.json {
+        println!("\nDiscovery:");
+        println!("  Claude Code JSONL files:   {}", report.claude_code_files.len());
+        println!(
+            "  Codex state.sqlite:        {}",
+            if report.codex_state.is_some() { "found" } else { "—" }
+        );
+        println!(
+            "  Codex history.jsonl:       {}",
+            if report.codex_history.is_some() { "found" } else { "—" }
+        );
+        println!("  Cursor chatSessions:       {}", report.cursor_jsonl_files.len());
+        println!(
+            "  Antigravity history.jsonl: {}",
+            if report.antigravity_history.is_some() { "found" } else { "—" }
+        );
+        println!("  Hermes session_*.json:     {}", report.hermes_session_files.len());
+        println!("  Obsidian vaults:           {}", report.obsidian_vaults.len());
+        println!();
+    }
+
+    if args.dry_run {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "dry_run": true,
+                    "total_session_files": report.total_session_files(),
+                    "obsidian_vaults": report.obsidian_vaults.len(),
+                }))?
+            );
+        } else {
+            println!("(dry-run — no changes made)");
+        }
+        return Ok(());
+    }
+
+    if !args.yes {
+        use std::io::{self, Write};
+        print!("Proceed with import? [Y/n] ");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err()
+            || matches!(line.trim().to_lowercase().as_str(), "n" | "no")
+        {
+            println!("aborted");
+            return Ok(());
+        }
+    }
+
+    let (final_report, stats) = run_analyze(&pool, analyze_opts).await?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "report": {
+                    "claude_code_files": final_report.claude_code_files.len(),
+                    "codex_history_present": final_report.codex_history.is_some(),
+                    "cursor_jsonl_files": final_report.cursor_jsonl_files.len(),
+                    "antigravity_present": final_report.antigravity_history.is_some(),
+                    "hermes_files": final_report.hermes_session_files.len(),
+                    "obsidian_vaults": final_report.obsidian_vaults.len(),
+                },
+                "stats": stats,
+            }))?
+        );
+    } else {
+        print_report(&final_report, &stats);
+    }
+    Ok(())
 }
 
 async fn run_verify(args: SetupVerifyArgs) -> anyhow::Result<()> {

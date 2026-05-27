@@ -24,6 +24,13 @@ pub struct SessionRow {
     pub cost_usd_estimate: f64,
     pub turn_count: i64,
     pub metadata: serde_json::Value,
+    /// Tool-native session id (e.g. Claude Code JSONL UUID, Codex thread id,
+    /// Cursor sessionId). Set only by Analyze Everything imports — live
+    /// `altevra session start` leaves it None. Combined with `tool` it is the
+    /// idempotency key for re-runs.
+    pub external_id: Option<String>,
+    /// Absolute path on disk we imported from (for debugging / incremental).
+    pub imported_from: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,8 +77,9 @@ impl<'a> SessionsRepository<'a> {
     pub async fn start_session(&self, s: &SessionRow) -> anyhow::Result<()> {
         sqlx::query(
             r#"INSERT INTO sessions
-                (id, tool, project_id, project_name, started_at, metadata)
-               VALUES (?, ?, ?, ?, ?, ?)"#,
+                (id, tool, project_id, project_name, started_at, metadata,
+                 external_id, imported_from)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(s.id.to_string())
         .bind(&s.tool)
@@ -79,8 +87,74 @@ impl<'a> SessionsRepository<'a> {
         .bind(s.project_name.as_deref())
         .bind(ts_to_text(&s.started_at))
         .bind(s.metadata.to_string())
+        .bind(s.external_id.as_deref())
+        .bind(s.imported_from.as_deref())
         .execute(self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Look up an existing session by `(tool, external_id)`. Returns the row
+    /// when found, used by Analyze Everything to detect duplicates.
+    pub async fn find_by_external(
+        &self,
+        tool: &str,
+        external_id: &str,
+    ) -> anyhow::Result<Option<SessionRow>> {
+        let row = sqlx::query("SELECT * FROM sessions WHERE tool = ? AND external_id = ?")
+            .bind(tool)
+            .bind(external_id)
+            .fetch_optional(self.pool)
+            .await?;
+        Ok(row.map(|r| SessionRow {
+            id: uuid_from_text(r.get::<String, _>("id")),
+            tool: r.get("tool"),
+            project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+            project_name: r.get("project_name"),
+            started_at: ts_from_text(r.get::<String, _>("started_at")),
+            ended_at: opt_ts_from_text(r.get::<Option<String>, _>("ended_at")),
+            summary: r.get("summary"),
+            tokens_in_total: r.get("tokens_in_total"),
+            tokens_out_total: r.get("tokens_out_total"),
+            cost_usd_estimate: r.get("cost_usd_estimate"),
+            turn_count: r.get("turn_count"),
+            metadata: serde_json::from_str(&r.get::<String, _>("metadata"))
+                .unwrap_or(serde_json::json!({})),
+            external_id: r.get("external_id"),
+            imported_from: r.get("imported_from"),
+        }))
+    }
+
+    /// Idempotent insert: if a session with `(tool, external_id)` already
+    /// exists, returns `Ok(None)` and leaves it untouched. Otherwise inserts
+    /// the row and returns `Ok(Some(id))`. Caller decides whether to import
+    /// turns based on the result.
+    pub async fn upsert_imported(&self, s: &SessionRow) -> anyhow::Result<Option<Uuid>> {
+        let ext = match s.external_id.as_deref() {
+            Some(e) if !e.is_empty() => e,
+            _ => anyhow::bail!("upsert_imported requires external_id on SessionRow"),
+        };
+        if let Some(existing) = self.find_by_external(&s.tool, ext).await? {
+            tracing::debug!(
+                tool = %s.tool,
+                external_id = ext,
+                existing_id = %existing.id,
+                "skip duplicate"
+            );
+            return Ok(None);
+        }
+        self.start_session(s).await?;
+        Ok(Some(s.id))
+    }
+
+    /// Set or replace the AI-generated session summary. Used after LLM
+    /// summarization of imported sessions.
+    pub async fn set_summary(&self, session_id: Uuid, summary: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE sessions SET summary = ? WHERE id = ?")
+            .bind(summary)
+            .bind(session_id.to_string())
+            .execute(self.pool)
+            .await?;
         Ok(())
     }
 
@@ -232,6 +306,8 @@ impl<'a> SessionsRepository<'a> {
                 turn_count: r.get("turn_count"),
                 metadata: serde_json::from_str(&r.get::<String, _>("metadata"))
                     .unwrap_or(serde_json::json!({})),
+                external_id: r.get("external_id"),
+                imported_from: r.get("imported_from"),
             })
             .collect())
     }
@@ -255,6 +331,8 @@ impl<'a> SessionsRepository<'a> {
             turn_count: r.get("turn_count"),
             metadata: serde_json::from_str(&r.get::<String, _>("metadata"))
                 .unwrap_or(serde_json::json!({})),
+            external_id: r.get("external_id"),
+            imported_from: r.get("imported_from"),
         }))
     }
 
@@ -369,6 +447,8 @@ impl<'a> SessionsRepository<'a> {
                 turn_count: r.get("turn_count"),
                 metadata: serde_json::from_str(&r.get::<String, _>("metadata"))
                     .unwrap_or(serde_json::json!({})),
+                external_id: r.get("external_id"),
+                imported_from: r.get("imported_from"),
             })
             .collect())
     }
@@ -526,7 +606,55 @@ mod tests {
             cost_usd_estimate: 0.0,
             turn_count: 0,
             metadata: serde_json::json!({}),
+            external_id: None,
+            imported_from: None,
         }
+    }
+
+    #[tokio::test]
+    async fn upsert_imported_is_idempotent() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let mut s = sample_session();
+        s.external_id = Some("uuid-abc-123".into());
+        s.imported_from = Some("/tmp/fixture.jsonl".into());
+
+        let first = repo.upsert_imported(&s).await.unwrap();
+        assert_eq!(first, Some(s.id));
+
+        // Second call with the same external_id must skip.
+        let mut s2 = sample_session();
+        s2.external_id = Some("uuid-abc-123".into());
+        let second = repo.upsert_imported(&s2).await.unwrap();
+        assert!(second.is_none());
+
+        // find_by_external returns the original row.
+        let found = repo
+            .find_by_external("claude-code", "uuid-abc-123")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, s.id);
+    }
+
+    #[tokio::test]
+    async fn upsert_requires_external_id() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        let result = repo.upsert_imported(&s).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn set_summary_updates_row() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        repo.start_session(&s).await.unwrap();
+        repo.set_summary(s.id, "Built v0.3.8 importer.").await.unwrap();
+        let fetched = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(fetched.summary.as_deref(), Some("Built v0.3.8 importer."));
     }
 
     #[tokio::test]

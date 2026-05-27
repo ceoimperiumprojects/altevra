@@ -174,6 +174,8 @@ mod tests {
             cost_usd_estimate: 0.0,
             turn_count: 0,
             metadata: serde_json::json!({}),
+            external_id: None,
+            imported_from: None,
         };
         repo.start_session(&s).await.unwrap();
         repo.record_turn(&TurnRow {

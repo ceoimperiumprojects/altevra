@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod analyze;
 pub mod banner;
 pub mod brain;
 pub mod config;

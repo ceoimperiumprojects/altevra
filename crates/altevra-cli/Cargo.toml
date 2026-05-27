@@ -24,7 +24,13 @@ altevra-secrets = { workspace = true }
 altevra-watcher = { workspace = true }
 altevra-brain = { workspace = true }
 altevra-db = { workspace = true }
+altevra-llm = { workspace = true }
 sqlx = { workspace = true }
+indicatif = { workspace = true }
+rusqlite = { workspace = true }
+walkdir = { workspace = true }
+serde_yaml = { workspace = true }
+async-trait = { workspace = true }
 libc = "0.2"
 clap = { workspace = true }
 serde = { workspace = true }
