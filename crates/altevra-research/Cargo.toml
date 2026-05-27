@@ -17,6 +17,8 @@ tokio = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 feed-rs = "2"
+url = "2"
+async-trait = { workspace = true }
 altevra-core = { workspace = true }
 altevra-vault = { workspace = true }
 

@@ -77,6 +77,8 @@ impl BrainScheduler {
             JobKind::VaultIndexer,
             JobKind::InsightSynthesizer,
             JobKind::ResearchFetcher,
+            JobKind::FeedDiscovery,
+            JobKind::GitHubTrendingFetch,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
         ] {
@@ -290,14 +292,21 @@ mod tests {
         let cfg = BrainConfig {
             vault_path: tmp.path().to_path_buf(),
             db_path: tmp.path().join("altevra.db"),
-            disabled: vec!["daily_summary".into()],
+            // Disable network-dependent jobs (research/discovery/trending)
+            // and the daily-only gate. Leaves 5 deterministic jobs.
+            disabled: vec![
+                "daily_summary".into(),
+                "feed_discovery".into(),
+                "github_trending_fetch".into(),
+                "research_fetcher".into(),
+            ],
             ..BrainConfig::default()
         };
         let mut sched = BrainScheduler::new(cfg, pool.clone());
         let n = sched.tick().await.unwrap();
-        assert!(n >= 6, "expected at least 6 jobs to run, got {n}");
+        assert!(n >= 5, "expected at least 5 jobs to run, got {n}");
         let status = BrainScheduler::status(&pool).await.unwrap();
-        assert!(status.jobs_done + status.jobs_failed >= 6);
+        assert!(status.jobs_done + status.jobs_failed >= 5);
     }
 
     #[tokio::test]
@@ -307,12 +316,17 @@ mod tests {
         let cfg = BrainConfig {
             vault_path: tmp.path().to_path_buf(),
             db_path: tmp.path().join("altevra.db"),
-            disabled: vec!["daily_summary".into()],
+            disabled: vec![
+                "daily_summary".into(),
+                "feed_discovery".into(),
+                "github_trending_fetch".into(),
+                "research_fetcher".into(),
+            ],
             ..BrainConfig::default()
         };
         let mut sched = BrainScheduler::new(cfg, pool.clone());
         let first = sched.tick().await.unwrap();
-        assert!(first >= 6);
+        assert!(first >= 5);
         let second = sched.tick().await.unwrap();
         assert_eq!(
             second, 0,
@@ -334,6 +348,8 @@ mod tests {
                 "vault_indexer".into(),
                 "insight_synthesizer".into(),
                 "research_fetcher".into(),
+                "feed_discovery".into(),
+                "github_trending_fetch".into(),
                 "task_grooming".into(),
             ],
             ..BrainConfig::default()

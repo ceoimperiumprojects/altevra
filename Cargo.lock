@@ -238,6 +238,7 @@ dependencies = [
  "altevra-core",
  "altevra-vault",
  "anyhow",
+ "async-trait",
  "chrono",
  "feed-rs",
  "hex",
@@ -250,6 +251,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "url",
  "uuid",
 ]
 

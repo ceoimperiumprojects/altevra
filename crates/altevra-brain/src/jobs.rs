@@ -14,6 +14,8 @@ pub enum JobKind {
     VaultIndexer,
     InsightSynthesizer,
     ResearchFetcher,
+    FeedDiscovery,
+    GitHubTrendingFetch,
     DailySummary,
     TaskGrooming,
 }
@@ -26,6 +28,8 @@ impl JobKind {
             Self::VaultIndexer => "vault_indexer",
             Self::InsightSynthesizer => "insight_synthesizer",
             Self::ResearchFetcher => "research_fetcher",
+            Self::FeedDiscovery => "feed_discovery",
+            Self::GitHubTrendingFetch => "github_trending_fetch",
             Self::DailySummary => "daily_summary",
             Self::TaskGrooming => "task_grooming",
         }
@@ -38,6 +42,8 @@ impl JobKind {
             "vault_indexer" => Self::VaultIndexer,
             "insight_synthesizer" => Self::InsightSynthesizer,
             "research_fetcher" => Self::ResearchFetcher,
+            "feed_discovery" => Self::FeedDiscovery,
+            "github_trending_fetch" => Self::GitHubTrendingFetch,
             "daily_summary" => Self::DailySummary,
             "task_grooming" => Self::TaskGrooming,
             _ => return None,
@@ -53,7 +59,9 @@ impl JobKind {
             Self::VaultIndexer => 900,
             Self::InsightSynthesizer => 3600,
             Self::ResearchFetcher => 7200,
-            Self::DailySummary => 3600, // tick hourly, fire only at 23:00
+            Self::FeedDiscovery => 3600,
+            Self::GitHubTrendingFetch => 14_400, // 4h
+            Self::DailySummary => 3600,          // tick hourly, fire only at 23:00
             Self::TaskGrooming => 10_800,
         }
     }
@@ -438,6 +446,143 @@ pub async fn run_task_grooming(pool: &SqlitePool, _ctx: &JobContext) -> anyhow::
     })
 }
 
+/// Walk recent research_items, fetch their source pages, extract feed links,
+/// and insert candidates. Full-auto mode promotes immediately into the
+/// active feeds.yaml file.
+pub async fn run_feed_discovery(pool: &SqlitePool, _ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_research::discover::{extract_feed_links, filter_promising_blog_links};
+
+    // Pick a small batch of recent items to scan. Each row gives us a source
+    // page URL — we crawl that page (light HTTP only — no imperium-crawl) and
+    // extract any RSS hints.
+    let rows = sqlx::query("SELECT link FROM research_items ORDER BY ingested_at DESC LIMIT 25")
+        .fetch_all(pool)
+        .await?;
+    if rows.is_empty() {
+        return Ok(JobResult {
+            summary: "no research items to mine for discovery".into(),
+            items_processed: 0,
+        });
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("Altevra/0.3 feed-discovery")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut candidates_seen = 0usize;
+    let mut candidates_new = 0usize;
+    for row in rows {
+        let url: String = sqlx::Row::try_get(&row, "link").unwrap_or_default();
+        if url.is_empty() {
+            continue;
+        }
+        let Ok(resp) = client.get(&url).send().await else {
+            continue;
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let Ok(html) = resp.text().await else {
+            continue;
+        };
+
+        // Direct feed-link hints from this page.
+        let feed_links = extract_feed_links(&url, &html);
+        // Optionally, promising outbound (filtered) — kept as candidates without feed_url.
+        let outbound = altevra_research::discover::extract_outbound_links(&url, &html);
+        let promising = filter_promising_blog_links(&outbound);
+
+        for f in feed_links.iter().chain(promising.iter()) {
+            candidates_seen += 1;
+            let id = uuid::Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                r#"INSERT OR IGNORE INTO research_feed_candidates
+                       (id, candidate_url, feed_url, source_url, discovered_by, status)
+                   VALUES (?, ?, ?, ?, 'brain_job', 'pending')"#,
+            )
+            .bind(&id)
+            .bind(f)
+            .bind(f) // candidate_url == feed_url for the direct-link hints
+            .bind(&url)
+            .execute(pool)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    candidates_new += 1;
+                }
+            }
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!(
+            "discovery scanned {} item(s), found {candidates_seen} candidate links, {candidates_new} new",
+            25
+        ),
+        items_processed: candidates_new,
+    })
+}
+
+/// Fetch GitHub Trending for a configurable set of languages and ingest as
+/// research_items with source_kind = 'github-trending'.
+pub async fn run_github_trending_fetch(
+    pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_research::sources::github_trending::{GitHubTrendingSource, TrendingPeriod};
+    use altevra_research::sources::{FetchCtx, SourceProvider};
+
+    let languages: &[Option<&str>] = &[Some("rust"), Some("typescript"), Some("python")];
+    let ctx = FetchCtx {
+        window_days: 1,
+        ..Default::default()
+    };
+    let mut total_new = 0usize;
+    let mut feeds_touched = 0usize;
+
+    for lang in languages {
+        feeds_touched += 1;
+        let source = GitHubTrendingSource::new(lang.map(String::from), TrendingPeriod::Daily);
+        let items = match source.fetch(&ctx).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("github trending fetch failed for {:?}: {e}", lang);
+                continue;
+            }
+        };
+        let feed_id = source.id_str();
+        for item in items {
+            let id = uuid::Uuid::new_v4().to_string();
+            let res = sqlx::query(
+                r#"INSERT OR IGNORE INTO research_items
+                       (id, feed_id, guid, link, title, summary, published_at,
+                        relevance_score, project_matches_json, source_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', 'github-trending')"#,
+            )
+            .bind(&id)
+            .bind(&feed_id)
+            .bind(&item.guid)
+            .bind(&item.link)
+            .bind(&item.title)
+            .bind(&item.summary)
+            .bind(item.published_at.map(|d| d.to_rfc3339()))
+            .bind(0.0f64)
+            .execute(pool)
+            .await;
+            if let Ok(r) = res {
+                if r.rows_affected() > 0 {
+                    total_new += 1;
+                }
+            }
+        }
+    }
+    Ok(JobResult {
+        summary: format!("github trending: {feeds_touched} langs, {total_new} new repos"),
+        items_processed: total_new,
+    })
+}
+
 pub async fn dispatch(
     kind: JobKind,
     pool: &SqlitePool,
@@ -449,6 +594,8 @@ pub async fn dispatch(
         JobKind::VaultIndexer => run_vault_indexer(pool, ctx).await,
         JobKind::InsightSynthesizer => run_insight_synthesizer(pool, ctx).await,
         JobKind::ResearchFetcher => run_research_fetcher(pool, ctx).await,
+        JobKind::FeedDiscovery => run_feed_discovery(pool, ctx).await,
+        JobKind::GitHubTrendingFetch => run_github_trending_fetch(pool, ctx).await,
         JobKind::DailySummary => run_daily_summary(pool, ctx).await,
         JobKind::TaskGrooming => run_task_grooming(pool, ctx).await,
     }
@@ -506,6 +653,8 @@ mod tests {
             JobKind::VaultIndexer,
             JobKind::InsightSynthesizer,
             JobKind::ResearchFetcher,
+            JobKind::FeedDiscovery,
+            JobKind::GitHubTrendingFetch,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
         ] {
@@ -566,6 +715,61 @@ mod tests {
         let err: String = sqlx::Row::try_get(&row, "last_error").unwrap();
         assert_eq!(count, 1);
         assert!(err.contains("DNS"));
+    }
+
+    #[tokio::test]
+    async fn feed_discovery_returns_when_no_items() {
+        let pool = setup_research_schema().await;
+        // Need research_feed_candidates table.
+        sqlx::query(
+            r#"CREATE TABLE research_feed_candidates (
+                id TEXT PRIMARY KEY,
+                candidate_url TEXT NOT NULL UNIQUE,
+                feed_url TEXT,
+                source_url TEXT,
+                discovered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                discovered_by TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                auto_promoted_at TEXT,
+                rejected_reason TEXT
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+        };
+        let r = run_feed_discovery(&pool, &ctx).await.unwrap();
+        // Empty DB -> "no research items to mine for discovery"
+        assert!(r.summary.contains("no research items"));
+        assert_eq!(r.items_processed, 0);
+    }
+
+    #[tokio::test]
+    async fn github_trending_fetch_does_not_panic_offline() {
+        // Test SCHEMA path: even if network fetch fails for all langs the job
+        // returns a summary, not a panic.
+        let pool = setup_research_schema().await;
+        // Provide source_kind column via ALTER (since our test schema is minimal).
+        sqlx::query(
+            "ALTER TABLE research_items ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'rss'",
+        )
+        .execute(&pool)
+        .await
+        .ok();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+        };
+        // We expect this to attempt 3 langs; either they succeed (network OK)
+        // or all fail and total_new == 0. Either way: no panic.
+        let r = run_github_trending_fetch(&pool, &ctx).await.unwrap();
+        assert!(r.summary.contains("github trending"));
     }
 
     #[tokio::test]

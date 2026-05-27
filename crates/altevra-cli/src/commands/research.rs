@@ -1,8 +1,9 @@
 use altevra_research::{
+    discover::{extract_feed_links, extract_outbound_links, filter_promising_blog_links},
     feeds::{FeedConfig, FeedKind, FeedSource, ProjectKeywordsSource},
     fetcher::{fetch_feed, FetchCacheHints},
     relevance::{default_imperium_projects_path, load_imperium_projects, matching_projects},
-    scrape_url, synthesize, ResearchPipeline, ScoredItem, SynthesisInput,
+    scrape_url, sources, synthesize, ResearchPipeline, ScoredItem, SynthesisInput,
 };
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -20,6 +21,8 @@ pub enum ResearchCommands {
     Feeds(FeedsCommands),
     /// Fetch all enabled feeds once, score and write briefs
     RunNow(RunNowArgs),
+    /// Fetch GitHub Trending repos for a given language
+    Trending(TrendingArgs),
 }
 
 #[derive(Subcommand)]
@@ -32,6 +35,69 @@ pub enum FeedsCommands {
     List(FeedsListArgs),
     /// Remove a feed by id
     Remove(FeedsRemoveArgs),
+    /// Scan a URL for RSS/Atom feed links and (optionally) auto-promote them
+    Discover(FeedsDiscoverArgs),
+    /// List discovered feed candidates from the brain's discovery queue
+    Candidates(FeedsCandidatesArgs),
+    /// Promote a discovered candidate into the active feeds.yaml
+    Promote(FeedsPromoteArgs),
+    /// Reject a discovered candidate (won't be auto-added on future runs)
+    Reject(FeedsRejectArgs),
+}
+
+#[derive(Args)]
+pub struct FeedsDiscoverArgs {
+    pub url: String,
+    /// Add discovered feeds to feeds.yaml immediately
+    #[arg(long)]
+    pub auto_promote: bool,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct FeedsCandidatesArgs {
+    /// Filter by status: pending | promoted | rejected
+    #[arg(long, default_value = "pending")]
+    pub status: String,
+    #[arg(long, default_value_t = 50)]
+    pub limit: i64,
+    #[arg(long, default_value = ".altevra/altevra.db")]
+    pub db: std::path::PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct FeedsPromoteArgs {
+    pub candidate_id: String,
+    #[arg(long, default_value_t = 0.5)]
+    pub trust_weight: f32,
+    #[arg(long, default_value = ".altevra/altevra.db")]
+    pub db: std::path::PathBuf,
+}
+
+#[derive(Args)]
+pub struct FeedsRejectArgs {
+    pub candidate_id: String,
+    #[arg(long)]
+    pub reason: Option<String>,
+    #[arg(long, default_value = ".altevra/altevra.db")]
+    pub db: std::path::PathBuf,
+}
+
+#[derive(Args)]
+pub struct TrendingArgs {
+    /// Language slug: rust, typescript, python (None = all languages)
+    #[arg(long)]
+    pub lang: Option<String>,
+    /// Time window: daily | weekly | monthly
+    #[arg(long, default_value = "daily")]
+    pub since: String,
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -133,6 +199,7 @@ pub async fn run(cmd: ResearchCommands) -> anyhow::Result<()> {
         ResearchCommands::Synthesize(args) => run_synthesize(args).await,
         ResearchCommands::Feeds(cmd) => run_feeds(cmd).await,
         ResearchCommands::RunNow(args) => run_now(args).await,
+        ResearchCommands::Trending(args) => run_trending(args).await,
     }
 }
 
@@ -197,7 +264,248 @@ async fn run_feeds(cmd: FeedsCommands) -> anyhow::Result<()> {
         FeedsCommands::Add(args) => run_feeds_add(args).await,
         FeedsCommands::List(args) => run_feeds_list(args).await,
         FeedsCommands::Remove(args) => run_feeds_remove(args).await,
+        FeedsCommands::Discover(args) => run_feeds_discover(args).await,
+        FeedsCommands::Candidates(args) => run_feeds_candidates(args).await,
+        FeedsCommands::Promote(args) => run_feeds_promote(args).await,
+        FeedsCommands::Reject(args) => run_feeds_reject(args).await,
     }
+}
+
+async fn run_feeds_discover(args: FeedsDiscoverArgs) -> anyhow::Result<()> {
+    // Reuse the existing scrape helper (which already does reqwest behind the scenes)
+    // — we only need the HTML body here, not the readable text.
+    let page = scrape_url(&args.url).await?;
+    let status = page.status;
+    let html = &page.html;
+    let feed_links = extract_feed_links(&args.url, html);
+    let outbound = extract_outbound_links(&args.url, html);
+    let promising = filter_promising_blog_links(&outbound);
+
+    let mut promoted_count = 0;
+    if args.auto_promote {
+        let cfg_path = FeedConfig::default_path();
+        let mut cfg = if cfg_path.exists() {
+            FeedConfig::load(&cfg_path)?
+        } else {
+            altevra_research::default_feeds()
+        };
+        for f in &feed_links {
+            let id = slugify_url(f);
+            if cfg.find(&id).is_some() {
+                continue;
+            }
+            let _ = cfg.add(FeedSource {
+                id,
+                name: f.clone(),
+                url: f.clone(),
+                kind: FeedKind::Rss,
+                category: "auto-discovered".into(),
+                trust_weight: 0.5,
+                enabled: true,
+                fetch_interval_minutes: 180,
+            });
+            promoted_count += 1;
+        }
+        cfg.save(&cfg_path)?;
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "url": args.url,
+                "status": status,
+                "feed_links": feed_links,
+                "promising_outbound": promising,
+                "auto_promote": args.auto_promote,
+                "promoted_count": promoted_count,
+            }))?
+        );
+    } else {
+        println!("Status: {status}");
+        println!("Feed links ({}):", feed_links.len());
+        for f in &feed_links {
+            println!("  {f}");
+        }
+        if !promising.is_empty() {
+            println!("Promising outbound ({}):", promising.len());
+            for l in promising.iter().take(10) {
+                println!("  {l}");
+            }
+        }
+        if args.auto_promote {
+            println!("Promoted {promoted_count} new feed(s) into feeds.yaml");
+        }
+    }
+    Ok(())
+}
+
+async fn run_feeds_candidates(args: FeedsCandidatesArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let rows = sqlx::query(
+        r#"SELECT id, candidate_url, feed_url, source_url, discovered_at, status, discovered_by
+           FROM research_feed_candidates
+           WHERE status = ?
+           ORDER BY discovered_at DESC LIMIT ?"#,
+    )
+    .bind(&args.status)
+    .bind(args.limit)
+    .fetch_all(&pool)
+    .await?;
+
+    let entries: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": sqlx::Row::try_get::<String, _>(r, "id").unwrap_or_default(),
+                "candidate_url": sqlx::Row::try_get::<String, _>(r, "candidate_url").unwrap_or_default(),
+                "feed_url": sqlx::Row::try_get::<Option<String>, _>(r, "feed_url").unwrap_or(None),
+                "source_url": sqlx::Row::try_get::<Option<String>, _>(r, "source_url").unwrap_or(None),
+                "discovered_at": sqlx::Row::try_get::<String, _>(r, "discovered_at").unwrap_or_default(),
+                "discovered_by": sqlx::Row::try_get::<Option<String>, _>(r, "discovered_by").unwrap_or(None),
+                "status": sqlx::Row::try_get::<String, _>(r, "status").unwrap_or_default(),
+            })
+        })
+        .collect();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": args.status,
+                "count": entries.len(),
+                "candidates": entries,
+            }))?
+        );
+    } else if entries.is_empty() {
+        println!("No candidates with status '{}'", args.status);
+    } else {
+        println!("{} candidate(s) [{}]:", entries.len(), args.status);
+        for e in &entries {
+            println!(
+                "  {} {} (from {})",
+                &e["id"].as_str().unwrap_or("")[..8],
+                e["candidate_url"].as_str().unwrap_or(""),
+                e["source_url"].as_str().unwrap_or("-")
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_feeds_promote(args: FeedsPromoteArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let row =
+        sqlx::query("SELECT candidate_url, feed_url FROM research_feed_candidates WHERE id = ?")
+            .bind(&args.candidate_id)
+            .fetch_optional(&pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no candidate with id {}", args.candidate_id))?;
+    let candidate_url: String = sqlx::Row::try_get(&row, "candidate_url")?;
+    let feed_url: Option<String> = sqlx::Row::try_get(&row, "feed_url").ok();
+    let target_url = feed_url.unwrap_or(candidate_url.clone());
+
+    let cfg_path = FeedConfig::default_path();
+    let mut cfg = if cfg_path.exists() {
+        FeedConfig::load(&cfg_path)?
+    } else {
+        altevra_research::default_feeds()
+    };
+    let id = slugify_url(&target_url);
+    if cfg.find(&id).is_none() {
+        cfg.add(FeedSource {
+            id: id.clone(),
+            name: target_url.clone(),
+            url: target_url.clone(),
+            kind: FeedKind::Rss,
+            category: "auto-discovered".into(),
+            trust_weight: args.trust_weight,
+            enabled: true,
+            fetch_interval_minutes: 180,
+        })?;
+        cfg.save(&cfg_path)?;
+    }
+
+    sqlx::query(
+        "UPDATE research_feed_candidates SET status = 'promoted', auto_promoted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+    )
+    .bind(&args.candidate_id)
+    .execute(&pool)
+    .await?;
+
+    println!("Promoted candidate {} -> feed '{id}'", args.candidate_id);
+    Ok(())
+}
+
+async fn run_feeds_reject(args: FeedsRejectArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let reason = args.reason.unwrap_or_else(|| "manual reject".into());
+    let n = sqlx::query(
+        "UPDATE research_feed_candidates SET status = 'rejected', rejected_reason = ? WHERE id = ?",
+    )
+    .bind(&reason)
+    .bind(&args.candidate_id)
+    .execute(&pool)
+    .await?
+    .rows_affected();
+    if n == 0 {
+        anyhow::bail!("no candidate with id {}", args.candidate_id);
+    }
+    println!("Rejected candidate {} ({reason})", args.candidate_id);
+    Ok(())
+}
+
+async fn run_trending(args: TrendingArgs) -> anyhow::Result<()> {
+    let period = match args.since.as_str() {
+        "weekly" => sources::github_trending::TrendingPeriod::Weekly,
+        "monthly" => sources::github_trending::TrendingPeriod::Monthly,
+        _ => sources::github_trending::TrendingPeriod::Daily,
+    };
+    let source = sources::github_trending::GitHubTrendingSource::new(args.lang.clone(), period);
+    let ctx = sources::FetchCtx {
+        window_days: 1,
+        ..Default::default()
+    };
+    use sources::SourceProvider;
+    let items = source.fetch(&ctx).await?;
+    let limit = args.limit.min(items.len());
+    let slice = &items[..limit];
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "language": args.lang,
+                "since": args.since,
+                "count": slice.len(),
+                "items": slice,
+            }))?
+        );
+    } else {
+        println!(
+            "GitHub Trending ({}{}, {}):",
+            args.lang.as_deref().unwrap_or("all"),
+            if args.lang.is_some() { "" } else { " langs" },
+            args.since
+        );
+        for it in slice {
+            println!("  {} — {}", it.title, it.link);
+            if !it.summary.is_empty() {
+                println!("    {}", truncate(&it.summary, 120));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
 }
 
 fn feeds_path(override_path: Option<PathBuf>) -> PathBuf {
