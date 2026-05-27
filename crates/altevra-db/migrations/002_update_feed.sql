@@ -1,27 +1,17 @@
 CREATE TABLE IF NOT EXISTS update_feed (
-    id                          UUID PRIMARY KEY,
-    event_id                    UUID NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-    project_id                  UUID,
+    id                          TEXT PRIMARY KEY,
+    event_id                    TEXT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+    project_id                  TEXT,
     update_type                 TEXT NOT NULL,
     importance                  TEXT NOT NULL DEFAULT 'low',
     title                       TEXT NOT NULL,
     short_summary               TEXT NOT NULL,
     agent_summary               TEXT,
-    affected_entities           JSONB NOT NULL DEFAULT '[]',
+    affected_entities           TEXT NOT NULL DEFAULT '[]',
     recommended_agent_action    TEXT,
-    visible_to_agents           BOOLEAN NOT NULL DEFAULT TRUE,
+    visible_to_agents           INTEGER NOT NULL DEFAULT 1,
     sensitivity                 TEXT NOT NULL DEFAULT 'internal',
-    created_at                  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS update_read_state (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    actor_type          TEXT NOT NULL,
-    actor_id            TEXT NOT NULL,
-    project_id          UUID,
-    last_seen_event_id  UUID REFERENCES events(id),
-    last_seen_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE (actor_type, actor_id, project_id)
+    created_at                  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_update_feed_created_at ON update_feed (created_at DESC);

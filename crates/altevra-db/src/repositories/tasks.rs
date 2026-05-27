@@ -1,6 +1,11 @@
 use chrono::{DateTime, NaiveDate, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use uuid::Uuid;
+
+use crate::util::{
+    date_to_text, opt_date_from_text, opt_ts_from_text, opt_uuid_from_text, ts_from_text,
+    ts_to_text, uuid_from_text,
+};
 
 #[derive(Debug, Clone)]
 pub struct TaskRow {
@@ -54,11 +59,11 @@ pub struct ReviewItemRow {
 }
 
 pub struct TasksRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 impl<'a> TasksRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -67,29 +72,29 @@ impl<'a> TasksRepository<'a> {
             r#"
             INSERT INTO tasks (id, project_id, title, description, status, priority,
                 assignee, due_at, metadata, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (id) DO UPDATE SET
-                title = EXCLUDED.title,
-                description = EXCLUDED.description,
-                status = EXCLUDED.status,
-                priority = EXCLUDED.priority,
-                assignee = EXCLUDED.assignee,
-                due_at = EXCLUDED.due_at,
-                metadata = EXCLUDED.metadata,
-                updated_at = EXCLUDED.updated_at
+                title = excluded.title,
+                description = excluded.description,
+                status = excluded.status,
+                priority = excluded.priority,
+                assignee = excluded.assignee,
+                due_at = excluded.due_at,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
             "#,
         )
-        .bind(t.id)
-        .bind(t.project_id)
+        .bind(t.id.to_string())
+        .bind(t.project_id.map(|u| u.to_string()))
         .bind(&t.title)
         .bind(t.description.as_deref())
         .bind(&t.status)
         .bind(&t.priority)
         .bind(t.assignee.as_deref())
-        .bind(t.due_at)
-        .bind(&t.metadata)
-        .bind(t.created_at)
-        .bind(t.updated_at)
+        .bind(t.due_at.as_ref().map(ts_to_text))
+        .bind(t.metadata.to_string())
+        .bind(ts_to_text(&t.created_at))
+        .bind(ts_to_text(&t.updated_at))
         .execute(self.pool)
         .await?;
         Ok(())
@@ -100,14 +105,17 @@ impl<'a> TasksRepository<'a> {
         project_id: Option<Uuid>,
         limit: i64,
     ) -> anyhow::Result<Vec<TaskRow>> {
+        // SQLite doesn't support `NULLS LAST` in standard ORDER BY but it does
+        // sort NULL first by default for ASC. We emulate NULLS LAST by sorting
+        // on (due_at IS NULL, due_at).
         let rows = if let Some(pid) = project_id {
             sqlx::query(
                 r#"SELECT id, project_id, title, description, status, priority, assignee,
                    due_at, metadata, created_at, updated_at
-                   FROM tasks WHERE project_id = $1 AND status NOT IN ('completed', 'cancelled')
-                   ORDER BY priority DESC, due_at ASC NULLS LAST LIMIT $2"#,
+                   FROM tasks WHERE project_id = ? AND status NOT IN ('completed', 'cancelled')
+                   ORDER BY priority DESC, (due_at IS NULL) ASC, due_at ASC LIMIT ?"#,
             )
-            .bind(pid)
+            .bind(pid.to_string())
             .bind(limit)
             .fetch_all(self.pool)
             .await?
@@ -116,7 +124,7 @@ impl<'a> TasksRepository<'a> {
                 r#"SELECT id, project_id, title, description, status, priority, assignee,
                    due_at, metadata, created_at, updated_at
                    FROM tasks WHERE status NOT IN ('completed', 'cancelled')
-                   ORDER BY priority DESC, due_at ASC NULLS LAST LIMIT $1"#,
+                   ORDER BY priority DESC, (due_at IS NULL) ASC, due_at ASC LIMIT ?"#,
             )
             .bind(limit)
             .fetch_all(self.pool)
@@ -130,16 +138,16 @@ impl<'a> TasksRepository<'a> {
         sqlx::query(
             r#"
             INSERT INTO decisions (id, project_id, title, rationale, decided_at, decided_by, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(d.id)
-        .bind(d.project_id)
+        .bind(d.id.to_string())
+        .bind(d.project_id.map(|u| u.to_string()))
         .bind(&d.title)
         .bind(d.rationale.as_deref())
-        .bind(d.decided_at)
+        .bind(ts_to_text(&d.decided_at))
         .bind(d.decided_by.as_deref())
-        .bind(&d.metadata)
+        .bind(d.metadata.to_string())
         .execute(self.pool)
         .await?;
         Ok(())
@@ -149,9 +157,9 @@ impl<'a> TasksRepository<'a> {
         let rows = if let Some(pid) = project_id {
             sqlx::query(
                 r#"SELECT id, project_id, title, description, target_date, status, metadata,
-                   created_at, updated_at FROM goals WHERE project_id = $1 ORDER BY created_at DESC"#,
+                   created_at, updated_at FROM goals WHERE project_id = ? ORDER BY created_at DESC"#,
             )
-            .bind(pid)
+            .bind(pid.to_string())
             .fetch_all(self.pool)
             .await?
         } else {
@@ -163,55 +171,93 @@ impl<'a> TasksRepository<'a> {
             .await?
         };
 
-        Ok(rows
-            .into_iter()
-            .map(|r| GoalRow {
-                id: r.get("id"),
-                project_id: r.get("project_id"),
-                title: r.get("title"),
-                description: r.get("description"),
-                target_date: r.get("target_date"),
-                status: r.get("status"),
-                metadata: r.get("metadata"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_goal).collect())
+    }
+
+    /// Upsert a goal (used by tests + downstream sync logic). Kept additive
+    /// to the previous public API.
+    pub async fn upsert_goal(&self, g: &GoalRow) -> anyhow::Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO goals (id, project_id, title, description, target_date, status, metadata,
+                created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (id) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                target_date = excluded.target_date,
+                status = excluded.status,
+                metadata = excluded.metadata,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(g.id.to_string())
+        .bind(g.project_id.map(|u| u.to_string()))
+        .bind(&g.title)
+        .bind(g.description.as_deref())
+        .bind(g.target_date.as_ref().map(date_to_text))
+        .bind(&g.status)
+        .bind(g.metadata.to_string())
+        .bind(ts_to_text(&g.created_at))
+        .bind(ts_to_text(&g.updated_at))
+        .execute(self.pool)
+        .await?;
+        Ok(())
     }
 
     pub async fn create_review_item(&self, item: &ReviewItemRow) -> anyhow::Result<()> {
         sqlx::query(
             r#"
             INSERT INTO review_items (id, project_id, kind, title, body, status, created_at, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(item.id)
-        .bind(item.project_id)
+        .bind(item.id.to_string())
+        .bind(item.project_id.map(|u| u.to_string()))
         .bind(&item.kind)
         .bind(&item.title)
         .bind(item.body.as_deref())
         .bind(&item.status)
-        .bind(item.created_at)
-        .bind(&item.metadata)
+        .bind(ts_to_text(&item.created_at))
+        .bind(item.metadata.to_string())
         .execute(self.pool)
         .await?;
         Ok(())
     }
 }
 
-fn row_to_task(r: sqlx::postgres::PgRow) -> TaskRow {
+fn row_to_task(r: SqliteRow) -> TaskRow {
     TaskRow {
-        id: r.get("id"),
-        project_id: r.get("project_id"),
+        id: uuid_from_text(r.get::<String, _>("id")),
+        project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
         title: r.get("title"),
         description: r.get("description"),
         status: r.get("status"),
         priority: r.get("priority"),
         assignee: r.get("assignee"),
-        due_at: r.get("due_at"),
-        metadata: r.get("metadata"),
-        created_at: r.get("created_at"),
-        updated_at: r.get("updated_at"),
+        due_at: opt_ts_from_text(r.get::<Option<String>, _>("due_at")),
+        metadata: r
+            .get::<Option<String>, _>("metadata")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        created_at: ts_from_text(r.get::<String, _>("created_at")),
+        updated_at: ts_from_text(r.get::<String, _>("updated_at")),
+    }
+}
+
+fn row_to_goal(r: SqliteRow) -> GoalRow {
+    GoalRow {
+        id: uuid_from_text(r.get::<String, _>("id")),
+        project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+        title: r.get("title"),
+        description: r.get("description"),
+        target_date: opt_date_from_text(r.get::<Option<String>, _>("target_date")),
+        status: r.get("status"),
+        metadata: r
+            .get::<Option<String>, _>("metadata")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+        created_at: ts_from_text(r.get::<String, _>("created_at")),
+        updated_at: ts_from_text(r.get::<String, _>("updated_at")),
     }
 }

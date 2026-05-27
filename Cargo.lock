@@ -109,9 +109,12 @@ dependencies = [
 name = "altevra-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "serde",
  "serde_json",
+ "strsim",
+ "tempfile",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -125,7 +128,9 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sqlite-vec",
  "sqlx",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -174,17 +179,21 @@ name = "altevra-memory"
 version = "0.1.0"
 dependencies = [
  "altevra-core",
+ "altevra-secrets",
  "altevra-vault",
  "anyhow",
+ "async-trait",
  "chrono",
  "hex",
  "pulldown-cmark",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 
@@ -1913,7 +1922,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2502,6 +2511,15 @@ checksum = "7bba3a93db0cc4f7bdece8bb09e77e2e785c20bfebf79eb8340ed80708048790"
 dependencies = [
  "nom",
  "unicode_categories",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

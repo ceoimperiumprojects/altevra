@@ -1,14 +1,16 @@
 use altevra_core::events::{ActorType, Event, EventStatus, EventType};
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::util::{opt_ts_from_text, opt_uuid_from_text, ts_from_text, ts_to_text, uuid_from_text};
+
 pub struct EventsRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 impl<'a> EventsRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -18,12 +20,12 @@ impl<'a> EventsRepository<'a> {
             INSERT INTO events (id, event_type, project_id, actor_type, actor_id, source,
                 entity_type, entity_id, title, summary, payload, sensitivity, created_at,
                 processed_at, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(event.id)
+        .bind(event.id.to_string())
         .bind(event.event_type.to_string())
-        .bind(event.project_id)
+        .bind(event.project_id.map(|u| u.to_string()))
         .bind(event.actor_type.to_string())
         .bind(event.actor_id.as_deref())
         .bind(&event.source)
@@ -31,10 +33,10 @@ impl<'a> EventsRepository<'a> {
         .bind(event.entity_id.as_deref())
         .bind(&event.title)
         .bind(event.summary.as_deref())
-        .bind(&event.payload)
+        .bind(event.payload.to_string())
         .bind(event.sensitivity.to_string())
-        .bind(event.created_at)
-        .bind(event.processed_at)
+        .bind(ts_to_text(&event.created_at))
+        .bind(event.processed_at.as_ref().map(ts_to_text))
         .bind(event.status.to_string())
         .execute(self.pool)
         .await?;
@@ -47,16 +49,17 @@ impl<'a> EventsRepository<'a> {
         project_id: Option<Uuid>,
         limit: i64,
     ) -> anyhow::Result<Vec<Event>> {
+        let since_text = ts_to_text(&since);
         let rows = if let Some(pid) = project_id {
             sqlx::query(
                 r#"SELECT id, event_type, project_id, actor_type, actor_id, source,
                    entity_type, entity_id, title, summary, payload, sensitivity,
                    created_at, processed_at, status
-                   FROM events WHERE created_at > $1 AND project_id = $2
-                   ORDER BY created_at DESC LIMIT $3"#,
+                   FROM events WHERE created_at > ? AND project_id = ?
+                   ORDER BY created_at DESC LIMIT ?"#,
             )
-            .bind(since)
-            .bind(pid)
+            .bind(since_text)
+            .bind(pid.to_string())
             .bind(limit)
             .fetch_all(self.pool)
             .await?
@@ -65,25 +68,24 @@ impl<'a> EventsRepository<'a> {
                 r#"SELECT id, event_type, project_id, actor_type, actor_id, source,
                    entity_type, entity_id, title, summary, payload, sensitivity,
                    created_at, processed_at, status
-                   FROM events WHERE created_at > $1
-                   ORDER BY created_at DESC LIMIT $2"#,
+                   FROM events WHERE created_at > ?
+                   ORDER BY created_at DESC LIMIT ?"#,
             )
-            .bind(since)
+            .bind(since_text)
             .bind(limit)
             .fetch_all(self.pool)
             .await?
         };
 
-        use sqlx::Row;
         let events = rows
             .into_iter()
             .map(|row| Event {
-                id: row.get("id"),
+                id: uuid_from_text(row.get::<String, _>("id")),
                 event_type: row
                     .get::<String, _>("event_type")
                     .parse()
                     .unwrap_or(EventType::ErrorLogged),
-                project_id: row.get("project_id"),
+                project_id: opt_uuid_from_text(row.get::<Option<String>, _>("project_id")),
                 actor_type: row
                     .get::<String, _>("actor_type")
                     .parse()
@@ -94,13 +96,16 @@ impl<'a> EventsRepository<'a> {
                 entity_id: row.get("entity_id"),
                 title: row.get("title"),
                 summary: row.get("summary"),
-                payload: row.get("payload"),
+                payload: row
+                    .get::<Option<String>, _>("payload")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
                 sensitivity: row
                     .get::<String, _>("sensitivity")
                     .parse()
                     .unwrap_or_default(),
-                created_at: row.get("created_at"),
-                processed_at: row.get("processed_at"),
+                created_at: ts_from_text(row.get::<String, _>("created_at")),
+                processed_at: opt_ts_from_text(row.get::<Option<String>, _>("processed_at")),
                 status: row
                     .get::<String, _>("status")
                     .parse()

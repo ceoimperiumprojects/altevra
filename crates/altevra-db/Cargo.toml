@@ -14,3 +14,17 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+
+# sqlite-vec is optional — when enabled we register the vec0 virtual table
+# extension on connection setup. If the feature is off (default), we still
+# create a fallback plain `memory_chunks_vectors` table that stores embeddings
+# as JSON-encoded `Vec<f32>` blobs and let callers do cosine in Rust.
+sqlite-vec = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+default = []
+vec = ["dep:sqlite-vec"]

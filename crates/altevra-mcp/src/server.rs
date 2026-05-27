@@ -316,6 +316,36 @@ pub fn list_tools() -> Value {
         ),
     ));
 
+    // Prompts
+    tools.push(tool(
+        "build_system_prompt",
+        "Assemble the layered Altevra system prompt for a given tool.",
+        obj_schema(
+            &["tool_name"],
+            serde_json::json!({
+                "tool_name": {"type": "string"},
+                "project": {"type": "string"},
+                "current_task": {"type": "string"},
+                "current_goal": {"type": "string"},
+                "vault": {"type": "string"},
+                "limit": {"type": "integer"},
+            }),
+        ),
+    ));
+
+    // Observer
+    tools.push(tool(
+        "get_observer_insights",
+        "Run pattern detectors over recent events and return structured insights.",
+        obj_schema(
+            &[],
+            serde_json::json!({
+                "since": {"type": "string", "description": "Window (e.g. 1h, 24h, 7d, 30d). Default 7d."},
+                "write_file": {"type": "boolean", "description": "Also write vault/10-insights/auto-YYYYMMDD.md."},
+            }),
+        ),
+    ));
+
     serde_json::json!({"tools": tools})
 }
 
@@ -404,6 +434,14 @@ impl McpServer {
             // Setup
             "get_setup_status" => crate::tools_setup::handle_get_setup_status(id, args),
             "run_hook" => crate::tools_setup::handle_run_hook(id, args),
+            // Prompts
+            "build_system_prompt" => {
+                crate::tools_prompts::handle_build_system_prompt(id, args, &self.altevra_version)
+            }
+            // Observer
+            "get_observer_insights" => {
+                crate::tools_observer::handle_get_observer_insights(id, args, &self.vault_path)
+            }
             other => McpResponse::error(id, -32602, format!("Unknown tool: {other}")),
         }
     }

@@ -1,7 +1,13 @@
+-- SQLite-flavored schema.
+--   * UUIDs stored as TEXT (36-char dashed form, sqlx-uuid friendly).
+--   * Timestamps stored as TEXT (ISO-8601, sqlx-chrono friendly).
+--   * JSON columns stored as TEXT (sqlx::types::Json or serde_json::Value via Json wrapper).
+--   * BOOLEAN stored as INTEGER (0/1) — sqlx Bool maps cleanly.
+
 CREATE TABLE IF NOT EXISTS events (
-    id              UUID PRIMARY KEY,
+    id              TEXT PRIMARY KEY,
     event_type      TEXT NOT NULL,
-    project_id      UUID,
+    project_id      TEXT,
     actor_type      TEXT NOT NULL,
     actor_id        TEXT,
     source          TEXT NOT NULL,
@@ -9,10 +15,10 @@ CREATE TABLE IF NOT EXISTS events (
     entity_id       TEXT,
     title           TEXT NOT NULL,
     summary         TEXT,
-    payload         JSONB NOT NULL DEFAULT '{}',
+    payload         TEXT NOT NULL DEFAULT '{}',
     sensitivity     TEXT NOT NULL DEFAULT 'internal',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed_at    TIMESTAMPTZ,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    processed_at    TEXT,
     status          TEXT NOT NULL DEFAULT 'pending'
 );
 

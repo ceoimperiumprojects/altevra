@@ -1,24 +1,24 @@
 CREATE TABLE IF NOT EXISTS skills (
-    id          UUID PRIMARY KEY,
+    id          TEXT PRIMARY KEY,
     slug        TEXT NOT NULL UNIQUE,
     version     TEXT NOT NULL,
     source_path TEXT NOT NULL,
     checksum    TEXT NOT NULL,
     content     TEXT NOT NULL,
-    metadata    JSONB NOT NULL DEFAULT '{}',
+    metadata    TEXT NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'active',
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
 
 CREATE TABLE IF NOT EXISTS skill_installations (
-    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id                  TEXT PRIMARY KEY,
     skill_slug          TEXT NOT NULL REFERENCES skills(slug) ON DELETE CASCADE,
     tool_name           TEXT NOT NULL,
-    project_id          UUID,
+    project_id          TEXT,
     installed_version   TEXT NOT NULL,
-    installed_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    last_verified_at    TIMESTAMPTZ,
+    installed_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_verified_at    TEXT,
     checksum            TEXT NOT NULL,
     status              TEXT NOT NULL DEFAULT 'current',
     UNIQUE (skill_slug, tool_name, project_id)

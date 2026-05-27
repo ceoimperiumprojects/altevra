@@ -14,8 +14,12 @@ pulldown-cmark = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
 altevra-core = { workspace = true }
 altevra-vault = { workspace = true }
+altevra-secrets = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -62,6 +62,10 @@ enum Commands {
     #[command(subcommand)]
     Memory(commands::memory::MemoryCommands),
 
+    /// Build a layered system prompt for an agent tool
+    #[command(subcommand)]
+    Prompt(commands::prompt::PromptCommands),
+
     /// Web research pipeline
     #[command(subcommand)]
     Research(commands::research::ResearchCommands),
@@ -76,6 +80,10 @@ enum Commands {
     /// Journal commands (today / generate)
     #[command(subcommand)]
     Journal(commands::journal::JournalCommands),
+
+    /// Observer brain — detect patterns and emit insights
+    #[command(subcommand)]
+    Observer(commands::observer::ObserverCommands),
 }
 
 #[tokio::main]
@@ -101,9 +109,11 @@ async fn main() -> anyhow::Result<()> {
         Commands::Doctor(args) => commands::doctor::run(args).await,
         Commands::Config(cmd) => commands::config::run(cmd).await,
         Commands::Memory(cmd) => commands::memory::run(cmd).await,
+        Commands::Prompt(cmd) => commands::prompt::run(cmd).await,
         Commands::Research(cmd) => commands::research::run(cmd).await,
         Commands::Secrets(cmd) => commands::secrets::run(cmd).await,
         Commands::Context(args) => commands::context::run(args).await,
         Commands::Journal(cmd) => commands::journal::run(cmd).await,
+        Commands::Observer(cmd) => commands::observer::run(cmd).await,
     }
 }

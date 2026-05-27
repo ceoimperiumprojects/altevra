@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::util::{ts_from_text, ts_to_text, uuid_from_text};
+
+#[derive(Debug, Clone)]
 pub struct SkillRow {
     pub id: Uuid,
     pub slug: String,
@@ -16,11 +19,11 @@ pub struct SkillRow {
 }
 
 pub struct SkillsRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 impl<'a> SkillsRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -28,27 +31,27 @@ impl<'a> SkillsRepository<'a> {
         sqlx::query(
             r#"
             INSERT INTO skills (id, slug, version, source_path, checksum, content, metadata, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (slug) DO UPDATE SET
-                version = EXCLUDED.version,
-                source_path = EXCLUDED.source_path,
-                checksum = EXCLUDED.checksum,
-                content = EXCLUDED.content,
-                metadata = EXCLUDED.metadata,
-                status = EXCLUDED.status,
-                updated_at = EXCLUDED.updated_at
+                version = excluded.version,
+                source_path = excluded.source_path,
+                checksum = excluded.checksum,
+                content = excluded.content,
+                metadata = excluded.metadata,
+                status = excluded.status,
+                updated_at = excluded.updated_at
             "#,
         )
-        .bind(row.id)
+        .bind(row.id.to_string())
         .bind(&row.slug)
         .bind(&row.version)
         .bind(&row.source_path)
         .bind(&row.checksum)
         .bind(&row.content)
-        .bind(&row.metadata)
+        .bind(row.metadata.to_string())
         .bind(&row.status)
-        .bind(row.created_at)
-        .bind(row.updated_at)
+        .bind(ts_to_text(&row.created_at))
+        .bind(ts_to_text(&row.updated_at))
         .execute(self.pool)
         .await?;
         Ok(())
@@ -57,23 +60,26 @@ impl<'a> SkillsRepository<'a> {
     pub async fn find_by_slug(&self, slug: &str) -> anyhow::Result<Option<SkillRow>> {
         let row = sqlx::query(
             r#"SELECT id, slug, version, source_path, checksum, content, metadata, status,
-               created_at, updated_at FROM skills WHERE slug = $1"#,
+               created_at, updated_at FROM skills WHERE slug = ?"#,
         )
         .bind(slug)
         .fetch_optional(self.pool)
         .await?;
 
         Ok(row.map(|r| SkillRow {
-            id: r.get("id"),
+            id: uuid_from_text(r.get::<String, _>("id")),
             slug: r.get("slug"),
             version: r.get("version"),
             source_path: r.get("source_path"),
             checksum: r.get("checksum"),
             content: r.get("content"),
-            metadata: r.get("metadata"),
+            metadata: r
+                .get::<Option<String>, _>("metadata")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
             status: r.get("status"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
+            created_at: ts_from_text(r.get::<String, _>("created_at")),
+            updated_at: ts_from_text(r.get::<String, _>("updated_at")),
         }))
     }
 
@@ -88,16 +94,19 @@ impl<'a> SkillsRepository<'a> {
         Ok(rows
             .into_iter()
             .map(|r| SkillRow {
-                id: r.get("id"),
+                id: uuid_from_text(r.get::<String, _>("id")),
                 slug: r.get("slug"),
                 version: r.get("version"),
                 source_path: r.get("source_path"),
                 checksum: r.get("checksum"),
                 content: r.get("content"),
-                metadata: r.get("metadata"),
+                metadata: r
+                    .get::<Option<String>, _>("metadata")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
                 status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+                created_at: ts_from_text(r.get::<String, _>("created_at")),
+                updated_at: ts_from_text(r.get::<String, _>("updated_at")),
             })
             .collect())
     }

@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
+
+use crate::util::{opt_uuid_from_text, ts_from_text, ts_to_text, uuid_from_text};
 
 #[derive(Debug, Clone)]
 pub struct UpdateReadState {
@@ -13,11 +15,11 @@ pub struct UpdateReadState {
 }
 
 pub struct ReadStateRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 impl<'a> ReadStateRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -28,23 +30,56 @@ impl<'a> ReadStateRepository<'a> {
         project_id: Option<Uuid>,
         last_seen_event_id: Option<Uuid>,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO update_read_state
-                (id, actor_type, actor_id, project_id, last_seen_event_id, last_seen_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            ON CONFLICT (actor_type, actor_id, project_id) DO UPDATE SET
-                last_seen_event_id = EXCLUDED.last_seen_event_id,
-                last_seen_at = EXCLUDED.last_seen_at
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(actor_type)
-        .bind(actor_id)
-        .bind(project_id)
-        .bind(last_seen_event_id)
-        .execute(self.pool)
-        .await?;
+        // SQLite's UNIQUE constraint treats NULLs as distinct, so a vanilla
+        // `ON CONFLICT (actor_type, actor_id, project_id)` upsert never fires
+        // for project-less rows. We emulate upsert manually: try UPDATE first,
+        // fall back to INSERT when no row was affected.
+        let now = ts_to_text(&Utc::now());
+        let project_text = project_id.map(|u| u.to_string());
+        let last_seen_text = last_seen_event_id.map(|u| u.to_string());
+
+        let result = if let Some(ref pid) = project_text {
+            sqlx::query(
+                r#"UPDATE update_read_state
+                   SET last_seen_event_id = ?, last_seen_at = ?
+                   WHERE actor_type = ? AND actor_id = ? AND project_id = ?"#,
+            )
+            .bind(&last_seen_text)
+            .bind(&now)
+            .bind(actor_type)
+            .bind(actor_id)
+            .bind(pid)
+            .execute(self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"UPDATE update_read_state
+                   SET last_seen_event_id = ?, last_seen_at = ?
+                   WHERE actor_type = ? AND actor_id = ? AND project_id IS NULL"#,
+            )
+            .bind(&last_seen_text)
+            .bind(&now)
+            .bind(actor_type)
+            .bind(actor_id)
+            .execute(self.pool)
+            .await?
+        };
+
+        if result.rows_affected() == 0 {
+            sqlx::query(
+                r#"INSERT INTO update_read_state
+                    (id, actor_type, actor_id, project_id, last_seen_event_id, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(Uuid::new_v4().to_string())
+            .bind(actor_type)
+            .bind(actor_id)
+            .bind(&project_text)
+            .bind(&last_seen_text)
+            .bind(&now)
+            .execute(self.pool)
+            .await?;
+        }
         Ok(())
     }
 
@@ -58,18 +93,18 @@ impl<'a> ReadStateRepository<'a> {
             sqlx::query(
                 r#"SELECT id, actor_type, actor_id, project_id, last_seen_event_id, last_seen_at
                    FROM update_read_state
-                   WHERE actor_type = $1 AND actor_id = $2 AND project_id = $3"#,
+                   WHERE actor_type = ? AND actor_id = ? AND project_id = ?"#,
             )
             .bind(actor_type)
             .bind(actor_id)
-            .bind(pid)
+            .bind(pid.to_string())
             .fetch_optional(self.pool)
             .await?
         } else {
             sqlx::query(
                 r#"SELECT id, actor_type, actor_id, project_id, last_seen_event_id, last_seen_at
                    FROM update_read_state
-                   WHERE actor_type = $1 AND actor_id = $2 AND project_id IS NULL"#,
+                   WHERE actor_type = ? AND actor_id = ? AND project_id IS NULL"#,
             )
             .bind(actor_type)
             .bind(actor_id)
@@ -78,12 +113,14 @@ impl<'a> ReadStateRepository<'a> {
         };
 
         Ok(row.map(|r| UpdateReadState {
-            id: r.get("id"),
+            id: uuid_from_text(r.get::<String, _>("id")),
             actor_type: r.get("actor_type"),
             actor_id: r.get("actor_id"),
-            project_id: r.get("project_id"),
-            last_seen_event_id: r.get("last_seen_event_id"),
-            last_seen_at: r.get("last_seen_at"),
+            project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+            last_seen_event_id: opt_uuid_from_text(
+                r.get::<Option<String>, _>("last_seen_event_id"),
+            ),
+            last_seen_at: ts_from_text(r.get::<String, _>("last_seen_at")),
         }))
     }
 }

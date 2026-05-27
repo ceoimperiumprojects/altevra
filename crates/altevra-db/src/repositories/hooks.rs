@@ -1,7 +1,10 @@
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::util::{opt_uuid_from_text, ts_from_text, ts_to_text, uuid_from_text};
+
+#[derive(Debug, Clone)]
 pub struct HookRow {
     pub id: Uuid,
     pub slug: String,
@@ -13,6 +16,7 @@ pub struct HookRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone)]
 pub struct HookRunRow {
     pub id: Uuid,
     pub hook_slug: String,
@@ -27,11 +31,11 @@ pub struct HookRunRow {
 }
 
 pub struct HooksRepository<'a> {
-    pool: &'a PgPool,
+    pool: &'a SqlitePool,
 }
 
 impl<'a> HooksRepository<'a> {
-    pub fn new(pool: &'a PgPool) -> Self {
+    pub fn new(pool: &'a SqlitePool) -> Self {
         Self { pool }
     }
 
@@ -39,23 +43,23 @@ impl<'a> HooksRepository<'a> {
         sqlx::query(
             r#"
             INSERT INTO hooks (id, slug, version, source_file, checksum, status, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (slug) DO UPDATE SET
-                version = EXCLUDED.version,
-                source_file = EXCLUDED.source_file,
-                checksum = EXCLUDED.checksum,
-                status = EXCLUDED.status,
-                updated_at = EXCLUDED.updated_at
+                version = excluded.version,
+                source_file = excluded.source_file,
+                checksum = excluded.checksum,
+                status = excluded.status,
+                updated_at = excluded.updated_at
             "#,
         )
-        .bind(row.id)
+        .bind(row.id.to_string())
         .bind(&row.slug)
         .bind(&row.version)
         .bind(&row.source_file)
         .bind(&row.checksum)
         .bind(&row.status)
-        .bind(row.created_at)
-        .bind(row.updated_at)
+        .bind(ts_to_text(&row.created_at))
+        .bind(ts_to_text(&row.updated_at))
         .execute(self.pool)
         .await?;
         Ok(())
@@ -72,14 +76,14 @@ impl<'a> HooksRepository<'a> {
         Ok(rows
             .into_iter()
             .map(|r| HookRow {
-                id: r.get("id"),
+                id: uuid_from_text(r.get::<String, _>("id")),
                 slug: r.get("slug"),
                 version: r.get("version"),
                 source_file: r.get("source_file"),
                 checksum: r.get("checksum"),
                 status: r.get("status"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+                created_at: ts_from_text(r.get::<String, _>("created_at")),
+                updated_at: ts_from_text(r.get::<String, _>("updated_at")),
             })
             .collect())
     }
@@ -89,19 +93,19 @@ impl<'a> HooksRepository<'a> {
             r#"
             INSERT INTO hook_runs (id, hook_slug, tool_name, project_id, payload, result,
                 success, error_message, duration_ms, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(run.id)
+        .bind(run.id.to_string())
         .bind(&run.hook_slug)
         .bind(&run.tool_name)
-        .bind(run.project_id)
-        .bind(&run.payload)
-        .bind(&run.result)
-        .bind(run.success)
+        .bind(run.project_id.map(|u| u.to_string()))
+        .bind(run.payload.to_string())
+        .bind(run.result.to_string())
+        .bind(if run.success { 1_i64 } else { 0_i64 })
         .bind(run.error_message.as_deref())
         .bind(run.duration_ms)
-        .bind(run.created_at)
+        .bind(ts_to_text(&run.created_at))
         .execute(self.pool)
         .await?;
         Ok(())
@@ -115,8 +119,8 @@ impl<'a> HooksRepository<'a> {
         let rows = sqlx::query(
             r#"SELECT id, hook_slug, tool_name, project_id, payload, result, success,
                error_message, duration_ms, created_at
-               FROM hook_runs WHERE hook_slug = $1
-               ORDER BY created_at DESC LIMIT $2"#,
+               FROM hook_runs WHERE hook_slug = ?
+               ORDER BY created_at DESC LIMIT ?"#,
         )
         .bind(hook_slug)
         .bind(limit)
@@ -126,16 +130,22 @@ impl<'a> HooksRepository<'a> {
         Ok(rows
             .into_iter()
             .map(|r| HookRunRow {
-                id: r.get("id"),
+                id: uuid_from_text(r.get::<String, _>("id")),
                 hook_slug: r.get("hook_slug"),
                 tool_name: r.get("tool_name"),
-                project_id: r.get("project_id"),
-                payload: r.get("payload"),
-                result: r.get("result"),
-                success: r.get("success"),
+                project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+                payload: r
+                    .get::<Option<String>, _>("payload")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                result: r
+                    .get::<Option<String>, _>("result")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::Value::Object(Default::default())),
+                success: r.get::<i64, _>("success") != 0,
                 error_message: r.get("error_message"),
                 duration_ms: r.get("duration_ms"),
-                created_at: r.get("created_at"),
+                created_at: ts_from_text(r.get::<String, _>("created_at")),
             })
             .collect())
     }
