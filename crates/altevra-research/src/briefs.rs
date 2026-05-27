@@ -165,6 +165,124 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+/// One project section in the leverage brief.
+#[derive(Debug, Clone)]
+pub struct LeverageProject {
+    pub project_id: String,
+    pub priority: Option<String>,
+    pub leverage_focus: Option<String>,
+    pub items: Vec<ScoredItem>,
+    /// LLM-distilled actionables (3-5 short bullets). When absent, fallback
+    /// is the top-3 raw item titles.
+    pub distilled_bullets: Vec<String>,
+}
+
+/// Write the daily *leverage* brief — projekt-first layout, with optional
+/// LLM-distilled actionables per project. Goes to Pavle's Obsidian Briefs dir.
+pub fn write_leverage_brief(
+    daily_obsidian_dir: &Path,
+    projects: &[LeverageProject],
+) -> anyhow::Result<PathBuf> {
+    let date = Utc::now().format("%Y-%m-%d").to_string();
+    let path = daily_obsidian_dir.join(format!("{date}-leverage.md"));
+    std::fs::create_dir_all(daily_obsidian_dir)?;
+
+    let project_ids: Vec<String> = projects.iter().map(|p| p.project_id.clone()).collect();
+    let total_items: usize = projects.iter().map(|p| p.items.len()).sum();
+
+    let mut out = String::new();
+    out.push_str("---\n");
+    out.push_str("kind: leverage-brief\n");
+    out.push_str("generated_by: altevra-brain\n");
+    out.push_str(&format!(
+        "generated_at: {}\n",
+        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    ));
+    out.push_str(&format!("date: {date}\n"));
+    out.push_str(&format!("projects_covered: [{}]\n", project_ids.join(", ")));
+    out.push_str(&format!("total_items: {total_items}\n"));
+    out.push_str("---\n\n");
+    out.push_str(&format!("# Daily Leverage — {date}\n\n"));
+
+    if projects.is_empty() {
+        out.push_str(
+            "_No projects swept today. Run `altevra brain start` to enable the daily sweep._\n",
+        );
+        atomic_write(&path, &out)?;
+        return Ok(path);
+    }
+
+    for proj in projects {
+        let heading = match &proj.priority {
+            Some(p) => format!("## {} — {} ({} new)", proj.project_id, p, proj.items.len()),
+            None => format!("## {} ({} new)", proj.project_id, proj.items.len()),
+        };
+        out.push_str(&heading);
+        out.push_str("\n\n");
+        if let Some(focus) = &proj.leverage_focus {
+            out.push_str(&format!("_Focus: {focus}_\n\n"));
+        }
+
+        if !proj.distilled_bullets.is_empty() {
+            out.push_str("**What might help today:**\n");
+            for b in &proj.distilled_bullets {
+                out.push_str(&format!("- {b}\n"));
+            }
+            out.push('\n');
+        }
+
+        if proj.items.is_empty() {
+            out.push_str("_No new items pulled for this project today._\n\n");
+            continue;
+        }
+
+        out.push_str("<details><summary>Sources</summary>\n\n");
+        // Highest score first.
+        let mut sorted: Vec<&ScoredItem> = proj.items.iter().collect();
+        sorted.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for it in sorted.iter().take(10) {
+            let title = if it.item.title.is_empty() {
+                "(no title)".to_string()
+            } else {
+                it.item.title.clone()
+            };
+            out.push_str(&format!(
+                "- [{}]({}) `score={:.2}` _{}_\n",
+                title, it.item.link, it.score, it.item.feed_id
+            ));
+        }
+        out.push_str("\n</details>\n\n");
+    }
+
+    atomic_write(&path, &out)?;
+    Ok(path)
+}
+
+/// Fallback distillation when no LLM is available: take top 3 item titles.
+pub fn distill_fallback(items: &[ScoredItem]) -> Vec<String> {
+    let mut sorted: Vec<&ScoredItem> = items.iter().collect();
+    sorted.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted
+        .iter()
+        .take(3)
+        .map(|i| {
+            if i.item.title.is_empty() {
+                i.item.link.clone()
+            } else {
+                format!("{} ({})", i.item.title, i.item.feed_id)
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +361,69 @@ mod tests {
         let p1 = write_daily_brief(tmp.path(), &items).unwrap();
         let p2 = write_daily_brief(tmp.path(), &items).unwrap();
         assert_eq!(p1, p2);
+    }
+
+    #[test]
+    fn leverage_brief_renders_project_sections() {
+        let tmp = TempDir::new().unwrap();
+        let projects = vec![
+            LeverageProject {
+                project_id: "revesta".into(),
+                priority: Some("P0".into()),
+                leverage_focus: Some("GTM angles".into()),
+                items: vec![
+                    item("hn-frontpage", "Wasteless Series A", vec!["revesta"], 0.85),
+                    item("techcrunch-ai", "Food tech roundup", vec!["revesta"], 0.5),
+                ],
+                distilled_bullets: vec![
+                    "Competitor move: Wasteless raised $4M Series A".into(),
+                    "GTM signal: 2 new Miami restaurants posted surplus inventory".into(),
+                ],
+            },
+            LeverageProject {
+                project_id: "altevra".into(),
+                priority: Some("P1".into()),
+                leverage_focus: None,
+                items: vec![item(
+                    "arxiv-cs-ai",
+                    "Continuous embeddings",
+                    vec!["altevra"],
+                    0.7,
+                )],
+                distilled_bullets: vec![],
+            },
+        ];
+        let path = write_leverage_brief(tmp.path(), &projects).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("kind: leverage-brief"));
+        assert!(body.contains("projects_covered: [revesta, altevra]"));
+        assert!(body.contains("## revesta — P0"));
+        assert!(body.contains("Wasteless Series A"));
+        assert!(body.contains("Competitor move"));
+        assert!(body.contains("## altevra — P1"));
+    }
+
+    #[test]
+    fn leverage_brief_handles_empty_projects() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_leverage_brief(tmp.path(), &[]).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("No projects swept today"));
+    }
+
+    #[test]
+    fn distill_fallback_uses_top_three_titles() {
+        let items = vec![
+            item("a", "alpha", vec!["x"], 0.9),
+            item("b", "beta", vec!["x"], 0.3),
+            item("c", "gamma", vec!["x"], 0.7),
+            item("d", "delta", vec!["x"], 0.1),
+        ];
+        let bullets = distill_fallback(&items);
+        assert_eq!(bullets.len(), 3);
+        assert!(bullets[0].contains("alpha"));
+        assert!(bullets[1].contains("gamma"));
+        // delta should not make the cut (score 0.1 vs beta 0.3)
+        assert!(bullets[2].contains("beta"));
     }
 }

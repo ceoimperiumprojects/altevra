@@ -192,6 +192,7 @@ dependencies = [
  "altevra-db",
  "altevra-hooks",
  "altevra-memory",
+ "altevra-research",
  "altevra-skills",
  "altevra-vault",
  "anyhow",

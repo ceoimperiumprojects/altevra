@@ -1,6 +1,7 @@
 pub mod server;
 pub mod tools_bootstrap;
 pub mod tools_capabilities;
+pub mod tools_discovery;
 pub mod tools_memory;
 pub mod tools_observer;
 pub mod tools_prompts;

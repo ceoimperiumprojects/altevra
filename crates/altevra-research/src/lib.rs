@@ -11,7 +11,10 @@ pub mod scraper;
 pub mod sources;
 pub mod synthesis;
 
-pub use briefs::{write_daily_brief, write_project_brief, ScoredItem};
+pub use briefs::{
+    distill_fallback, write_daily_brief, write_leverage_brief, write_project_brief,
+    LeverageProject, ScoredItem,
+};
 pub use crawl_bridge::{
     crawl_via_imperium, crawl_with_login, imperium_crawl_spec, CrawlOpts, CrawlResult,
     ImperiumCrawlSpec,

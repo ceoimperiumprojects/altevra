@@ -346,6 +346,54 @@ pub fn list_tools() -> Value {
         ),
     ));
 
+    // v0.3.7.5: Research v2 — discovery + per-project search
+    tools.push(tool(
+        "discover_feed",
+        "Scan a URL for RSS/Atom feed links and (optionally) auto-promote them.",
+        obj_schema(
+            &["url"],
+            serde_json::json!({
+                "url": {"type": "string"},
+                "auto_promote": {"type": "boolean"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "github_trending",
+        "Fetch GitHub Trending repositories for a language and period.",
+        obj_schema(
+            &[],
+            serde_json::json!({
+                "language": {"type": "string"},
+                "since": {"type": "string", "enum": ["daily", "weekly", "monthly"]},
+                "limit": {"type": "integer"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "web_search",
+        "Run a web search via DuckDuckGo (default), Brave or Exa.",
+        obj_schema(
+            &["query"],
+            serde_json::json!({
+                "query": {"type": "string"},
+                "provider": {"type": "string", "enum": ["ddg", "brave", "exa"]},
+                "limit": {"type": "integer"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "project_research",
+        "Return the project agent's keywords, queries and budget for a given project_id.",
+        obj_schema(
+            &["project_id"],
+            serde_json::json!({
+                "project_id": {"type": "string"},
+                "force_run": {"type": "boolean"},
+            }),
+        ),
+    ));
+
     // v0.3.7: Replay & Query
     tools.push(tool(
         "replay_session",
@@ -486,6 +534,11 @@ impl McpServer {
             "replay_session" => crate::tools_sessions::handle_replay_session(id, args),
             "search_turns" => crate::tools_sessions::handle_search_turns(id, args),
             "file_history" => crate::tools_sessions::handle_file_history(id, args),
+            // v0.3.7.5: Research v2
+            "discover_feed" => crate::tools_discovery::handle_discover_feed(id, args),
+            "github_trending" => crate::tools_discovery::handle_github_trending(id, args),
+            "web_search" => crate::tools_discovery::handle_web_search(id, args),
+            "project_research" => crate::tools_discovery::handle_project_research(id, args),
             other => McpResponse::error(id, -32602, format!("Unknown tool: {other}")),
         }
     }

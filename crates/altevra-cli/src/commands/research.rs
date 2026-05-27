@@ -28,6 +28,29 @@ pub enum ResearchCommands {
     /// Manage per-project research agents
     #[command(subcommand)]
     Projects(ProjectsCommands),
+    /// Generate today's leverage brief from current research_items
+    Leverage(LeverageArgs),
+}
+
+#[derive(Args)]
+pub struct LeverageArgs {
+    /// Date override (default: today). Reserved for future use.
+    #[arg(long)]
+    pub date: Option<String>,
+    /// Lookback window in hours for items to consider (default: 24h)
+    #[arg(long, default_value_t = 24)]
+    pub hours: i64,
+    /// Vault root for resolving identity / brief paths (default: ".")
+    #[arg(long, default_value = ".")]
+    pub vault: PathBuf,
+    /// Override output directory (default: ~/Obsidian/Imperium/Content/Research/Briefs)
+    #[arg(long)]
+    pub out_dir: Option<PathBuf>,
+    /// SQLite DB path
+    #[arg(long, default_value = ".altevra/altevra.db")]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand)]
@@ -250,7 +273,123 @@ pub async fn run(cmd: ResearchCommands) -> anyhow::Result<()> {
         ResearchCommands::Trending(args) => run_trending(args).await,
         ResearchCommands::Search(args) => run_search(args).await,
         ResearchCommands::Projects(cmd) => run_projects(cmd).await,
+        ResearchCommands::Leverage(args) => run_leverage(args).await,
     }
+}
+
+async fn run_leverage(args: LeverageArgs) -> anyhow::Result<()> {
+    use altevra_research::briefs::{
+        distill_fallback, write_leverage_brief, LeverageProject, ScoredItem,
+    };
+    use altevra_research::fetcher::FeedItem;
+    use altevra_research::projects::ProjectAgent;
+    use chrono::Utc;
+
+    // Identity (skip if absent → empty leverage).
+    let id_path = identity_path();
+    let agents = if id_path.exists() {
+        ProjectAgent::load_all(&id_path).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Pool — read-only for this command.
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+
+    let cutoff = Utc::now() - chrono::Duration::hours(args.hours.max(1));
+    let cutoff_str = cutoff.to_rfc3339();
+
+    let mut projects: Vec<LeverageProject> = Vec::new();
+
+    for agent in &agents {
+        // SQLite LIKE on project_matches_json (small set; no fancy JSON support needed).
+        let pattern = format!("%\"{}\"%", agent.project_id);
+        let rows = sqlx::query(
+            r#"SELECT feed_id, guid, link, title, summary, published_at,
+                       relevance_score, project_matches_json
+               FROM research_items
+               WHERE ingested_at >= ?
+                 AND project_matches_json LIKE ?
+               ORDER BY relevance_score DESC, ingested_at DESC
+               LIMIT 30"#,
+        )
+        .bind(&cutoff_str)
+        .bind(&pattern)
+        .fetch_all(&pool)
+        .await?;
+
+        let items: Vec<ScoredItem> = rows
+            .iter()
+            .map(|r| {
+                let pj: String =
+                    sqlx::Row::try_get(r, "project_matches_json").unwrap_or_else(|_| "[]".into());
+                let matches: Vec<String> = serde_json::from_str(&pj).unwrap_or_default();
+                let published: Option<String> =
+                    sqlx::Row::try_get(r, "published_at").unwrap_or(None);
+                ScoredItem {
+                    item: FeedItem {
+                        feed_id: sqlx::Row::try_get::<String, _>(r, "feed_id").unwrap_or_default(),
+                        guid: sqlx::Row::try_get::<String, _>(r, "guid").unwrap_or_default(),
+                        link: sqlx::Row::try_get::<String, _>(r, "link").unwrap_or_default(),
+                        title: sqlx::Row::try_get::<String, _>(r, "title").unwrap_or_default(),
+                        summary: sqlx::Row::try_get::<String, _>(r, "summary").unwrap_or_default(),
+                        published_at: published
+                            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                            .map(|d| d.with_timezone(&Utc)),
+                    },
+                    score: sqlx::Row::try_get::<f64, _>(r, "relevance_score").unwrap_or(0.0) as f32,
+                    matched_projects: matches,
+                }
+            })
+            .collect();
+
+        let distilled_bullets = distill_fallback(&items);
+        projects.push(LeverageProject {
+            project_id: agent.project_id.clone(),
+            priority: agent.priority.clone(),
+            leverage_focus: agent.leverage_focus.clone(),
+            items,
+            distilled_bullets,
+        });
+    }
+
+    let out_dir = args.out_dir.clone().unwrap_or_else(|| {
+        std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("Obsidian")
+            .join("Imperium")
+            .join("Content")
+            .join("Research")
+            .join("Briefs")
+    });
+
+    let path = write_leverage_brief(&out_dir, &projects)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.display().to_string(),
+                "projects_covered": projects.iter().map(|p| &p.project_id).collect::<Vec<_>>(),
+                "total_items": projects.iter().map(|p| p.items.len()).sum::<usize>(),
+            }))?
+        );
+    } else {
+        println!("Leverage brief written: {}", path.display());
+        println!(
+            "  Projects covered: {}",
+            projects
+                .iter()
+                .map(|p| p.project_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let _ = args.date; // reserved for future date-rewrite mode
+    let _ = args.vault;
+    Ok(())
 }
 
 async fn run_full(args: ResearchRunArgs) -> anyhow::Result<()> {
