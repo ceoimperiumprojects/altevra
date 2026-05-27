@@ -173,76 +173,95 @@ altevra context --project ${{ALTEVRA_PROJECT}} --json
     }
 
     /// Antigravity hook scaffold — SDK-only Python decorators, not static JSON.
+    /// Emits 9 decorators covering session, message, tool, file, error and
+    /// artifact phases. Each hook pipes a JSON-serialised ctx envelope to
+    /// `altevra hook-handle <event>` via stdin (the v0.3.1 handler).
     fn hooks_py_content() -> String {
-        // Use a Python comment header (# ALTEVRA_MANAGED: true) so the
-        // managed-header drift check still works on this file format.
-        r#"# ALTEVRA_MANAGED: true
-# source: 07-capabilities/hooks.yaml
-# generated_by: altevra
-# adapter: antigravity
-# version: 0.1.0
-#
-# Antigravity hook scaffold — opt-in. Drop this file into your repo and the
-# Antigravity runtime will pick it up via its SDK decorators.
-#
-# Antigravity hooks are SDK-only (Python decorators), NOT static JSON like
-# Claude Code's settings.json. So this file is the authoritative wiring.
+        // 9 hooks: (antigravity decorator, altevra canonical event, docstring)
+        let entries: &[(&str, &str, &str)] = &[
+            ("session_start", "session_start", "Run on session start."),
+            ("session_end", "session_end", "Run on session end."),
+            (
+                "user_message",
+                "user_prompt_submit",
+                "Run on each user message.",
+            ),
+            (
+                "assistant_message",
+                "response_received",
+                "Run on each assistant response.",
+            ),
+            (
+                "pre_tool_call",
+                "pre_tool_use",
+                "Run before each tool invocation.",
+            ),
+            (
+                "post_tool_call",
+                "post_tool_use",
+                "Run after each tool invocation.",
+            ),
+            (
+                "file_change",
+                "file_changed",
+                "Run when a file is created/edited/deleted.",
+            ),
+            ("error", "error", "Run on runtime/tool error."),
+            (
+                "artifact",
+                "tool_call_observed",
+                "Run when an artifact is produced.",
+            ),
+        ];
 
-from antigravity_sdk import hooks  # type: ignore
-import subprocess
+        let mut out = String::new();
+        out.push_str(
+            "# ALTEVRA_MANAGED: true\n\
+             # source: 07-capabilities/hooks.yaml\n\
+             # generated_by: altevra\n\
+             # adapter: antigravity\n\
+             # version: 0.1.0\n\
+             #\n\
+             # Antigravity hook scaffold — opt-in. Drop this file into your repo and the\n\
+             # Antigravity runtime will pick it up via its SDK decorators.\n\
+             #\n\
+             # Antigravity hooks are SDK-only (Python decorators), NOT static JSON like\n\
+             # Claude Code's settings.json. So this file is the authoritative wiring.\n\
+             #\n\
+             # Each hook serialises its ctx to JSON and pipes it to\n\
+             # `altevra hook-handle <event>` which is the v0.3.1 stdin handler that\n\
+             # writes turns/sessions into the recorder.\n\
+             \n\
+             from antigravity_sdk import hooks  # type: ignore\n\
+             import json\n\
+             import subprocess\n\
+             \n\
+             \n\
+             def _dispatch(event: str, ctx) -> None:\n\
+                 \"\"\"Pipe a JSON-encoded ctx to `altevra hook-handle <event>`.\"\"\"\n\
+                 try:\n\
+                     payload = ctx if isinstance(ctx, (dict, list)) else getattr(ctx, '__dict__', {})\n\
+                     stdin = json.dumps(payload, default=str).encode('utf-8')\n\
+                 except Exception:\n\
+                     stdin = b'{}'\n\
+                 subprocess.run(\n\
+                     [\"altevra\", \"hook-handle\", event, \"--tool\", \"antigravity\"],\n\
+                     input=stdin,\n\
+                     check=False,\n\
+                 )\n\
+             \n\
+             \n",
+        );
 
+        for (decorator, event, doc) in entries {
+            let fn_name = format!("altevra_{decorator}");
+            out.push_str(&format!(
+                "@hooks.{decorator}\n\
+                 def {fn_name}(ctx):\n    \"\"\"{doc}\"\"\"\n    _dispatch(\"{event}\", ctx)\n\n\n",
+            ));
+        }
 
-@hooks.session_start
-def altevra_session_start(ctx):
-    """Run Altevra session_start hook at the beginning of every session."""
-    subprocess.run(
-        [
-            "altevra",
-            "hook",
-            "run",
-            "session_start",
-            "--tool",
-            "antigravity",
-            "--json",
-        ],
-        check=False,
-    )
-
-
-@hooks.pre_tool_call
-def altevra_pre_tool(ctx):
-    """Run Altevra before_tool_call hook before each tool invocation."""
-    subprocess.run(
-        [
-            "altevra",
-            "hook",
-            "run",
-            "before_tool_call",
-            "--tool",
-            "antigravity",
-            "--json",
-        ],
-        check=False,
-    )
-
-
-@hooks.session_end
-def altevra_session_end(ctx):
-    """Run Altevra session_end hook at the end of every session."""
-    subprocess.run(
-        [
-            "altevra",
-            "hook",
-            "run",
-            "session_end",
-            "--tool",
-            "antigravity",
-            "--json",
-        ],
-        check=False,
-    )
-"#
-        .to_string()
+        out
     }
 
     /// Classify a destination path into create/update/drifted bucket.
@@ -696,8 +715,51 @@ mod tests {
         assert!(content.contains("@hooks.pre_tool_call"));
         // Wires to altevra CLI.
         assert!(content.contains("altevra"));
-        assert!(content.contains("session_start"));
-        assert!(content.contains("before_tool_call"));
+    }
+
+    #[test]
+    fn test_antigravity_hooks_cover_nine_decorators() {
+        let a = AntigravityAdapter::new();
+        let content = a.render_hooks(vec![]).unwrap()[0].content.clone();
+        for decorator in [
+            "@hooks.session_start",
+            "@hooks.session_end",
+            "@hooks.user_message",
+            "@hooks.assistant_message",
+            "@hooks.pre_tool_call",
+            "@hooks.post_tool_call",
+            "@hooks.file_change",
+            "@hooks.error",
+            "@hooks.artifact",
+        ] {
+            assert!(
+                content.contains(decorator),
+                "Antigravity scaffold missing {decorator}\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_antigravity_hooks_use_hook_handle_stdin() {
+        let a = AntigravityAdapter::new();
+        let content = a.render_hooks(vec![]).unwrap()[0].content.clone();
+        assert!(
+            content.contains("altevra"),
+            "scaffold should invoke altevra binary"
+        );
+        assert!(
+            content.contains("hook-handle"),
+            "scaffold must call altevra hook-handle (v0.3.1 stdin handler)"
+        );
+        assert!(
+            content.contains("input=stdin"),
+            "scaffold must pipe JSON to stdin"
+        );
+        // No legacy hook-run path.
+        assert!(
+            !content.contains("\"run\""),
+            "scaffold must not use legacy 'hook run' arg"
+        );
     }
 
     #[test]

@@ -104,19 +104,27 @@ altevra context --project ${{ALTEVRA_PROJECT}} --json          # Current project
         mcp_servers["altevra"] = Item::Table(altevra_server);
         doc["mcp_servers"] = Item::Table(mcp_servers);
 
-        // [hooks]
+        // [hooks] — 10 lifecycle events covering session, prompt, tool-call,
+        // compaction, error and notification phases. All wired to
+        // `altevra hook-handle <event>` which reads JSON from stdin (v0.3.1).
         let mut hooks = Table::new();
-        for (event, hook_name) in [
+        for (event, altevra_event) in [
             ("SessionStart", "session_start"),
-            ("PreToolUse", "before_tool_call"),
-            ("PostToolUse", "after_tool_call"),
             ("Stop", "session_end"),
+            ("UserPromptSubmit", "user_prompt_submit"),
+            ("ResponseReceived", "response_received"),
+            ("PreToolUse", "pre_tool_use"),
+            ("PostToolUse", "post_tool_use"),
+            ("PreCompaction", "pre_compaction"),
+            ("PostCompaction", "post_compaction"),
+            ("Error", "error"),
+            ("Notification", "notification"),
         ] {
             let mut entry = InlineTable::new();
             entry.insert("type", Value::from("command"));
             entry.insert(
                 "command",
-                Value::from(format!("altevra hook run {hook_name} --tool codex --json")),
+                Value::from(format!("altevra hook-handle {altevra_event} --tool codex")),
             );
             let mut arr = Array::new();
             arr.push(Value::InlineTable(entry));
@@ -490,6 +498,44 @@ mod tests {
         // Parse the TOML to make sure it is valid (after stripping the
         // comment header which toml_edit is happy with anyway).
         let _doc: DocumentMut = f.content.parse().expect("config.toml must parse");
+    }
+
+    #[test]
+    fn test_codex_hooks_cover_ten_events() {
+        let adapter = CodexAdapter::new();
+        let f = &adapter.render_hooks(vec![]).unwrap()[0];
+        for ev in [
+            "SessionStart",
+            "Stop",
+            "UserPromptSubmit",
+            "ResponseReceived",
+            "PreToolUse",
+            "PostToolUse",
+            "PreCompaction",
+            "PostCompaction",
+            "Error",
+            "Notification",
+        ] {
+            assert!(
+                f.content.contains(ev),
+                "Codex config.toml missing hook event {ev}\n{}",
+                f.content
+            );
+        }
+    }
+
+    #[test]
+    fn test_codex_hooks_use_hook_handle_not_hook_run() {
+        let adapter = CodexAdapter::new();
+        let f = &adapter.render_hooks(vec![]).unwrap()[0];
+        assert!(
+            f.content.contains("altevra hook-handle"),
+            "Codex hooks must call altevra hook-handle (v0.3.1 stdin handler)"
+        );
+        assert!(
+            !f.content.contains("altevra hook run "),
+            "Codex hooks must not use the legacy 'hook run' path"
+        );
     }
 
     #[test]
