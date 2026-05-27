@@ -310,27 +310,173 @@ schemas + small CLI). Phases 3+ are gated on v0.3.9 multi-provider LLM.
 
 After reading this file, every agent must also read:
 
-1. **`ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md`**
-   (in repo root) — defines the next-phase architecture: Resident Agent
-   layer with modes, Wiki Layer (living knowledge pages), Context Packet
-   System, Token Economy Rules, Model Routing roles, Personal Brain Layer,
-   Relevance Gate, Daily Capture Protocol, Auto-Wiki Pipeline. This
-   document is the **source-of-truth for build phase v0.4+** and replaces
-   the rough sketches in `~/.claude/plans/sleepy-soaring-cosmos.md`
-   for everything after v0.3.10.
+1. **[VISION.md](./VISION.md)** — long-form vision (philosophical
+   underpinning, decade-arc design, what success looks like in years
+   2027 / 2030 / 2040). The "why" deepens here.
 
-2. **`~/Obsidian/Imperium/Memory/Decisions.md`** — human-facing
+2. **[ROADMAP.md](./ROADMAP.md)** — concrete ordered build sequence
+   from current state (v0.3.8) through v1.0+, with phase exit criteria
+   and time estimates. This is **the** execution plan.
+
+3. **[ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md](./ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md)** —
+   technical architecture for the next phase: Resident Agent modes,
+   Wiki Layer, Context Packet System, Token Economy, Model Routing roles,
+   Personal Brain types, Relevance Gate, Auto-Wiki Pipeline.
+
+4. **`~/Obsidian/Imperium/Memory/Decisions.md`** — human-facing
    record of every material decision made over the project's life.
 
 The hierarchy is:
 
 ```
-CLAUDE.md (this file)         ← WHY Altevra exists, vision gate
+VISION.md            ← WHY Altevra exists, decade arc
    ↓
-ALTEVRA_NEXT_ARCHITECTURE...md ← WHAT Altevra becomes next (concrete)
+CLAUDE.md (here)     ← Operating doctrine, vision gate, system architecture
    ↓
-.planning/                    ← HOW the current sub-version gets built
+ROADMAP.md           ← Ordered build plan (NEXT)
+   ↓
+ALTEVRA_NEXT...md    ← Technical architecture for next phase
+   ↓
+.planning/           ← Per-sub-version implementation plans
 ```
+
+---
+
+## 10. System architecture (high-level)
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  AI tools Pavle uses                                             │
+│  Claude Code · Codex CLI · Cursor CLI · Antigravity · Hermes     │
+└─────────┬────────────────────────────────────────────┬───────────┘
+          │ hooks (40+ events)                         │ MCP
+          ▼                                            ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│                          ALTEVRA CORE                            │
+│                                                                  │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐          │
+│  │  Recorder    │   │  Watcher     │   │ Brain Jobs   │          │
+│  │  sessions    │   │  vault scan  │   │ 10 periodic  │          │
+│  │  turns       │   │  embedder    │   │ jobs         │          │
+│  │  file_changes│   │  worker      │   │              │          │
+│  └──────┬───────┘   └──────┬───────┘   └──────┬───────┘          │
+│         └──────────────────┴──────────────────┘                  │
+│                            │                                     │
+│  ┌─────────────────────────▼─────────────────────────┐           │
+│  │              Resident Agent Layer                  │           │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │           │
+│  │  │ memory_     │ │ synthesis   │ │ wiki_       │   │           │
+│  │  │ curator     │ │             │ │ curator     │   │           │
+│  │  └─────────────┘ └─────────────┘ └─────────────┘   │           │
+│  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐   │           │
+│  │  │ daily_      │ │ insight     │ │ observer    │   │           │
+│  │  │ briefing    │ │             │ │ (self-impr) │   │           │
+│  │  └─────────────┘ └─────────────┘ └─────────────┘   │           │
+│  └────────────────────────┬──────────────────────────┘            │
+│                           │ routes by role                       │
+│  ┌────────────────────────▼──────────────────────────┐           │
+│  │           Model Routing Layer                      │           │
+│  │  cheap_worker / strong_reasoner / local_private    │           │
+│  │  embedding / reranker                              │           │
+│  └────────────────────────┬──────────────────────────┘           │
+│                           │                                      │
+│  ┌────────────────────────▼──────────────────────────┐           │
+│  │         altevra-llm (multi-provider)               │           │
+│  │  Gemini · OpenAI · Anthropic · Voyage (native)     │           │
+│  │  OpenAI-compat: DeepSeek · Qwen · Moonshot ·       │           │
+│  │  Zhipu · MiniMax · Baichuan · Yi · Groq · Together │           │
+│  │  · OpenRouter · Mistral · Cohere · Ollama · vLLM   │           │
+│  └────────────────────────────────────────────────────┘           │
+│                                                                  │
+│  ┌─────────────────────────────────────────────────────────────┐  │
+│  │               Living Storage                                │  │
+│  │  SQLite (sessions/turns/memory/wiki/personal/relevance)    │  │
+│  │  + Vector store (embeddings, semantic search)              │  │
+│  │  + Keyring (secrets, API keys)                             │  │
+│  │  + ~/.altevra/identity/* (deep, versioned)                 │  │
+│  │  + wiki/* (markdown, human + agent readable)               │  │
+│  └─────────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+          │
+          ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Obsidian vault (human-facing canonical truth)                   │
+│  Daily/  Memory/  Projects/  Content/Research/Briefs/            │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 11. Hermes ↔ Altevra split (identity hierarchy)
+
+Adopted 2026-05-28 per Pavle's directive: *"Identity treba da Hermes
+ostane ne preplavljen, ali Altevra treba da ide dublje."*
+
+| Layer | Hermes | Altevra |
+|-------|--------|---------|
+| **Identity depth** | Light/summary — short, fast, agent-readable | Deep/comprehensive — versioned, sensitive-labeled, full life context |
+| **File location** | `~/.imperium/identity/profile.yaml` | `~/.altevra/identity/{profile,preferences,life-domains,active-goals,evolution}.yaml` |
+| **Default exposure** | Public to agents Hermes spawns | Never auto-exposed; explicit MCP call required |
+| **Primary role** | Orchestration, command center, gateways, kanban | Memory, semantic search, wiki, pattern detection |
+| **Self-improvement** | `background_review.py` fork (per-turn) | Generalized: imports + hooks + research + wiki |
+| **Personal data** | Light reference only | Full storage; local models for personal-data ops |
+
+**Depth-on-demand:** When Hermes needs depth, it calls Altevra via MCP:
+`altevra_identity_query(field, depth)` returns the latest versioned
+record plus provenance. Hermes stays small. Altevra stays deep. Both
+listen to the same Brain Bus events.
+
+---
+
+## 12. Self-improving architecture (borrowed from Hermes, generalized)
+
+Hermes has `agent/background_review.py`: after every conversation turn,
+it forks the agent into a daemon thread with a whitelisted tool set
+(memory + skill only) and asks itself *"should anything be saved or
+updated?"*. The fork uses the cached system prompt so it's token-cheap.
+
+Altevra **generalizes this pattern** across all surfaces:
+
+| Trigger | Review fork asks |
+|---------|------------------|
+| Session imported (Analyze Everything) | New memory/learning/preference to save? |
+| Hook turn captured (live AI session) | New decision/preference/skill proposal? |
+| Research run completed | Real insight or noise? Wiki page to update? |
+| Wiki page edited | Other pages affected? Links to add? |
+| Hour passes | Pattern detected across last N hours? |
+| Day ends | Daily summary + identity shift detection |
+
+### Trust ladder (auto-apply vs review)
+
+Auto-applied (no Pavle blocking):
+- New research insights, low-risk wiki pages, new category creation,
+  non-sensitive memory writes
+
+Review required (Pavle approves):
+- Sensitive memory (relationship, health, identity), skill proposals,
+  prompt tweaks, source-of-truth edits, person/relationship pages
+
+### Skill factory for other agents
+
+Altevra observes repeated tool-call patterns across sessions → proposes
+new skills for Claude Code / Codex / Cursor CLI / Antigravity / Hermes.
+Pavle reviews → Altevra writes the skill manifest to the appropriate
+adapter dir via existing connectors.
+
+This makes Altevra **the skill manufacturing layer** for Pavle's entire
+AI tool ecosystem. As the second brain learns Pavle's habits, every
+agent gets sharper.
+
+### Prompt tweaking
+
+Observer mode notices low-quality outputs from a particular Resident
+Agent mode → proposes a refined prompt with A/B preview → Pavle approves
+or rejects. Altevra's own prompts evolve. So can other agents' system
+prompts when Pavle authorizes.
+
+Full pattern detailed in [VISION.md §4](./VISION.md).
 
 ---
 
