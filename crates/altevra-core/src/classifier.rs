@@ -37,6 +37,14 @@ pub fn classify(event: &Event) -> Importance {
         | EventType::ConfigChanged
         | EventType::SessionStarted
         | EventType::SessionEnded => Importance::Low,
+        // v0.3 observability events — typically Noise level (high volume),
+        // but FileChanged on tracked vault files bumps to Low for visibility.
+        EventType::FileChanged => Importance::Low,
+        EventType::ToolCallObserved
+        | EventType::PromptSent
+        | EventType::ResponseReceived
+        | EventType::McpCall
+        | EventType::AgentThinkingStep => Importance::Noise,
     }
 }
 

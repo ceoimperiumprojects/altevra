@@ -34,6 +34,13 @@ pub enum EventType {
     ErrorLogged,
     ReviewItemCreated,
     ToolConnected,
+    // v0.3 — Omniscient Brain OS observability events.
+    ToolCallObserved,
+    PromptSent,
+    ResponseReceived,
+    FileChanged,
+    McpCall,
+    AgentThinkingStep,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

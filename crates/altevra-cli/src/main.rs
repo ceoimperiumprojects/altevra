@@ -84,6 +84,16 @@ enum Commands {
     /// Observer brain — detect patterns and emit insights
     #[command(subcommand)]
     Observer(commands::observer::ObserverCommands),
+
+    /// Manage agent sessions (v0.3 omniscient recorder)
+    #[command(subcommand)]
+    Session(commands::session::SessionCommands),
+
+    /// Record a single agent turn into the recorder
+    Turn(commands::turn::TurnRecordArgs),
+
+    /// Handle a tool hook event (reads JSON from stdin)
+    HookHandle(commands::hook_handle::HookHandleArgs),
 }
 
 #[tokio::main]
@@ -115,5 +125,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Context(args) => commands::context::run(args).await,
         Commands::Journal(cmd) => commands::journal::run(cmd).await,
         Commands::Observer(cmd) => commands::observer::run(cmd).await,
+        Commands::Session(cmd) => commands::session::run(cmd).await,
+        Commands::Turn(args) => commands::turn::run(args).await,
+        Commands::HookHandle(args) => commands::hook_handle::run(args).await,
     }
 }

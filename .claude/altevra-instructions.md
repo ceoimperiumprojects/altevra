@@ -4,7 +4,6 @@
 <!-- adapter: claude-code -->
 <!-- version: 0.1.0 -->
 <!-- checksum: 2a65ee1867ed87bf1ff36aafe41048370868a26fd825f96c3700e859309ad419 -->
-<!-- generated_at: 2026-05-27T04:56:35.136494766+00:00 -->
 
 # Altevra Context
 
