@@ -5,7 +5,6 @@ use crate::base::{
 use altevra_hooks::universal::UniversalHook;
 use altevra_skills::parser::ParsedSkill;
 use altevra_skills::renderer;
-use chrono::Utc;
 use std::path::Path;
 use tracing::info;
 
@@ -180,13 +179,11 @@ impl ToolAdapter for ClaudeCodeAdapter {
 
     fn render_skills(&self, skills: Vec<&ParsedSkill>) -> anyhow::Result<Vec<GeneratedFile>> {
         let mut files = vec![];
-        let now = Utc::now().to_rfc3339();
         for skill in skills {
             let content = renderer::render_with_header(
                 skill,
                 self.tool_name(),
                 &altevra_skills::checksum::compute(&skill.raw),
-                &now,
             );
             let path = format!(".claude/skills/{}.md", skill.slug());
             files.push(GeneratedFile::new(path, content));

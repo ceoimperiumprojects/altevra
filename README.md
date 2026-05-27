@@ -4,7 +4,7 @@ Local-first Agent OS — skills, hooks, and context delivery for AI-assisted dev
 
 ## Status: v5 Foundation — CI-green
 
-- 58 tests passing
+- 62 tests passing
 - `cargo fmt --check` clean
 - MCP server verified via stdio smoke
 

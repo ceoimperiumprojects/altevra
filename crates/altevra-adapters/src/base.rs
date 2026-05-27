@@ -1,6 +1,5 @@
 use altevra_hooks::universal::UniversalHook;
 use altevra_skills::parser::ParsedSkill;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -39,10 +38,8 @@ impl GeneratedFile {
              <!-- generated_by: altevra -->\n\
              <!-- adapter: {adapter} -->\n\
              <!-- version: {version} -->\n\
-             <!-- checksum: {checksum} -->\n\
-             <!-- generated_at: {now} -->\n\n",
+             <!-- checksum: {checksum} -->\n\n",
             checksum = self.checksum,
-            now = Utc::now().to_rfc3339(),
         );
         self.content = format!("{header}{}", self.content);
         self
@@ -132,4 +129,38 @@ pub trait ToolAdapter: Send + Sync {
     fn install(&self, plan: &InstallPlan, repo_path: &Path) -> anyhow::Result<InstallResult>;
     fn verify(&self, repo_path: &Path) -> anyhow::Result<VerifyResult>;
     fn repair(&self, repo_path: &Path) -> anyhow::Result<RepairPlan>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generated_file_with_managed_header_is_deterministic() {
+        let make =
+            || {
+                GeneratedFile::new(".claude/test.md", "content here".to_string())
+                    .with_managed_header("07-capabilities/test.yaml", "claude-code", "0.1.0")
+            };
+        let a = make();
+        let b = make();
+        assert_eq!(
+            a.content, b.content,
+            "with_managed_header must be deterministic"
+        );
+        assert_eq!(a.checksum, b.checksum);
+    }
+
+    #[test]
+    fn test_managed_header_no_timestamp() {
+        let file = GeneratedFile::new(".claude/test.md", "body".to_string()).with_managed_header(
+            "src.yaml",
+            "claude-code",
+            "0.1.0",
+        );
+        assert!(
+            !file.content.contains("generated_at"),
+            "header must not contain generated_at"
+        );
+    }
 }

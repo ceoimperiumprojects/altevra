@@ -10,7 +10,7 @@
 
 ## Current state (2026-05-27)
 
-**58 tests green. `cargo fmt --check` clean. MCP stdio verified.**
+**62 tests green. `cargo fmt --check` clean. MCP stdio verified.**
 
 Implemented:
 - `altevra init` — vault scaffolding with dry-run + JSON
