@@ -1,7 +1,10 @@
 [package]
 name = "altevra-cli"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
+license = "LicenseRef-PolyForm-Strict-1.0.0"
+description = "Altevra CLI — local-first omniscient brain layer for AI tools"
+repository = "https://github.com/ceoimperiumprojects/altevra"
 
 [[bin]]
 name = "altevra"

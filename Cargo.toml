@@ -1,5 +1,12 @@
 [workspace]
 resolver = "2"
+package.version = "0.3.0"
+package.edition = "2021"
+package.authors = ["Pavle Anđelković <ceoimperiumprojects@gmail.com>"]
+package.license = "LicenseRef-PolyForm-Strict-1.0.0"
+package.repository = "https://github.com/ceoimperiumprojects/Altevra"
+package.homepage = "https://github.com/ceoimperiumprojects/Altevra"
+package.description = "Local-first omniscient brain layer for AI tools. Source-available, PolyForm Strict licensed."
 members = [
     "crates/altevra-core",
     "crates/altevra-cli",

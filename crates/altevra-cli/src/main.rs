@@ -113,6 +113,9 @@ enum Commands {
     /// Autonomous brain daemon (periodic jobs: observer, classifier, indexer, ...)
     #[command(subcommand)]
     Brain(commands::brain::BrainCommands),
+
+    /// Print the Altevra banner / about screen
+    Banner(commands::banner::BannerArgs),
 }
 
 #[tokio::main]
@@ -152,5 +155,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Watch(cmd) => commands::watch::run(cmd).await,
         Commands::Embed(cmd) => commands::embed::run(cmd).await,
         Commands::Brain(cmd) => commands::brain::run(cmd).await,
+        Commands::Banner(args) => commands::banner::run(args).await,
     }
 }

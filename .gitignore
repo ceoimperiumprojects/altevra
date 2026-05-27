@@ -5,3 +5,13 @@
 .env
 .env.*
 !.env.example
+
+# Local runtime state (per-repo SQLite + event logs from altevra itself)
+.altevra/altevra.db
+.altevra/altevra.db-shm
+.altevra/altevra.db-wal
+.altevra/events/
+**/.altevra/altevra.db
+**/.altevra/altevra.db-shm
+**/.altevra/altevra.db-wal
+**/.altevra/events/

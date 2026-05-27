@@ -1,0 +1,29 @@
+Altevra
+Copyright 2026 Pavle Anđelković
+
+This product is licensed under the PolyForm Strict License 1.0.0.
+See LICENSE for the full text.
+
+For commercial licensing, contact:
+  ceoimperiumprojects@gmail.com
+
+================================================================================
+
+Third-party dependencies are licensed under their respective licenses.
+Run `cargo about generate` to produce a full dependency licensing report.
+
+Notable runtime dependencies:
+  - tokio (MIT)
+  - sqlx (Apache-2.0 OR MIT)
+  - reqwest (Apache-2.0 OR MIT)
+  - serde (MIT OR Apache-2.0)
+  - clap (MIT OR Apache-2.0)
+  - feed-rs (MIT)
+  - scraper (ISC)
+  - notify (CC0-1.0)
+
+================================================================================
+
+"Altevra" and the Altevra logomark are unregistered trademarks owned by
+Pavle Anđelković. Use of these marks in a commercial context requires
+written permission.
