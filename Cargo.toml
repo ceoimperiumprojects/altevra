@@ -48,6 +48,7 @@ rpassword = "7"
 walkdir = "2"
 strsim = "0.11"
 notify = "6"
+feed-rs = "2"
 altevra-core = { path = "crates/altevra-core" }
 altevra-db = { path = "crates/altevra-db" }
 altevra-skills = { path = "crates/altevra-skills" }

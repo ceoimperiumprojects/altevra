@@ -104,6 +104,65 @@ impl BootstrapBuilder {
         self
     }
 
+    /// Append "new since last session" research items to last_updates.
+    ///
+    /// Reads from the SQLite `research_items` table populated by
+    /// `altevra-brain`'s research_fetcher job. Items below `min_score` are
+    /// skipped. Top `limit` matches by score (then recency) are kept.
+    pub async fn with_recent_research(
+        mut self,
+        pool: &sqlx::SqlitePool,
+        since: DateTime<Utc>,
+        limit: usize,
+        min_score: f32,
+    ) -> Self {
+        let rows = sqlx::query(
+            r#"SELECT title, link, summary, relevance_score, ingested_at
+               FROM research_items
+               WHERE ingested_at >= ? AND relevance_score >= ?
+               ORDER BY relevance_score DESC, ingested_at DESC
+               LIMIT ?"#,
+        )
+        .bind(since.to_rfc3339())
+        .bind(min_score as f64)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await;
+        let Ok(rows) = rows else { return self };
+
+        for r in rows {
+            let title: String = sqlx::Row::try_get(&r, "title").unwrap_or_default();
+            let link: String = sqlx::Row::try_get(&r, "link").unwrap_or_default();
+            let summary: String = sqlx::Row::try_get(&r, "summary").unwrap_or_default();
+            let score: f64 = sqlx::Row::try_get(&r, "relevance_score").unwrap_or(0.0);
+            let ingested: String = sqlx::Row::try_get(&r, "ingested_at").unwrap_or_default();
+            let created_at = DateTime::parse_from_rfc3339(&ingested)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now());
+
+            let importance = if score >= 0.7 {
+                "High"
+            } else if score >= 0.4 {
+                "Medium"
+            } else {
+                "Low"
+            };
+
+            self.last_updates.push(UpdateSummary {
+                title,
+                importance: importance.to_string(),
+                update_type: "research".into(),
+                short_summary: if summary.len() > 240 {
+                    format!("{}…  ({link})", &summary[..240])
+                } else {
+                    format!("{summary} ({link})")
+                },
+                created_at,
+            });
+        }
+        self
+    }
+
     pub fn warning(mut self, w: impl Into<String>) -> Self {
         self.warnings.push(w.into());
         self

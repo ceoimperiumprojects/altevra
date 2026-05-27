@@ -203,15 +203,201 @@ pub async fn run_insight_synthesizer(
     })
 }
 
-/// Placeholder for RSS / web research. Wired in v0.3.5.
+/// Pull RSS/Atom feeds, dedupe via SQLite, score against project keywords,
+/// write daily Obsidian brief + per-project briefs.
+///
+/// Driven by `~/.altevra/research/feeds.yaml` (falls back to default packet).
 pub async fn run_research_fetcher(
-    _pool: &SqlitePool,
-    _ctx: &JobContext,
+    pool: &SqlitePool,
+    ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
+    use altevra_research::{
+        briefs::{write_daily_brief, write_project_brief, ScoredItem},
+        feeds::FeedConfig,
+        fetcher::fetch_feed,
+        relevance::{default_imperium_projects_path, load_imperium_projects, matching_projects},
+    };
+
+    let cfg = FeedConfig::load_or_default();
+    let projects_path = default_imperium_projects_path();
+    let projects = load_imperium_projects(&projects_path).unwrap_or_default();
+
+    let mut new_items = 0usize;
+    let mut scored_items: Vec<ScoredItem> = Vec::new();
+    let mut feeds_touched = 0usize;
+
+    let now = ctx.now;
+    for feed in cfg.enabled() {
+        // Skip if within fetch_interval since last_fetched_at.
+        let cache_hints = fetch_cache_hints(pool, &feed.id).await;
+        if let Some(last) = last_fetched_at(pool, &feed.id).await {
+            let elapsed = (now - last).num_minutes();
+            if elapsed >= 0 && (elapsed as u32) < feed.fetch_interval_minutes {
+                continue;
+            }
+        }
+
+        feeds_touched += 1;
+        let outcome = match fetch_feed(feed, cfg.window_days, &cache_hints).await {
+            Ok(o) => o,
+            Err(e) => {
+                record_feed_failure(pool, &feed.id, &e.to_string()).await;
+                tracing::warn!("research fetch failed for {}: {e}", feed.id);
+                continue;
+            }
+        };
+
+        record_feed_success(pool, &feed.id, &outcome).await;
+
+        for item in outcome.items {
+            // Idempotent insert — UNIQUE(feed_id, guid) prevents dupes.
+            let (max_score, matched) = matching_projects(&item, &projects, cfg.relevance_threshold);
+            let id = uuid::Uuid::new_v4().to_string();
+            let project_json = serde_json::to_string(&matched).unwrap_or_else(|_| "[]".into());
+            let published = item.published_at.map(|d| d.to_rfc3339());
+
+            let res = sqlx::query(
+                r#"INSERT OR IGNORE INTO research_items
+                       (id, feed_id, guid, link, title, summary, published_at,
+                        relevance_score, project_matches_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(&id)
+            .bind(&item.feed_id)
+            .bind(&item.guid)
+            .bind(&item.link)
+            .bind(&item.title)
+            .bind(&item.summary)
+            .bind(published)
+            .bind(max_score as f64)
+            .bind(&project_json)
+            .execute(pool)
+            .await;
+
+            let inserted = res.map(|r| r.rows_affected() > 0).unwrap_or(false);
+            if inserted {
+                new_items += 1;
+                scored_items.push(ScoredItem {
+                    item,
+                    score: max_score,
+                    matched_projects: matched,
+                });
+            }
+        }
+    }
+
+    // Briefs — only write if we have something new.
+    let mut briefs_written = 0usize;
+    if !scored_items.is_empty() {
+        if let Ok(path) = write_daily_brief(&cfg.brief_paths.daily_obsidian, &scored_items) {
+            tracing::info!("daily brief written to {}", path.display());
+            briefs_written += 1;
+        }
+        // Per-project briefs — one per matched project id.
+        let mut project_ids: Vec<String> = scored_items
+            .iter()
+            .flat_map(|i| i.matched_projects.iter().cloned())
+            .collect();
+        project_ids.sort();
+        project_ids.dedup();
+        for pid in &project_ids {
+            if let Ok(Some(path)) = write_project_brief(
+                &ctx.vault_path,
+                &cfg.brief_paths.project_vault,
+                pid,
+                &scored_items,
+            ) {
+                tracing::info!("project brief ({pid}) written to {}", path.display());
+                briefs_written += 1;
+            }
+        }
+    }
+
     Ok(JobResult {
-        summary: "no feeds configured".into(),
-        items_processed: 0,
+        summary: format!(
+            "fetched {feeds_touched} feeds, {new_items} new items, {briefs_written} brief(s) written"
+        ),
+        items_processed: new_items,
     })
+}
+
+async fn last_fetched_at(pool: &SqlitePool, feed_id: &str) -> Option<DateTime<Utc>> {
+    let row = sqlx::query("SELECT last_fetched_at FROM research_feed_state WHERE feed_id = ?")
+        .bind(feed_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()?;
+    let s: Option<String> = sqlx::Row::try_get(&row, "last_fetched_at").ok();
+    s.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+        .map(|d| d.with_timezone(&Utc))
+}
+
+async fn fetch_cache_hints(
+    pool: &SqlitePool,
+    feed_id: &str,
+) -> altevra_research::fetcher::FetchCacheHints {
+    let row =
+        sqlx::query("SELECT last_etag, last_modified FROM research_feed_state WHERE feed_id = ?")
+            .bind(feed_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    match row {
+        Some(r) => altevra_research::fetcher::FetchCacheHints {
+            etag: sqlx::Row::try_get::<Option<String>, _>(&r, "last_etag")
+                .ok()
+                .flatten(),
+            last_modified: sqlx::Row::try_get::<Option<String>, _>(&r, "last_modified")
+                .ok()
+                .flatten(),
+        },
+        None => altevra_research::fetcher::FetchCacheHints::default(),
+    }
+}
+
+async fn record_feed_success(
+    pool: &SqlitePool,
+    feed_id: &str,
+    outcome: &altevra_research::fetcher::FetchOutcome,
+) {
+    let now = Utc::now().to_rfc3339();
+    let _ = sqlx::query(
+        r#"INSERT INTO research_feed_state
+               (feed_id, last_fetched_at, last_etag, last_modified, fail_count, last_error)
+           VALUES (?, ?, ?, ?, 0, NULL)
+           ON CONFLICT(feed_id) DO UPDATE SET
+               last_fetched_at = excluded.last_fetched_at,
+               last_etag = excluded.last_etag,
+               last_modified = excluded.last_modified,
+               fail_count = 0,
+               last_error = NULL"#,
+    )
+    .bind(feed_id)
+    .bind(&now)
+    .bind(&outcome.new_etag)
+    .bind(&outcome.new_last_modified)
+    .execute(pool)
+    .await;
+}
+
+async fn record_feed_failure(pool: &SqlitePool, feed_id: &str, err: &str) {
+    let now = Utc::now().to_rfc3339();
+    let _ = sqlx::query(
+        r#"INSERT INTO research_feed_state
+               (feed_id, last_fetched_at, fail_count, last_error)
+           VALUES (?, ?, 1, ?)
+           ON CONFLICT(feed_id) DO UPDATE SET
+               last_fetched_at = excluded.last_fetched_at,
+               fail_count = research_feed_state.fail_count + 1,
+               last_error = excluded.last_error"#,
+    )
+    .bind(feed_id)
+    .bind(&now)
+    .bind(err)
+    .execute(pool)
+    .await;
 }
 
 /// Daily summary at 23:00 local. Writes a markdown file under
@@ -272,6 +458,46 @@ pub async fn dispatch(
 mod tests {
     use super::*;
 
+    async fn setup_research_schema() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Minimal schema needed for run_research_fetcher path.
+        sqlx::query(
+            r#"CREATE TABLE research_feed_state (
+                feed_id TEXT PRIMARY KEY,
+                last_fetched_at TEXT,
+                last_etag TEXT,
+                last_modified TEXT,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE research_items (
+                id TEXT PRIMARY KEY,
+                feed_id TEXT NOT NULL,
+                guid TEXT NOT NULL,
+                link TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                published_at TEXT,
+                ingested_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                relevance_score REAL NOT NULL DEFAULT 0.0,
+                project_matches_json TEXT NOT NULL DEFAULT '[]',
+                UNIQUE(feed_id, guid)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     #[test]
     fn job_kind_roundtrip() {
         for k in [
@@ -317,5 +543,78 @@ mod tests {
         // idempotent — second call returns 0
         let r2 = run_daily_summary(&pool, &ctx).await.unwrap();
         assert_eq!(r2.items_processed, 0);
+    }
+
+    #[tokio::test]
+    async fn record_feed_success_then_failure_increments_count() {
+        let pool = setup_research_schema().await;
+        let outcome = altevra_research::fetcher::FetchOutcome {
+            items: vec![],
+            new_etag: Some("\"abc\"".into()),
+            new_last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".into()),
+            status: 200,
+        };
+        record_feed_success(&pool, "feed-x", &outcome).await;
+        record_feed_failure(&pool, "feed-x", "DNS error").await;
+        let row =
+            sqlx::query("SELECT fail_count, last_error FROM research_feed_state WHERE feed_id = ?")
+                .bind("feed-x")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let count: i64 = sqlx::Row::try_get(&row, "fail_count").unwrap();
+        let err: String = sqlx::Row::try_get(&row, "last_error").unwrap();
+        assert_eq!(count, 1);
+        assert!(err.contains("DNS"));
+    }
+
+    #[tokio::test]
+    async fn research_fetcher_returns_when_no_feeds_reachable() {
+        // We can't hit real network in unit tests, so verify the job itself
+        // doesn't panic when feeds resolve to no items. The default-packet
+        // load path is exercised via test below.
+        let pool = setup_research_schema().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+        };
+        // Override feeds.yaml to a single bad URL so the loop runs and records a failure
+        // instead of trying to hit real RSS endpoints.
+        let yaml = r#"
+feeds:
+  - id: bad-feed
+    name: Bad
+    url: https://this-domain-does-not-exist-altevra-test.invalid/rss
+    type: rss
+    category: test
+    trust_weight: 0.1
+    enabled: true
+    fetch_interval_minutes: 60
+window_days: 7
+relevance_threshold: 0.4
+"#;
+        let feeds_dir = tmp.path().join(".altevra-research");
+        std::fs::create_dir_all(&feeds_dir).unwrap();
+        let feeds_path = feeds_dir.join("feeds.yaml");
+        std::fs::write(&feeds_path, yaml).unwrap();
+
+        // Point HOME at tmp so default_path() resolves there.
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        let alt_feeds = tmp.path().join(".altevra").join("research");
+        std::fs::create_dir_all(&alt_feeds).unwrap();
+        std::fs::copy(&feeds_path, alt_feeds.join("feeds.yaml")).unwrap();
+
+        let r = run_research_fetcher(&pool, &ctx).await.unwrap();
+        // Either DNS resolves or fails — either way job completes without panic
+        // and items_processed is 0 because no items came back.
+        assert!(r.summary.contains("feeds"));
+
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
+        }
     }
 }

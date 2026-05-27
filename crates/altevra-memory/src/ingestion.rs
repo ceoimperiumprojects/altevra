@@ -60,6 +60,51 @@ pub fn ingest_text(text: &str, source: Option<PathBuf>, chunk_size: usize) -> In
     }
 }
 
+/// Ingest a remote URL's textual content with enriched frontmatter (title, source tag, URL).
+/// The frontmatter is built and prepended to the body so downstream callers can preserve
+/// provenance when indexing the result.
+pub fn ingest_url_content(
+    url: &str,
+    title: &str,
+    content: &str,
+    source_tag: &str,
+    chunk_size: usize,
+) -> IngestedDocument {
+    let body = format!(
+        "---\nkind: external-content\nsource: {src}\nurl: {url}\ntitle: {title}\nfetched_at: {ts}\n---\n\n{content}\n",
+        src = source_tag,
+        url = url,
+        title = sanitize_yaml_value(title),
+        ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        content = content,
+    );
+    // Build a deterministic synthetic source path so two ingests of the same URL produce
+    // identical paths (helps with dedup at the repository layer).
+    let safe = sanitize_path_segment(url);
+    let source = PathBuf::from(format!("<{source_tag}>/{safe}.md"));
+    ingest_text(&body, Some(source), chunk_size)
+}
+
+fn sanitize_yaml_value(s: &str) -> String {
+    s.replace('"', "'")
+        .replace('\n', " ")
+        .chars()
+        .take(180)
+        .collect()
+}
+
+fn sanitize_path_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn effective_chunk_size(requested: usize) -> usize {
     if requested == 0 {
         DEFAULT_CHUNK_SIZE
@@ -207,5 +252,35 @@ mod tests {
         let (fm, body) = split_frontmatter("---\nkey: value\nnot closed\n");
         assert!(fm.is_none());
         assert!(body.starts_with("---"));
+    }
+
+    #[test]
+    fn ingest_url_content_builds_frontmatter() {
+        let doc = ingest_url_content(
+            "https://example.com/post",
+            "Cool Article",
+            "First paragraph.\n\nSecond.",
+            "research:hn-frontpage",
+            DEFAULT_CHUNK_SIZE,
+        );
+        let fm = doc.frontmatter.expect("frontmatter present");
+        assert_eq!(
+            fm.get("kind").and_then(|v| v.as_str()),
+            Some("external-content")
+        );
+        assert_eq!(
+            fm.get("source").and_then(|v| v.as_str()),
+            Some("research:hn-frontpage")
+        );
+        assert_eq!(
+            fm.get("url").and_then(|v| v.as_str()),
+            Some("https://example.com/post")
+        );
+        assert!(!doc.chunks.is_empty());
+        // Deterministic source path for dedup.
+        assert!(doc
+            .source_path
+            .to_string_lossy()
+            .contains("research:hn-frontpage"));
     }
 }
