@@ -1,0 +1,30 @@
+[package]
+name = "altevra-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "altevra"
+path = "src/main.rs"
+
+[dependencies]
+altevra-core = { workspace = true }
+altevra-skills = { workspace = true }
+altevra-hooks = { workspace = true }
+altevra-adapters = { workspace = true }
+altevra-bootstrap = { workspace = true }
+altevra-mcp = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

@@ -1,0 +1,16 @@
+{
+  "_altevra_managed": true,
+  "_note": "Manual step: add the 'mcpServers' block below into your project-scoped .mcp.json or into ~/.claude/mcp_config.json. Do NOT paste into ~/.claude/settings.json.",
+  "mcpServers": {
+    "altevra": {
+      "command": "altevra",
+      "args": ["serve", "--vault", "/data/pavle/projekti/Altevra"],
+      "type": "stdio"
+    }
+  },
+  "usage": {
+    "project_scoped": "Create or edit .mcp.json at your project root and paste the mcpServers block.",
+    "global": "Add the mcpServers block to ~/.claude/mcp_config.json (not settings.json).",
+    "verify": "claude mcp list  # should show 'altevra' as connected"
+  }
+}

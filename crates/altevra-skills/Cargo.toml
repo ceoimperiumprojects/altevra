@@ -1,0 +1,17 @@
+[package]
+name = "altevra-skills"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+altevra-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

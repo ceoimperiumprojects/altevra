@@ -1,0 +1,62 @@
+# Altevra Agent Tools Capability Matrix
+# Version: 0.1.0
+# ALTEVRA_MANAGED: true
+# What each tool supports determines how Altevra installs/configures it.
+
+tools:
+  - name: claude-code
+    adapter: claude_code
+    adapter_version: "0.1.0"
+    supports_native_hooks: true
+    supports_mcp: true
+    supports_skills: true
+    supports_instructions: true
+    instructions_file: "CLAUDE.md or .claude/altevra-instructions.md"
+    hooks_config: ".claude/settings.json"
+    skills_dir: ".claude/skills/"
+    notes: "Full adapter support. Primary target. Use altevra connect --tool claude-code."
+
+  - name: codex
+    adapter: codex
+    adapter_version: "0.1.0"
+    supports_native_hooks: false
+    supports_mcp: false
+    supports_skills: true
+    supports_instructions: true
+    instructions_file: "AGENTS.md"
+    hooks_config: null
+    skills_dir: null
+    notes: "CLI fallback only. No native hook support. Skills injected via AGENTS.md."
+
+  - name: cursor
+    adapter: cursor
+    adapter_version: "0.1.0"
+    supports_native_hooks: false
+    supports_mcp: false
+    supports_skills: true
+    supports_instructions: true
+    instructions_file: ".cursor/rules/altevra.mdc"
+    hooks_config: null
+    skills_dir: null
+    notes: "Rules-based. CLI fallback for hooks."
+
+  - name: aider
+    adapter: aider
+    adapter_version: "0.1.0"
+    supports_native_hooks: false
+    supports_mcp: false
+    supports_skills: true
+    supports_instructions: true
+    instructions_file: "CONVENTIONS.md"
+    hooks_config: null
+    skills_dir: ".aider/commands/"
+    notes: "CONVENTIONS.md based."
+
+  - name: antigravity
+    adapter: antigravity
+    adapter_version: "0.1.0"
+    supports_native_hooks: false
+    supports_mcp: false
+    supports_skills: false
+    supports_instructions: false
+    notes: "No assumptions until adapter dossier confirmed. Placeholder only."

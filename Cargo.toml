@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/altevra-core",
+    "crates/altevra-cli",
+    "crates/altevra-db",
+    "crates/altevra-skills",
+    "crates/altevra-hooks",
+    "crates/altevra-adapters",
+    "crates/altevra-bootstrap",
+    "crates/altevra-mcp",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7" }
+reqwest = { version = "0.12", features = ["json"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+config = "0.14"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+pulldown-cmark = "0.11"
+regex = "1"
+async-trait = "0.1"
+futures = "0.3"
+altevra-core = { path = "crates/altevra-core" }
+altevra-db = { path = "crates/altevra-db" }
+altevra-skills = { path = "crates/altevra-skills" }
+altevra-hooks = { path = "crates/altevra-hooks" }
+altevra-adapters = { path = "crates/altevra-adapters" }
+altevra-bootstrap = { path = "crates/altevra-bootstrap" }
+altevra-mcp = { path = "crates/altevra-mcp" }
+tempfile = "3"

@@ -1,0 +1,31 @@
+{
+  "_altevra_managed": true,
+  "tool": "claude-code",
+  "adapter_version": "0.1.0",
+  "generated_by": "altevra connect --tool claude-code --dry-run",
+  "generated_at": "2026-05-27T03:00:00Z",
+  "status": "dry-run-preview",
+  "files": [
+    {
+      "path": ".claude/altevra-instructions.md",
+      "action": "create",
+      "managed": true,
+      "description": "Altevra context instructions for Claude Code sessions"
+    },
+    {
+      "path": ".claude/skills/altevra-core.md",
+      "action": "create",
+      "managed": true,
+      "description": "Altevra core skill file — injected into Claude Code context"
+    },
+    {
+      "path": ".claude/settings.json",
+      "action": "create",
+      "managed": true,
+      "description": "Claude Code hook configuration for session_start/session_end"
+    }
+  ],
+  "hooks": ["session_start", "session_end"],
+  "skills": ["altevra-core"],
+  "note": "Run 'altevra connect --tool claude-code --project <project>' to apply."
+}

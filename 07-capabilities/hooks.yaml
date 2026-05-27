@@ -1,0 +1,51 @@
+# Altevra Universal Hooks Registry
+# Version: 0.1.0
+# ALTEVRA_MANAGED: true
+
+hooks:
+  - slug: session_start
+    version: "0.1.0"
+    hook_type: session_start
+    enabled: true
+    actions:
+      - check_skill_version
+      - get_last_updates
+      - get_project_context
+      - start_session_log
+    description: "Bootstrap agent context at session start."
+    cli_command: "altevra hook run session_start --tool {tool} --project {project} --json"
+
+  - slug: session_end
+    version: "0.1.0"
+    hook_type: session_end
+    enabled: true
+    actions:
+      - end_session_log
+      - emit_event
+    description: "Finalize session log and emit session_ended event."
+    cli_command: "altevra hook run session_end --tool {tool} --project {project} --json"
+
+  - slug: on_error
+    version: "0.1.0"
+    hook_type: on_error
+    enabled: true
+    actions:
+      - emit_event
+      - create_review_item
+    description: "Log errors as events and create review items."
+
+  - slug: on_skill_check
+    version: "0.1.0"
+    hook_type: on_skill_check
+    enabled: false
+    actions:
+      - check_skill_version
+    description: "Check skill version before work. Disabled by default — enable per tool."
+
+  - slug: on_task_complete
+    version: "0.1.0"
+    hook_type: on_task_complete
+    enabled: false
+    actions:
+      - emit_event
+    description: "Emit event when a task is marked complete."

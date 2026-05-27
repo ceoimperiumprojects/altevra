@@ -1,0 +1,17 @@
+[package]
+name = "altevra-adapters"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+altevra-core = { workspace = true }
+altevra-skills = { workspace = true }
+altevra-hooks = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
