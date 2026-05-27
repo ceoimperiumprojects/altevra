@@ -3,6 +3,7 @@ pub mod config;
 pub mod connect;
 pub mod context;
 pub mod doctor;
+pub mod embed;
 pub mod hook;
 pub mod hook_handle;
 pub mod init;

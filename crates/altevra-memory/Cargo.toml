@@ -17,6 +17,7 @@ regex = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+sqlx = { workspace = true }
 altevra-core = { workspace = true }
 altevra-vault = { workspace = true }
 altevra-secrets = { workspace = true }

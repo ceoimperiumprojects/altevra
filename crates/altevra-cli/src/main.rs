@@ -98,6 +98,10 @@ enum Commands {
     /// File watcher daemon — emits FileChanged events and queues for embedding
     #[command(subcommand)]
     Watch(commands::watch::WatchCommands),
+
+    /// Continuous embedder worker (drains pending_indexing → Gemini → vectors)
+    #[command(subcommand)]
+    Embed(commands::embed::EmbedCommands),
 }
 
 #[tokio::main]
@@ -133,5 +137,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Turn(args) => commands::turn::run(args).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,
+        Commands::Embed(cmd) => commands::embed::run(cmd).await,
     }
 }
