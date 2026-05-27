@@ -263,6 +263,26 @@ Hooks fail with `altevra: command not found` because the binary lives in
 `~/.local/bin/altevra` → release build. Future `altevra setup` wizard
 should automate this on first run.
 
+### 2026-05-28 — Next architecture adopted: Resident Agent + Wiki Layer
+Pavle delivered a load-bearing architecture document defining the next
+build phase: Resident Agent with modes (memory_curator, synthesis,
+daily_briefing, wiki_curator, insight, observer), Wiki Layer (living
+knowledge pages distinct from raw notes), Context Packet System (no full
+vault dumps), Token Economy Rules (cheap models perform well via good
+context, not just bigger models), Model Routing roles (cheap_worker,
+strong_reasoner, local_private, embedding, reranker), Personal Brain
+Layer (17 personal data types + identity seeds + sensitivity labels),
+Relevance Gate (no random research). Document: `ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md`.
+
+This supersedes the v0.4-v0.8 sketches in
+`~/.claude/plans/sleepy-soaring-cosmos.md`. Build order from that
+document's §20: Phase 1 (prompt + schema foundation), Phase 2 (wiki
+skeleton), Phase 3 (resident runtime), Phase 4 (wiki curator),
+Phase 5 (personal brain), Phase 6 (daily briefing).
+
+Phase 1 is unblocked NOW (no LLM dependency — pure markdown + JSON
+schemas + small CLI). Phases 3+ are gated on v0.3.9 multi-provider LLM.
+
 ---
 
 ## 8. Quotes to hold onto
@@ -283,6 +303,34 @@ should automate this on first run.
 
 > *"Ovo je stvarno jedan kontekst inženjering na jednom jako visokom
 > nivou."*
+
+---
+
+## 9. Companion documents (READ THESE TOO)
+
+After reading this file, every agent must also read:
+
+1. **`ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md`**
+   (in repo root) — defines the next-phase architecture: Resident Agent
+   layer with modes, Wiki Layer (living knowledge pages), Context Packet
+   System, Token Economy Rules, Model Routing roles, Personal Brain Layer,
+   Relevance Gate, Daily Capture Protocol, Auto-Wiki Pipeline. This
+   document is the **source-of-truth for build phase v0.4+** and replaces
+   the rough sketches in `~/.claude/plans/sleepy-soaring-cosmos.md`
+   for everything after v0.3.10.
+
+2. **`~/Obsidian/Imperium/Memory/Decisions.md`** — human-facing
+   record of every material decision made over the project's life.
+
+The hierarchy is:
+
+```
+CLAUDE.md (this file)         ← WHY Altevra exists, vision gate
+   ↓
+ALTEVRA_NEXT_ARCHITECTURE...md ← WHAT Altevra becomes next (concrete)
+   ↓
+.planning/                    ← HOW the current sub-version gets built
+```
 
 ---
 
