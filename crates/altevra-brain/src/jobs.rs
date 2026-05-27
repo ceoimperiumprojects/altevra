@@ -16,6 +16,7 @@ pub enum JobKind {
     ResearchFetcher,
     FeedDiscovery,
     GitHubTrendingFetch,
+    ProjectResearchSweep,
     DailySummary,
     TaskGrooming,
 }
@@ -30,6 +31,7 @@ impl JobKind {
             Self::ResearchFetcher => "research_fetcher",
             Self::FeedDiscovery => "feed_discovery",
             Self::GitHubTrendingFetch => "github_trending_fetch",
+            Self::ProjectResearchSweep => "project_research_sweep",
             Self::DailySummary => "daily_summary",
             Self::TaskGrooming => "task_grooming",
         }
@@ -44,6 +46,7 @@ impl JobKind {
             "research_fetcher" => Self::ResearchFetcher,
             "feed_discovery" => Self::FeedDiscovery,
             "github_trending_fetch" => Self::GitHubTrendingFetch,
+            "project_research_sweep" => Self::ProjectResearchSweep,
             "daily_summary" => Self::DailySummary,
             "task_grooming" => Self::TaskGrooming,
             _ => return None,
@@ -60,8 +63,9 @@ impl JobKind {
             Self::InsightSynthesizer => 3600,
             Self::ResearchFetcher => 7200,
             Self::FeedDiscovery => 3600,
-            Self::GitHubTrendingFetch => 14_400, // 4h
-            Self::DailySummary => 3600,          // tick hourly, fire only at 23:00
+            Self::GitHubTrendingFetch => 14_400,  // 4h
+            Self::ProjectResearchSweep => 86_400, // 24h
+            Self::DailySummary => 3600,           // tick hourly, fire only at 23:00
             Self::TaskGrooming => 10_800,
         }
     }
@@ -583,6 +587,142 @@ pub async fn run_github_trending_fetch(
     })
 }
 
+/// Per-project agent sweep. For every project in
+/// `~/.imperium/identity/projects.yaml` (with optional per-project YAML override
+/// at `~/.altevra/research/projects/<id>.yaml`), run web search for each
+/// configured query against DuckDuckGo (free; Brave/Exa if keys present),
+/// and insert top-N items into research_items with source_kind='web-search'.
+pub async fn run_project_research_sweep(
+    pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_research::projects::ProjectAgent;
+    use altevra_research::sources::web_search::{WebSearchProviderKind, WebSearchSource};
+    use altevra_research::sources::{FetchCtx, SourceProvider};
+
+    let identity_path = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+        .join(".imperium")
+        .join("identity")
+        .join("projects.yaml");
+    if !identity_path.exists() {
+        return Ok(JobResult {
+            summary: "no ~/.imperium/identity/projects.yaml — skipping project sweep".into(),
+            items_processed: 0,
+        });
+    }
+    let agents = ProjectAgent::load_all(&identity_path).unwrap_or_default();
+    if agents.is_empty() {
+        return Ok(JobResult {
+            summary: "no project agents loaded".into(),
+            items_processed: 0,
+        });
+    }
+
+    let brave_key = std::env::var("BRAVE_API_KEY").ok();
+    let exa_key = std::env::var("EXA_API_KEY").ok();
+    let mut total_new = 0usize;
+    let mut projects_touched = 0usize;
+
+    for agent in &agents {
+        projects_touched += 1;
+        let queries_to_run = agent
+            .queries
+            .iter()
+            .take(agent.daily_budget_queries.min(20) as usize)
+            .cloned()
+            .collect::<Vec<_>>();
+        if queries_to_run.is_empty() {
+            continue;
+        }
+
+        for query in &queries_to_run {
+            let mut source = WebSearchSource::new(query.clone());
+            // Provider chain: Brave (if keyed) → Exa (if keyed) → DDG.
+            let mut chain = Vec::new();
+            if brave_key.is_some() {
+                chain.push(WebSearchProviderKind::Brave);
+            }
+            if exa_key.is_some() {
+                chain.push(WebSearchProviderKind::Exa);
+            }
+            chain.push(WebSearchProviderKind::DuckDuckGo);
+            source = source.with_chain(chain);
+            if let Some(k) = &brave_key {
+                source = source.with_brave(k);
+            }
+            if let Some(k) = &exa_key {
+                source = source.with_exa(k);
+            }
+
+            let ctx = FetchCtx {
+                limit: 10,
+                ..Default::default()
+            };
+            let items = match source.fetch(&ctx).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("web search failed for '{query}': {e}");
+                    continue;
+                }
+            };
+            for item in items {
+                let id = uuid::Uuid::new_v4().to_string();
+                let project_match = serde_json::json!([agent.project_id.clone()]).to_string();
+                let res = sqlx::query(
+                    r#"INSERT OR IGNORE INTO research_items
+                           (id, feed_id, guid, link, title, summary, published_at,
+                            relevance_score, project_matches_json, source_kind)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'web-search')"#,
+                )
+                .bind(&id)
+                .bind(&item.feed_id)
+                .bind(&item.guid)
+                .bind(&item.link)
+                .bind(&item.title)
+                .bind(&item.summary)
+                .bind(item.published_at.map(|d| d.to_rfc3339()))
+                .bind(0.5f64)
+                .bind(&project_match)
+                .execute(pool)
+                .await;
+                if let Ok(r) = res {
+                    if r.rows_affected() > 0 {
+                        total_new += 1;
+                    }
+                }
+            }
+        }
+
+        // Update per-project state.
+        let now = Utc::now().to_rfc3339();
+        let queries_used = queries_to_run.len() as i64;
+        let _ = sqlx::query(
+            r#"INSERT INTO project_research_state
+                   (project_id, last_run_at, queries_used_today, daily_budget)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(project_id) DO UPDATE SET
+                   last_run_at = excluded.last_run_at,
+                   queries_used_today = excluded.queries_used_today,
+                   daily_budget = excluded.daily_budget"#,
+        )
+        .bind(&agent.project_id)
+        .bind(&now)
+        .bind(queries_used)
+        .bind(agent.daily_budget_queries as i64)
+        .execute(pool)
+        .await;
+    }
+
+    Ok(JobResult {
+        summary: format!(
+            "project sweep: {projects_touched} project(s), {total_new} new web-search item(s)"
+        ),
+        items_processed: total_new,
+    })
+}
+
 pub async fn dispatch(
     kind: JobKind,
     pool: &SqlitePool,
@@ -596,6 +736,7 @@ pub async fn dispatch(
         JobKind::ResearchFetcher => run_research_fetcher(pool, ctx).await,
         JobKind::FeedDiscovery => run_feed_discovery(pool, ctx).await,
         JobKind::GitHubTrendingFetch => run_github_trending_fetch(pool, ctx).await,
+        JobKind::ProjectResearchSweep => run_project_research_sweep(pool, ctx).await,
         JobKind::DailySummary => run_daily_summary(pool, ctx).await,
         JobKind::TaskGrooming => run_task_grooming(pool, ctx).await,
     }
@@ -655,10 +796,32 @@ mod tests {
             JobKind::ResearchFetcher,
             JobKind::FeedDiscovery,
             JobKind::GitHubTrendingFetch,
+            JobKind::ProjectResearchSweep,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
         ] {
             assert_eq!(JobKind::from_str(k.as_str()), Some(k));
+        }
+    }
+
+    #[tokio::test]
+    async fn project_research_sweep_returns_when_no_identity_file() {
+        // Without ~/.imperium/identity/projects.yaml the job should bail
+        // gracefully with a skip message, not panic.
+        let pool = setup_research_schema().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+        };
+        let r = run_project_research_sweep(&pool, &ctx).await.unwrap();
+        assert!(r.summary.to_lowercase().contains("no"));
+        if let Some(h) = old_home {
+            std::env::set_var("HOME", h);
+        } else {
+            std::env::remove_var("HOME");
         }
     }
 

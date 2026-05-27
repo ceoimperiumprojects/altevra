@@ -79,6 +79,7 @@ impl BrainScheduler {
             JobKind::ResearchFetcher,
             JobKind::FeedDiscovery,
             JobKind::GitHubTrendingFetch,
+            JobKind::ProjectResearchSweep,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
         ] {
@@ -299,6 +300,7 @@ mod tests {
                 "feed_discovery".into(),
                 "github_trending_fetch".into(),
                 "research_fetcher".into(),
+                "project_research_sweep".into(),
             ],
             ..BrainConfig::default()
         };
@@ -321,6 +323,7 @@ mod tests {
                 "feed_discovery".into(),
                 "github_trending_fetch".into(),
                 "research_fetcher".into(),
+                "project_research_sweep".into(),
             ],
             ..BrainConfig::default()
         };
@@ -350,6 +353,7 @@ mod tests {
                 "research_fetcher".into(),
                 "feed_discovery".into(),
                 "github_trending_fetch".into(),
+                "project_research_sweep".into(),
                 "task_grooming".into(),
             ],
             ..BrainConfig::default()

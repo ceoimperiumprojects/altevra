@@ -23,6 +23,54 @@ pub enum ResearchCommands {
     RunNow(RunNowArgs),
     /// Fetch GitHub Trending repos for a given language
     Trending(TrendingArgs),
+    /// Run a web search query (DuckDuckGo by default; Brave/Exa if keys set)
+    Search(SearchArgs),
+    /// Manage per-project research agents
+    #[command(subcommand)]
+    Projects(ProjectsCommands),
+}
+
+#[derive(Subcommand)]
+pub enum ProjectsCommands {
+    /// List configured project agents (from ~/.imperium/identity/projects.yaml)
+    List(ProjectsListArgs),
+    /// Show one project agent's keywords / queries / budget
+    Show(ProjectsShowArgs),
+    /// Open the per-project override YAML in $EDITOR
+    Edit(ProjectsEditArgs),
+}
+
+#[derive(Args)]
+pub struct SearchArgs {
+    pub query: String,
+    /// Optional project_id — tags the results in research_items
+    #[arg(long)]
+    pub project: Option<String>,
+    /// Provider chain: ddg | brave | exa (multiple allowed, tried in order)
+    #[arg(long, value_delimiter = ',')]
+    pub provider: Vec<String>,
+    #[arg(long, default_value_t = 10)]
+    pub limit: usize,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ProjectsListArgs {
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ProjectsShowArgs {
+    pub project_id: String,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct ProjectsEditArgs {
+    pub project_id: String,
 }
 
 #[derive(Subcommand)]
@@ -200,6 +248,8 @@ pub async fn run(cmd: ResearchCommands) -> anyhow::Result<()> {
         ResearchCommands::Feeds(cmd) => run_feeds(cmd).await,
         ResearchCommands::RunNow(args) => run_now(args).await,
         ResearchCommands::Trending(args) => run_trending(args).await,
+        ResearchCommands::Search(args) => run_search(args).await,
+        ResearchCommands::Projects(cmd) => run_projects(cmd).await,
     }
 }
 
@@ -506,6 +556,183 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(max).collect();
     out.push('…');
     out
+}
+
+// ---- v0.3.7.5 Batch B: search + projects ------------------------------------
+
+async fn run_search(args: SearchArgs) -> anyhow::Result<()> {
+    use altevra_research::sources::web_search::{WebSearchProviderKind, WebSearchSource};
+    use altevra_research::sources::{FetchCtx, SourceProvider};
+
+    let mut chain: Vec<WebSearchProviderKind> = if args.provider.is_empty() {
+        vec![WebSearchProviderKind::DuckDuckGo]
+    } else {
+        args.provider
+            .iter()
+            .filter_map(|p| match p.as_str() {
+                "ddg" | "duckduckgo" => Some(WebSearchProviderKind::DuckDuckGo),
+                "brave" => Some(WebSearchProviderKind::Brave),
+                "exa" => Some(WebSearchProviderKind::Exa),
+                _ => None,
+            })
+            .collect()
+    };
+    if chain.is_empty() {
+        chain.push(WebSearchProviderKind::DuckDuckGo);
+    }
+
+    let mut source = WebSearchSource::new(args.query.clone()).with_chain(chain);
+    if let Ok(k) = std::env::var("BRAVE_API_KEY") {
+        source = source.with_brave(k);
+    }
+    if let Ok(k) = std::env::var("EXA_API_KEY") {
+        source = source.with_exa(k);
+    }
+    let ctx = FetchCtx {
+        limit: args.limit,
+        ..Default::default()
+    };
+    let items = source.fetch(&ctx).await?;
+    let no_keys = std::env::var("BRAVE_API_KEY").is_err() && std::env::var("EXA_API_KEY").is_err();
+    let ddg_blocked_hint = items.is_empty() && no_keys;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "query": args.query,
+                "project": args.project,
+                "count": items.len(),
+                "items": items,
+                "ddg_blocked_hint": ddg_blocked_hint,
+            }))?
+        );
+    } else {
+        println!("Web search for '{}' ({} results):", args.query, items.len());
+        for it in &items {
+            println!("  {} — {}", it.title, it.link);
+            if !it.summary.is_empty() {
+                println!("    {}", truncate(&it.summary, 200));
+            }
+        }
+        if ddg_blocked_hint {
+            println!();
+            println!("Hint: DuckDuckGo blocks scrapers in 2026. For reliable web search set:");
+            println!("  BRAVE_API_KEY=...   (free 2000 req/mo at brave.com/search/api)");
+            println!("  EXA_API_KEY=...     (paid, AI-aware search at exa.ai)");
+            println!("Then re-run with --provider brave or --provider exa.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_projects(cmd: ProjectsCommands) -> anyhow::Result<()> {
+    match cmd {
+        ProjectsCommands::List(args) => run_projects_list(args).await,
+        ProjectsCommands::Show(args) => run_projects_show(args).await,
+        ProjectsCommands::Edit(args) => run_projects_edit(args).await,
+    }
+}
+
+fn identity_path() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+        .join(".imperium")
+        .join("identity")
+        .join("projects.yaml")
+}
+
+async fn run_projects_list(args: ProjectsListArgs) -> anyhow::Result<()> {
+    let path = identity_path();
+    if !path.exists() {
+        if args.json {
+            println!("[]");
+        } else {
+            println!(
+                "No ~/.imperium/identity/projects.yaml found at {}",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    let agents = altevra_research::projects::ProjectAgent::load_all(&path)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&agents)?);
+    } else {
+        println!("{} project agent(s):", agents.len());
+        for a in &agents {
+            println!(
+                "  [{}] {} — {} kw, {} queries, budget={}",
+                a.priority.as_deref().unwrap_or("?"),
+                a.project_id,
+                a.keywords.len(),
+                a.queries.len(),
+                a.daily_budget_queries,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn run_projects_show(args: ProjectsShowArgs) -> anyhow::Result<()> {
+    let agents = altevra_research::projects::ProjectAgent::load_all(&identity_path())?;
+    let agent = agents
+        .iter()
+        .find(|a| a.project_id == args.project_id)
+        .ok_or_else(|| anyhow::anyhow!("no project agent for id '{}'", args.project_id))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(agent)?);
+    } else {
+        println!("Project: {}", agent.project_id);
+        if let Some(p) = &agent.priority {
+            println!("  Priority: {p}");
+        }
+        println!("  Keywords ({}):", agent.keywords.len());
+        for k in &agent.keywords {
+            println!("    - {k}");
+        }
+        println!("  Queries ({}):", agent.queries.len());
+        for q in &agent.queries {
+            println!("    - {q}");
+        }
+        println!("  Sources enabled: {}", agent.sources_enabled.join(", "));
+        println!("  Daily budget queries: {}", agent.daily_budget_queries);
+        if let Some(f) = &agent.leverage_focus {
+            println!("  Leverage focus: {f}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_projects_edit(args: ProjectsEditArgs) -> anyhow::Result<()> {
+    let dir = altevra_research::projects::ProjectAgent::override_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.yaml", args.project_id));
+    if !path.exists() {
+        let stub = format!(
+            "# Per-project override for {}\nproject_id: {}\nkeywords: []\nqueries: []\nsources_enabled: [rss, github_trending, web_search]\ndaily_budget_queries: 5\nleverage_focus: \"\"\n",
+            args.project_id, args.project_id
+        );
+        std::fs::write(&path, stub)?;
+    }
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".into());
+    let status = std::process::Command::new(&editor).arg(&path).status();
+    match status {
+        Ok(s) if s.success() => {
+            println!("Saved {}", path.display());
+            Ok(())
+        }
+        Ok(s) => anyhow::bail!("editor exited with status {s}"),
+        Err(e) => {
+            // Fall back to printing the path if the editor can't be launched.
+            println!(
+                "Could not launch editor '{editor}': {e}. Edit the file directly: {}",
+                path.display()
+            );
+            Ok(())
+        }
+    }
 }
 
 fn feeds_path(override_path: Option<PathBuf>) -> PathBuf {
