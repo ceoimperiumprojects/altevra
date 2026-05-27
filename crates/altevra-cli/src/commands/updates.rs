@@ -84,12 +84,50 @@ fn parse_since(s: &str) -> chrono::DateTime<Utc> {
 }
 
 fn load_local_updates(
-    _project: &Option<String>,
-    _since: chrono::DateTime<Utc>,
+    project: &Option<String>,
+    since: chrono::DateTime<Utc>,
 ) -> Vec<UpdateFeedItem> {
-    // Loads from .altevra/events/*.jsonl in current directory if available
-    // Returns empty for MVP without DB
-    vec![]
+    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    if !path.exists() {
+        return vec![];
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut items: Vec<UpdateFeedItem> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|item: &UpdateFeedItem| item.created_at >= since)
+        .filter(|item: &UpdateFeedItem| {
+            project.as_deref().map_or(true, |p| {
+                item.update_type.contains(p)
+                    || item.title.contains(p)
+                    || item.short_summary.contains(p)
+            })
+        })
+        .collect();
+    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items
+}
+
+/// Append a single UpdateFeedItem as a JSONL line to the local events file.
+pub fn append_local_update(item: &UpdateFeedItem) {
+    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(line) = serde_json::to_string(item) {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(file, "{line}");
+        }
+    }
 }
 
 #[cfg(test)]

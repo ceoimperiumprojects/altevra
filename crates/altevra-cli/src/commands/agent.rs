@@ -137,7 +137,94 @@ async fn run_bootstrap(args: AgentBootstrapArgs) -> anyhow::Result<()> {
 }
 
 async fn run_status(args: AgentStatusArgs) -> anyhow::Result<()> {
-    let status = SetupStatus::placeholder(&args.tool);
+    use altevra_bootstrap::setup_status::{ComponentCheck, ComponentStatus, SetupStatus};
+
+    let repo = std::path::Path::new(".");
+
+    let vault_ok = repo.join(".altevra/config.toml").exists();
+    let skills_ok = repo.join("06-skills").is_dir()
+        && std::fs::read_dir(repo.join("06-skills"))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            })
+            .unwrap_or(false);
+    let claude_instructions_ok = repo.join(".claude/altevra-instructions.md").exists();
+    let claude_settings_ok = repo.join(".claude/settings.json").exists();
+    let skills_installed_ok = repo.join(".claude/skills").is_dir()
+        && std::fs::read_dir(repo.join(".claude/skills"))
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            })
+            .unwrap_or(false);
+
+    let mk = |component: &str, ok: bool, path: Option<&str>, fix: &str| ComponentCheck {
+        component: component.into(),
+        status: if ok {
+            ComponentStatus::Current
+        } else {
+            ComponentStatus::Missing
+        },
+        path: path.map(Into::into),
+        note: if ok { None } else { Some(fix.into()) },
+    };
+
+    let components = vec![
+        mk(
+            "vault",
+            vault_ok,
+            Some(".altevra/config.toml"),
+            "Run: altevra init",
+        ),
+        mk(
+            "skills",
+            skills_ok,
+            Some("06-skills/"),
+            "Add skills to 06-skills/",
+        ),
+        mk(
+            "instruction_file",
+            claude_instructions_ok,
+            Some(".claude/altevra-instructions.md"),
+            "Run: altevra connect --tool claude-code",
+        ),
+        mk(
+            "settings_json",
+            claude_settings_ok,
+            Some(".claude/settings.json"),
+            "Run: altevra connect --tool claude-code",
+        ),
+        mk(
+            "skills_installed",
+            skills_installed_ok,
+            Some(".claude/skills/"),
+            "Run: altevra connect --tool claude-code",
+        ),
+    ];
+
+    let all_ok = components
+        .iter()
+        .all(|c| matches!(c.status, ComponentStatus::Current));
+    let any_ok = components
+        .iter()
+        .any(|c| matches!(c.status, ComponentStatus::Current));
+
+    let overall = if all_ok {
+        ComponentStatus::Current
+    } else if any_ok {
+        ComponentStatus::Outdated
+    } else {
+        ComponentStatus::Missing
+    };
+
+    let status = SetupStatus {
+        tool_name: args.tool.clone(),
+        overall,
+        components,
+        warnings: vec![],
+        run_repair: !all_ok,
+    };
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&status)?);
@@ -145,13 +232,15 @@ async fn run_status(args: AgentStatusArgs) -> anyhow::Result<()> {
         println!("Setup Status: {}", args.tool);
         println!("Overall: {}", status.overall);
         for c in &status.components {
-            println!("  {} — {}", c.component, c.status);
+            let icon = if matches!(c.status, ComponentStatus::Current) {
+                "✓"
+            } else {
+                "✗"
+            };
+            println!("  {icon} {} — {}", c.component, c.status);
             if let Some(note) = &c.note {
                 println!("    {note}");
             }
-        }
-        for w in &status.warnings {
-            println!("  ⚠ {w}");
         }
     }
 

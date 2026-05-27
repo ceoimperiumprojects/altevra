@@ -1,5 +1,7 @@
+use altevra_core::updates::{Importance, UpdateFeedItem};
 use altevra_hooks::{HookRegistry, HookRunContext, HookRunner};
 use clap::{Args, Subcommand};
+use uuid::Uuid;
 
 #[derive(Subcommand)]
 pub enum HookCommands {
@@ -113,6 +115,22 @@ async fn run_hook(args: HookRunArgs) -> anyhow::Result<()> {
     };
 
     let outcome = runner.run(ctx);
+
+    // Emit local update event so `altevra updates` can show hook activity.
+    if outcome.success {
+        let event = UpdateFeedItem::from_event(
+            Uuid::new_v4(),
+            format!("hook.{}", args.slug),
+            Importance::Low,
+            format!("Hook ran: {}", args.slug),
+            format!(
+                "Tool: {} | Actions: {}",
+                args.tool,
+                outcome.actions_executed.join(", ")
+            ),
+        );
+        crate::commands::updates::append_local_update(&event);
+    }
 
     if args.json {
         println!("{}", serde_json::to_string_pretty(&outcome)?);

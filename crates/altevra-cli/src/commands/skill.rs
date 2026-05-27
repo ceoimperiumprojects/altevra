@@ -203,8 +203,49 @@ async fn run_check(args: SkillCheckArgs) -> anyhow::Result<()> {
 }
 
 async fn run_refresh(args: SkillRefreshArgs) -> anyhow::Result<()> {
-    println!("Skill refresh for '{}' — not yet implemented.", args.slug);
-    println!("TODO: fetch latest from vault source and re-register.");
+    use altevra_adapters::{ClaudeCodeAdapter, ToolAdapter};
+
+    let skills_dir = args.vault.join("06-skills");
+    let skill_file = skills_dir.join(format!("{}.md", args.slug));
+
+    if !skill_file.exists() {
+        anyhow::bail!(
+            "Skill '{}' not found in vault (looked at {})",
+            args.slug,
+            skill_file.display()
+        );
+    }
+
+    let content = std::fs::read_to_string(&skill_file)?;
+    let skill = altevra_skills::parser::parse_skill(&content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse skill '{}': {e}", args.slug))?;
+
+    let dest = std::path::Path::new(".claude/skills").join(format!("{}.md", args.slug));
+
+    // Drift protection: if file exists without managed header, refuse to overwrite.
+    if dest.exists() {
+        let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+        if !existing.contains("ALTEVRA_MANAGED: true") {
+            anyhow::bail!(
+                "Drift detected: {} exists but is not managed by Altevra. Remove it manually if you want to refresh.",
+                dest.display()
+            );
+        }
+    }
+
+    let adapter = ClaudeCodeAdapter::new();
+    let files = adapter.render_skills(vec![&skill])?;
+    let rendered = files
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Adapter returned no files for skill '{}'", args.slug))?;
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&dest, &rendered.content)?;
+
+    println!("Refreshed: {} → {}", skill_file.display(), dest.display());
     Ok(())
 }
 
@@ -282,5 +323,38 @@ mod tests {
             json: true,
         };
         run_check(args).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_skill_refresh_missing_slug_errors() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("06-skills")).unwrap();
+        let args = SkillRefreshArgs {
+            slug: "nonexistent-skill".to_string(),
+            vault: tmp.path().to_path_buf(),
+        };
+        assert!(run_refresh(args).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_skill_refresh_writes_file() {
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("06-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        make_skill_file(&skills_dir, "altevra-core", "0.5.0");
+
+        // Change to tmp dir so .claude/skills/ is created there.
+        let orig_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let args = SkillRefreshArgs {
+            slug: "altevra-core".to_string(),
+            vault: tmp.path().to_path_buf(),
+        };
+        let result = run_refresh(args).await;
+        std::env::set_current_dir(orig_dir).unwrap();
+
+        assert!(result.is_ok());
+        assert!(tmp.path().join(".claude/skills/altevra-core.md").exists());
     }
 }

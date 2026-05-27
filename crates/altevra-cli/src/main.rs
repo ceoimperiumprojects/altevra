@@ -46,6 +46,13 @@ enum Commands {
 
     /// Start MCP server on stdio (JSON-RPC 2.0)
     Serve(commands::serve::ServeArgs),
+
+    /// Run health checks on the current Altevra setup
+    Doctor(commands::doctor::DoctorArgs),
+
+    /// Manage Altevra configuration
+    #[command(subcommand)]
+    Config(commands::config::ConfigCommands),
 }
 
 #[tokio::main]
@@ -67,5 +74,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Connect(args) => commands::connect::run(args).await,
         Commands::Agent(cmd) => commands::agent::run(cmd).await,
         Commands::Serve(args) => commands::serve::run(args).await,
+        Commands::Doctor(args) => commands::doctor::run(args).await,
+        Commands::Config(cmd) => commands::config::run(cmd).await,
     }
 }

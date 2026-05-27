@@ -4,7 +4,6 @@
 <!-- adapter: claude-code -->
 <!-- version: 0.5.0 -->
 <!-- checksum: 7fddebaa49cde5805652285dd6fa085c69a04d036936181b10cc90c3caf41e86 -->
-<!-- generated_at: 2026-05-27T04:56:35.136594738+00:00 -->
 
 # Altevra Core Skill
 
