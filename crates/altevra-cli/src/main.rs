@@ -40,6 +40,10 @@ enum Commands {
     /// Connect a tool to the current project
     Connect(commands::connect::ConnectArgs),
 
+    /// Tool setup management (alias of connect with verify/repair/status)
+    #[command(subcommand)]
+    Setup(commands::setup::SetupCommands),
+
     /// Agent lifecycle commands
     #[command(subcommand)]
     Agent(commands::agent::AgentCommands),
@@ -53,6 +57,25 @@ enum Commands {
     /// Manage Altevra configuration
     #[command(subcommand)]
     Config(commands::config::ConfigCommands),
+
+    /// Memory ingest / search / context
+    #[command(subcommand)]
+    Memory(commands::memory::MemoryCommands),
+
+    /// Web research pipeline
+    #[command(subcommand)]
+    Research(commands::research::ResearchCommands),
+
+    /// Secrets management (keyring or encrypted file)
+    #[command(subcommand)]
+    Secrets(commands::secrets::SecretsCommands),
+
+    /// Project context report
+    Context(commands::context::ContextArgs),
+
+    /// Journal commands (today / generate)
+    #[command(subcommand)]
+    Journal(commands::journal::JournalCommands),
 }
 
 #[tokio::main]
@@ -72,9 +95,15 @@ async fn main() -> anyhow::Result<()> {
         Commands::Skill(cmd) => commands::skill::run(cmd).await,
         Commands::Hook(cmd) => commands::hook::run(cmd).await,
         Commands::Connect(args) => commands::connect::run(args).await,
+        Commands::Setup(cmd) => commands::setup::run(cmd).await,
         Commands::Agent(cmd) => commands::agent::run(cmd).await,
         Commands::Serve(args) => commands::serve::run(args).await,
         Commands::Doctor(args) => commands::doctor::run(args).await,
         Commands::Config(cmd) => commands::config::run(cmd).await,
+        Commands::Memory(cmd) => commands::memory::run(cmd).await,
+        Commands::Research(cmd) => commands::research::run(cmd).await,
+        Commands::Secrets(cmd) => commands::secrets::run(cmd).await,
+        Commands::Context(args) => commands::context::run(args).await,
+        Commands::Journal(cmd) => commands::journal::run(cmd).await,
     }
 }

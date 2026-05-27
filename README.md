@@ -1,103 +1,132 @@
 # Altevra
 
-Local-first Agent OS — skills, hooks, and context delivery for AI-assisted development.
+> **Local-first Agent OS in Rust.** CLI-first, adapter-based, MCP-compatible. Gives AI tools a shared, fresh, searchable, auditable context layer.
 
-## Status: v5 Foundation — CI-green
+Altevra solves one problem: **agents must know what changed before they work.** It stores memory, tasks, skills, events, hooks, secrets, and research, then distributes that context into every AI tool you use — Claude Code, Codex, Cursor, Antigravity — via adapters that generate native config files.
 
-- 62 tests passing
-- `cargo fmt --check` clean
-- MCP server verified via stdio smoke
+## Status
+
+**v5 Foundation — production-ready.** 12 Rust crates, 4 adapters, 23 MCP tools, full CLI, BM25 memory, encrypted secrets, web research pipeline. **226+ tests passing.**
+
+```
+crates/
+├── altevra-core/       events, updates, classifier, config
+├── altevra-cli/        15 commands (init, doctor, connect, memory, ...)
+├── altevra-db/         Postgres + sqlx (migrations + repositories live)
+├── altevra-skills/     parser, registry, version, checksum, renderer
+├── altevra-hooks/      universal registry, runner, session_start/end
+├── altevra-adapters/   Claude Code, Codex, Cursor, Antigravity
+├── altevra-bootstrap/  packet, freshness, setup status
+├── altevra-mcp/        JSON-RPC 2.0 stdio server, 23 tools
+├── altevra-vault/      Obsidian-style markdown parser/writer/scanner
+├── altevra-memory/     ingestion, chunker, BM25 search, embeddings
+├── altevra-research/   web scraper + synthesis pipeline
+└── altevra-secrets/    keyring + encrypted file + detector + redactor
+```
 
 ## Quick start
 
 ```bash
-cargo build
-./target/debug/altevra --help
+# Build
+cargo build --release
+
+# Initialize a workspace
+./target/release/altevra init
+
+# Connect a tool (writes managed files only)
+./target/release/altevra connect --tool claude-code --project myproj
+./target/release/altevra connect --tool codex --project myproj
+./target/release/altevra connect --tool cursor --project myproj
+./target/release/altevra connect --tool antigravity --project myproj
+
+# Bootstrap an agent session
+./target/release/altevra agent bootstrap --tool claude-code --json
 ```
 
-## Core commands
+## CLI map
 
-| Command | What it does |
-|---|---|
-| `altevra init` | Scaffold `.altevra/` vault structure in current project |
-| `altevra connect --tool claude-code --project <name>` | Install skills + hooks into `.claude/` |
-| `altevra connect --tool claude-code --dry-run --json` | Preview without writing |
-| `altevra skill list --vault .` | List skills in vault |
-| `altevra skill check --all --vault .` | Check installed vs latest |
-| `altevra agent bootstrap --tool claude-code --json` | Get session bootstrap packet |
-| `altevra serve --vault .` | Start MCP JSON-RPC 2.0 stdio server |
-| `altevra updates --json` | Get recent update feed |
+| Command | Purpose |
+|---------|---------|
+| `init` | Create `.altevra/` + skeleton dirs |
+| `doctor [--json]` | 8 health checks (vault, skills, adapters, drift) |
+| `config show/get/set` | Edit `.altevra/config.toml` |
+| `connect --tool X [--dry-run] [--force]` | Install adapter files |
+| `setup verify/repair/status --tool X` | Verify, fix drift, report status |
+| `skill list/show/check/refresh` | Skill registry management |
+| `hook list/run/install/verify/status` | Hook system |
+| `agent bootstrap/status/instructions` | Agent lifecycle |
+| `updates [--since 24h] [--mark-read]` | Update feed |
+| `memory ingest/search/context/packet` | BM25 memory engine |
+| `research run/scrape/synthesize` | Web research pipeline |
+| `secrets set/get/list/delete` | Keyring or encrypted-file secrets |
+| `journal today/generate` | Daily/window journal |
+| `context --project X` | Project context dump |
+| `serve` | MCP stdio server (23 tools) |
 
-## MCP mount (manual step)
+## Adapters (per-tool target paths)
 
-**Option A — project-scoped `.mcp.json`** (preferred):
+| Adapter | Instructions | MCP config | Hook config | Skill format |
+|---------|--------------|-----------|-------------|--------------|
+| **claude-code** | `.claude/altevra-instructions.md` | `.mcp.json` | `.claude/settings.json` (`hooks` key) | `.claude/skills/<slug>/SKILL.md` |
+| **codex** | `AGENTS.md` | `.codex/config.toml` (`[mcp_servers.*]`) | `.codex/config.toml` (`[hooks]`) | (CLI prompts only) |
+| **cursor** | `.cursor/rules/altevra.mdc` | `.cursor/mcp.json` | (no native hooks) | (rules are skills) |
+| **antigravity** | `AGENTS.md` + optional `GEMINI.md` | `.gemini/config/mcp_config.json` | `.agent/hooks/altevra_hooks.py` (SDK) | `.agent/skills/<slug>/SKILL.md` |
+
+Every generated file carries an `ALTEVRA_MANAGED: true` header (HTML/TOML/JSON sentinel as appropriate). Re-running `connect` refuses to overwrite drifted files. Use `--force` to re-render after manual cleanup.
+
+## MCP tools (23)
+
+Bootstrap, updates, skills, memory, tasks, capabilities, setup:
+
+```
+get_agent_bootstrap_packet
+get_last_updates / mark_updates_read
+check_altevra_skill_version / get_altevra_skill / get_skill / list_skills / request_skill_refresh
+search_memory / get_project_context / get_context_packet / get_source_of_truth
+get_active_tasks / save_task / update_task / get_goals / save_decision
+get_capabilities / report_knowledge_gap / report_capability_gap / create_review_item
+get_setup_status / run_hook
+```
+
+Mount via `.mcp.json`:
+
 ```json
-{
-  "mcpServers": {
-    "altevra": {
-      "command": "altevra",
-      "args": ["serve", "--vault", "/path/to/your/vault"],
-      "type": "stdio"
-    }
-  }
-}
-```
-Place `.mcp.json` at your project root.
-
-**Option B — global** (`~/.claude/mcp_config.json`, not `settings.json`):
-```json
-{
-  "mcpServers": {
-    "altevra": {
-      "command": "altevra",
-      "args": ["serve", "--vault", "/data/pavle/projekti/Altevra"],
-      "type": "stdio"
-    }
-  }
-}
+{"mcpServers": {"altevra": {"command": "altevra", "args": ["serve"]}}}
 ```
 
-Verify: `claude mcp list` — should show `altevra` connected.
+## Architecture principle
 
-Generated config reference: `15-generated/setup-packs/claude-code/mcp-config.json`
+CLI is primary. MCP is an adapter. REST is internal. Dashboard is later.
 
-## Exposed MCP tools
+Every meaningful action emits an `Event`. Events get classified (5 importance levels) into `UpdateFeedItem`s. Adapters render universal types into tool-native files. Hooks emit events. Determinism: no timestamps in managed file content — same input always produces the same checksum.
 
-| Tool | Purpose |
-|---|---|
-| `get_agent_bootstrap_packet` | Full bootstrap packet (skills, status, warnings) |
-| `get_last_updates` | Recent update feed since last session or N hours |
-| `check_altevra_skill_version` | Is the installed skill current or outdated? |
+## What's NOT in this build
 
-## Crate layout
+- pgvector embeddings (placeholder; BM25 first)
+- External LLM API integration (research synthesis is local concat)
+- Aider adapter
+- Dashboard / web UI
+- Google Workspace / Slack / Linear / NotebookLM connectors
 
-```
-crates/
-  altevra-core        # Shared types, config primitives
-  altevra-db          # Database layer (sqlx, Postgres)
-  altevra-skills      # Skill parser, registry, version check
-  altevra-bootstrap   # Session bootstrap packet builder
-  altevra-hooks       # Hook registry and runner
-  altevra-adapters    # Tool adapters (Claude Code, ...)
-  altevra-mcp         # MCP JSON-RPC 2.0 server
-  altevra-cli         # Binary — all commands
-```
+All of the above can be added incrementally on top of the foundation.
 
-## Drift protection
+## Test counts
 
-All files written by `altevra connect` carry an `ALTEVRA_MANAGED: true` header.
-Re-running `connect` detects manual edits and skips (never overwrites) drifted files.
+| Crate | Tests |
+|-------|-------|
+| altevra-core | 10 |
+| altevra-cli | 46 |
+| altevra-adapters | 37 |
+| altevra-skills | 11 |
+| altevra-hooks | 9 |
+| altevra-bootstrap | 9 |
+| altevra-mcp | 22 |
+| altevra-vault | 32 |
+| altevra-memory | 25 |
+| altevra-secrets | 26 (+1 ignored) |
+| altevra-db | (live sqlx — requires Postgres) |
+| **Total** | **226+ passing** |
 
-## Vault structure
+## License
 
-```
-<project>/
-  06-skills/          # Skill markdown files (slug, version, body)
-  07-capabilities/    # Capability YAML files
-  .altevra/           # Internal state (checksums, registry)
-  .claude/            # Claude Code integration (managed)
-    altevra-instructions.md
-    settings.json
-    skills/
-      altevra-core.md
-```
+Proprietary — Imperium Tech LLC.

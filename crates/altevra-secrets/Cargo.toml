@@ -1,0 +1,21 @@
+[package]
+name = "altevra-secrets"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+keyring = { workspace = true }
+chacha20poly1305 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+rpassword = { workspace = true }
+altevra-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -11,6 +11,32 @@ pub enum HookCommands {
     Run(HookRunArgs),
     /// Show hook status
     Status(HookStatusArgs),
+    /// Install hooks into a tool (delegates to adapter render_hooks)
+    Install(HookInstallArgs),
+    /// Verify installed hooks against expected
+    Verify(HookVerifyArgs),
+}
+
+#[derive(Args)]
+pub struct HookInstallArgs {
+    #[arg(long, default_value = "claude-code")]
+    pub tool: String,
+    #[arg(long)]
+    pub project: Option<String>,
+    #[arg(long, default_value = ".")]
+    pub repo: std::path::PathBuf,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct HookVerifyArgs {
+    #[arg(long, default_value = "claude-code")]
+    pub tool: String,
+    #[arg(long, default_value = ".")]
+    pub repo: std::path::PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -51,7 +77,62 @@ pub async fn run(cmd: HookCommands) -> anyhow::Result<()> {
         HookCommands::List(args) => run_list(args).await,
         HookCommands::Run(args) => run_hook(args).await,
         HookCommands::Status(args) => run_status(args).await,
+        HookCommands::Install(args) => run_install(args).await,
+        HookCommands::Verify(args) => run_verify(args).await,
     }
+}
+
+async fn run_install(args: HookInstallArgs) -> anyhow::Result<()> {
+    use crate::commands::connect::resolve_adapter;
+    let adapter = resolve_adapter(&args.tool)?;
+    let registry = HookRegistry::with_defaults();
+    let hooks: Vec<_> = registry.list();
+    let hook_refs: Vec<&altevra_hooks::universal::UniversalHook> = hooks.iter().copied().collect();
+    let files = adapter.render_hooks(hook_refs)?;
+
+    if args.dry_run {
+        println!("Hook install (dry-run) — tool: {}", args.tool);
+        for f in &files {
+            println!("  + {}", f.path.display());
+        }
+        return Ok(());
+    }
+
+    let mut written = 0;
+    for f in &files {
+        let dest = args.repo.join(&f.path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        // Drift protection
+        if dest.exists() {
+            let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+            if !existing.contains("ALTEVRA_MANAGED") {
+                eprintln!("skip (drift): {}", dest.display());
+                continue;
+            }
+        }
+        std::fs::write(&dest, &f.content)?;
+        written += 1;
+    }
+    println!("Hook install — tool: {} ({} files)", args.tool, written);
+    Ok(())
+}
+
+async fn run_verify(args: HookVerifyArgs) -> anyhow::Result<()> {
+    use crate::commands::connect::resolve_adapter;
+    let adapter = resolve_adapter(&args.tool)?;
+    let result = adapter.verify(&args.repo)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!("Hook verify ({}):", args.tool);
+        println!("  Status: {}", if result.all_ok { "OK" } else { "ISSUES" });
+        for issue in &result.issues {
+            println!("  ⚠ {issue}");
+        }
+    }
+    Ok(())
 }
 
 async fn run_list(args: HookListArgs) -> anyhow::Result<()> {

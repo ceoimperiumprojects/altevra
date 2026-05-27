@@ -220,7 +220,10 @@ async fn run_refresh(args: SkillRefreshArgs) -> anyhow::Result<()> {
     let skill = altevra_skills::parser::parse_skill(&content)
         .map_err(|e| anyhow::anyhow!("Failed to parse skill '{}': {e}", args.slug))?;
 
-    let dest = std::path::Path::new(".claude/skills").join(format!("{}.md", args.slug));
+    // Folder-per-skill layout: .claude/skills/<slug>/SKILL.md
+    let dest = std::path::Path::new(".claude/skills")
+        .join(&args.slug)
+        .join("SKILL.md");
 
     // Drift protection: if file exists without managed header, refuse to overwrite.
     if dest.exists() {
@@ -355,6 +358,10 @@ mod tests {
         std::env::set_current_dir(orig_dir).unwrap();
 
         assert!(result.is_ok());
-        assert!(tmp.path().join(".claude/skills/altevra-core.md").exists());
+        // Folder-per-skill layout.
+        assert!(tmp
+            .path()
+            .join(".claude/skills/altevra-core/SKILL.md")
+            .exists());
     }
 }

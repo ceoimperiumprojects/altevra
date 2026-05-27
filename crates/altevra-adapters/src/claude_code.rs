@@ -4,7 +4,6 @@ use crate::base::{
 };
 use altevra_hooks::universal::UniversalHook;
 use altevra_skills::parser::ParsedSkill;
-use altevra_skills::renderer;
 use std::path::Path;
 use tracing::info;
 
@@ -15,6 +14,100 @@ pub struct ClaudeCodeAdapter;
 impl ClaudeCodeAdapter {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Render a single SKILL.md body following Claude Code's folder-per-skill
+    /// convention. Frontmatter includes `name`, `description`, `allowed-tools`.
+    ///
+    /// Field source priority:
+    ///   1. If the original skill frontmatter has `name`/`description`/`allowed-tools`
+    ///      in its `extra` map, use those.
+    ///   2. Otherwise: name = slug, description = title (or empty), allowed-tools = [].
+    fn skill_md_content(skill: &ParsedSkill, checksum: &str) -> String {
+        let fm = &skill.frontmatter;
+
+        // name
+        let name = fm
+            .extra
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| fm.slug.clone());
+
+        // description
+        let description = fm
+            .extra
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .or_else(|| fm.description.clone())
+            .unwrap_or_else(|| fm.title.clone());
+
+        // allowed-tools (Claude Code convention key is `allowed-tools`)
+        let allowed_tools: Vec<String> = fm
+            .extra
+            .get("allowed-tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let allowed_tools_yaml = if allowed_tools.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                allowed_tools
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let description_yaml = Self::yaml_string(&description);
+        let name_yaml = Self::yaml_string(&name);
+
+        format!(
+            "---\n\
+             name: {name_yaml}\n\
+             description: {description_yaml}\n\
+             allowed-tools: {allowed_tools_yaml}\n\
+             ---\n\
+             <!-- ALTEVRA_MANAGED: true -->\n\
+             <!-- source: 06-skills/{slug}.md -->\n\
+             <!-- generated_by: altevra -->\n\
+             <!-- adapter: claude-code -->\n\
+             <!-- version: {version} -->\n\
+             <!-- checksum: {checksum} -->\n\n\
+             # {title}\n\n\
+             {body}\n",
+            slug = fm.slug,
+            version = fm.version,
+            title = fm.title,
+            body = skill.body,
+        )
+    }
+
+    /// Quote a value as a YAML scalar safely. Wraps in double quotes when the
+    /// content contains special chars; otherwise emits plain.
+    fn yaml_string(s: &str) -> String {
+        let needs_quote = s.is_empty()
+            || s.contains(':')
+            || s.contains('#')
+            || s.contains('\n')
+            || s.contains('"')
+            || s.starts_with(' ')
+            || s.ends_with(' ');
+        if needs_quote {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        } else {
+            s.to_string()
+        }
     }
 
     fn settings_json_content() -> String {
@@ -180,12 +273,10 @@ impl ToolAdapter for ClaudeCodeAdapter {
     fn render_skills(&self, skills: Vec<&ParsedSkill>) -> anyhow::Result<Vec<GeneratedFile>> {
         let mut files = vec![];
         for skill in skills {
-            let content = renderer::render_with_header(
-                skill,
-                self.tool_name(),
-                &altevra_skills::checksum::compute(&skill.raw),
-            );
-            let path = format!(".claude/skills/{}.md", skill.slug());
+            let content =
+                Self::skill_md_content(skill, &altevra_skills::checksum::compute(&skill.raw));
+            // Folder-per-skill layout: .claude/skills/<slug>/SKILL.md
+            let path = format!(".claude/skills/{}/SKILL.md", skill.slug());
             files.push(GeneratedFile::new(path, content));
         }
         Ok(files)
@@ -244,7 +335,7 @@ impl ToolAdapter for ClaudeCodeAdapter {
                 }
                 let raw = std::fs::read_to_string(&p).unwrap_or_default();
                 if let Ok(skill) = altevra_skills::parser::parse_skill(&raw) {
-                    let dest = repo_path.join(format!(".claude/skills/{}.md", skill.slug()));
+                    let dest = repo_path.join(format!(".claude/skills/{}/SKILL.md", skill.slug()));
                     let label = format!("{} skill", skill.slug());
                     Self::classify_path(
                         &dest,
@@ -374,5 +465,127 @@ impl ToolAdapter for ClaudeCodeAdapter {
                 "Re-run: altevra connect --tool claude-code to restore managed files".to_string(),
             ],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use altevra_skills::parser::parse_skill;
+
+    fn sample_skill_basic() -> ParsedSkill {
+        parse_skill(
+            "---\n\
+             slug: altevra-core\n\
+             version: 0.5.0\n\
+             title: Altevra Core\n\
+             description: Core skill for Altevra.\n\
+             ---\n\n\
+             Body content for the core skill.\n",
+        )
+        .unwrap()
+    }
+
+    fn sample_skill_with_explicit_fields() -> ParsedSkill {
+        parse_skill(
+            "---\n\
+             slug: my-skill\n\
+             version: 1.0.0\n\
+             title: My Skill\n\
+             name: explicit-name\n\
+             description: An explicit description.\n\
+             allowed-tools:\n  - Read\n  - Bash\n  - Grep\n\
+             ---\n\n\
+             Body.\n",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_render_skills_uses_folder_layout() {
+        let adapter = ClaudeCodeAdapter::new();
+        let skill = sample_skill_basic();
+        let files = adapter.render_skills(vec![&skill]).unwrap();
+        assert_eq!(files.len(), 1);
+        let path_str = files[0].path.to_string_lossy().to_string();
+        assert_eq!(path_str, ".claude/skills/altevra-core/SKILL.md");
+        assert!(
+            !path_str.ends_with("/altevra-core.md"),
+            "must not use flat-file layout"
+        );
+    }
+
+    #[test]
+    fn test_render_skills_frontmatter_defaults() {
+        let adapter = ClaudeCodeAdapter::new();
+        let skill = sample_skill_basic();
+        let files = adapter.render_skills(vec![&skill]).unwrap();
+        let content = &files[0].content;
+        assert!(content.starts_with("---\n"), "must start with frontmatter");
+        assert!(content.contains("name: altevra-core"));
+        assert!(content.contains("description: "));
+        assert!(content.contains("allowed-tools: []"));
+        assert!(content.contains("ALTEVRA_MANAGED: true"));
+        assert!(content.contains("# Altevra Core"));
+    }
+
+    #[test]
+    fn test_render_skills_frontmatter_from_explicit_fields() {
+        let adapter = ClaudeCodeAdapter::new();
+        let skill = sample_skill_with_explicit_fields();
+        let files = adapter.render_skills(vec![&skill]).unwrap();
+        let content = &files[0].content;
+        assert!(content.contains("name: explicit-name"));
+        assert!(content.contains("An explicit description."));
+        assert!(content.contains("allowed-tools: [Read, Bash, Grep]"));
+    }
+
+    #[test]
+    fn test_render_skills_is_deterministic() {
+        let adapter = ClaudeCodeAdapter::new();
+        let skill = sample_skill_basic();
+        let a = adapter.render_skills(vec![&skill]).unwrap();
+        let b = adapter.render_skills(vec![&skill]).unwrap();
+        assert_eq!(a[0].content, b[0].content);
+        assert_eq!(a[0].checksum, b[0].checksum);
+        assert!(!a[0].content.contains("generated_at"));
+    }
+
+    #[test]
+    fn test_render_skills_no_timestamps() {
+        let adapter = ClaudeCodeAdapter::new();
+        let skill = sample_skill_basic();
+        let files = adapter.render_skills(vec![&skill]).unwrap();
+        assert!(!files[0].content.contains("generated_at"));
+        assert!(!files[0].content.contains("timestamp"));
+    }
+
+    #[test]
+    fn test_build_install_plan_skills_use_folder_paths() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("06-skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("altevra-core.md"),
+            "---\nslug: altevra-core\nversion: 0.5.0\ntitle: Altevra Core\n---\n\nBody.\n",
+        )
+        .unwrap();
+
+        let adapter = ClaudeCodeAdapter::new();
+        let plan = adapter
+            .build_install_plan(tmp.path(), Some("demo"))
+            .unwrap();
+
+        let has_folder_path = plan.files_to_create.iter().any(|f| {
+            f.path
+                .to_string_lossy()
+                .ends_with(".claude/skills/altevra-core/SKILL.md")
+        });
+        assert!(
+            has_folder_path,
+            "build_install_plan must use folder-per-skill paths; got {:?}",
+            plan.files_to_create
+        );
     }
 }

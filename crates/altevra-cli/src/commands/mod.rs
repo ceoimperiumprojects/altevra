@@ -1,9 +1,15 @@
 pub mod agent;
 pub mod config;
 pub mod connect;
+pub mod context;
 pub mod doctor;
 pub mod hook;
 pub mod init;
+pub mod journal;
+pub mod memory;
+pub mod research;
+pub mod secrets;
 pub mod serve;
+pub mod setup;
 pub mod skill;
 pub mod updates;

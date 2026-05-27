@@ -14,6 +14,10 @@ altevra-hooks = { workspace = true }
 altevra-adapters = { workspace = true }
 altevra-bootstrap = { workspace = true }
 altevra-mcp = { workspace = true }
+altevra-vault = { workspace = true }
+altevra-memory = { workspace = true }
+altevra-research = { workspace = true }
+altevra-secrets = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +28,7 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
+rpassword = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2"

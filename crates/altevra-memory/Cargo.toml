@@ -1,0 +1,21 @@
+[package]
+name = "altevra-memory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+pulldown-cmark = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+regex = { workspace = true }
+altevra-core = { workspace = true }
+altevra-vault = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

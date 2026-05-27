@@ -1,8 +1,8 @@
 use altevra_core::updates::{Importance, UpdateFeedItem};
 use chrono::{Duration, Utc};
-use clap::Args;
+use clap::{Args, Subcommand};
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct UpdatesArgs {
     /// Filter by project
     #[arg(long)]
@@ -23,18 +23,47 @@ pub struct UpdatesArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Mark all returned updates as read
+    #[arg(long)]
+    pub mark_read: bool,
+
+    #[command(subcommand)]
+    pub subcommand: Option<UpdatesSubcommand>,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum UpdatesSubcommand {
+    /// Mark updates as read up to a given event ID (or all)
+    MarkRead(MarkReadArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct MarkReadArgs {
+    /// Actor type marking read (default: agent)
+    #[arg(long, default_value = "agent")]
+    pub actor_type: String,
+    /// Actor ID
+    #[arg(long, default_value = "default")]
+    pub actor_id: String,
+    /// Specific update id to mark (otherwise mark all current)
+    #[arg(long)]
+    pub up_to: Option<uuid::Uuid>,
 }
 
 pub async fn run(args: UpdatesArgs) -> anyhow::Result<()> {
+    if let Some(UpdatesSubcommand::MarkRead(mr)) = args.subcommand.clone() {
+        return run_mark_read(mr).await;
+    }
+
     let since = parse_since(&args.since);
-    let _importance_min = if args.important {
+    let importance_min = if args.important {
         Some(Importance::High)
     } else {
-        Some(Importance::Low)
+        None
     };
 
-    // In MVP without DB: show sample/no updates with instructions
-    let updates: Vec<UpdateFeedItem> = load_local_updates(&args.project, since);
+    let updates = load_local_updates(&args.project, since, importance_min.as_ref());
 
     if args.json {
         let output = serde_json::json!({
@@ -47,29 +76,42 @@ pub async fn run(args: UpdatesArgs) -> anyhow::Result<()> {
             }
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
+    } else if updates.is_empty() {
+        println!("No updates found.");
+        println!("Hint: Connect to Altevra database for live updates.");
+        println!("      Set ALTEVRA_DATABASE_URL and run: altevra serve");
     } else {
-        if updates.is_empty() {
-            println!("No updates found.");
-            println!("Hint: Connect to Altevra database for live updates.");
-            println!("      Set ALTEVRA_DATABASE_URL and run: altevra serve");
-        } else {
-            println!("Updates (since {}):", args.since);
-            for u in &updates {
-                let icon = match u.importance {
-                    Importance::Critical => "🚨",
-                    Importance::High => "🔴",
-                    Importance::Medium => "🟡",
-                    Importance::Low => "🟢",
-                    Importance::Noise => "⚪",
-                };
-                println!(
-                    "{icon} [{}] {} — {}",
-                    u.importance, u.title, u.short_summary
-                );
-            }
+        println!("Updates (since {}):", args.since);
+        for u in &updates {
+            let icon = match u.importance {
+                Importance::Critical => "🚨",
+                Importance::High => "🔴",
+                Importance::Medium => "🟡",
+                Importance::Low => "🟢",
+                Importance::Noise => "⚪",
+            };
+            println!(
+                "{icon} [{}] {} — {}",
+                u.importance, u.title, u.short_summary
+            );
         }
     }
 
+    if args.mark_read && !updates.is_empty() {
+        let last = updates.first().map(|u| u.event_id);
+        mark_read_local("agent", "default", last)?;
+        println!("\nMarked {} updates as read.", updates.len());
+    }
+
+    Ok(())
+}
+
+async fn run_mark_read(args: MarkReadArgs) -> anyhow::Result<()> {
+    mark_read_local(&args.actor_type, &args.actor_id, args.up_to)?;
+    println!(
+        "Marked read for {}/{} up_to={:?}",
+        args.actor_type, args.actor_id, args.up_to
+    );
     Ok(())
 }
 
@@ -86,6 +128,7 @@ fn parse_since(s: &str) -> chrono::DateTime<Utc> {
 fn load_local_updates(
     project: &Option<String>,
     since: chrono::DateTime<Utc>,
+    importance_min: Option<&Importance>,
 ) -> Vec<UpdateFeedItem> {
     let path = std::path::Path::new(".altevra/events/updates.jsonl");
     if !path.exists() {
@@ -106,6 +149,12 @@ fn load_local_updates(
                     || item.title.contains(p)
                     || item.short_summary.contains(p)
             })
+        })
+        .filter(|item: &UpdateFeedItem| {
+            importance_min
+                .as_ref()
+                .map(|imin| &item.importance >= *imin)
+                .unwrap_or(true)
         })
         .collect();
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -128,6 +177,34 @@ pub fn append_local_update(item: &UpdateFeedItem) {
             let _ = writeln!(file, "{line}");
         }
     }
+}
+
+/// Persist read-state in a local JSON file (DB-less fallback).
+pub fn mark_read_local(
+    actor_type: &str,
+    actor_id: &str,
+    last_event: Option<uuid::Uuid>,
+) -> anyhow::Result<()> {
+    let path = std::path::Path::new(".altevra/state/read_state.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut map: serde_json::Map<String, serde_json::Value> = if path.exists() {
+        let raw = std::fs::read_to_string(path)?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let key = format!("{actor_type}::{actor_id}");
+    map.insert(
+        key,
+        serde_json::json!({
+            "last_seen_event_id": last_event,
+            "last_seen_at": Utc::now(),
+        }),
+    );
+    std::fs::write(path, serde_json::to_string_pretty(&map)?)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -156,6 +233,8 @@ mod tests {
             agent: None,
             important: false,
             json: true,
+            mark_read: false,
+            subcommand: None,
         };
         run(args).await.unwrap();
     }
