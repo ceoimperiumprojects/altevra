@@ -346,6 +346,46 @@ pub fn list_tools() -> Value {
         ),
     ));
 
+    // v0.3.7: Replay & Query
+    tools.push(tool(
+        "replay_session",
+        "Replay a recorded session — return its full turn stream.",
+        obj_schema(
+            &["session_id"],
+            serde_json::json!({
+                "session_id": {"type": "string"},
+                "turn_limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "search_turns",
+        "BM25-style search over recorded turn content.",
+        obj_schema(
+            &["query"],
+            serde_json::json!({
+                "query": {"type": "string"},
+                "project": {"type": "string"},
+                "tool": {"type": "string"},
+                "limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "file_history",
+        "Recorded change history for a file path.",
+        obj_schema(
+            &["path"],
+            serde_json::json!({
+                "path": {"type": "string"},
+                "limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
+
     serde_json::json!({"tools": tools})
 }
 
@@ -442,6 +482,10 @@ impl McpServer {
             "get_observer_insights" => {
                 crate::tools_observer::handle_get_observer_insights(id, args, &self.vault_path)
             }
+            // v0.3.7: Replay & Query
+            "replay_session" => crate::tools_sessions::handle_replay_session(id, args),
+            "search_turns" => crate::tools_sessions::handle_search_turns(id, args),
+            "file_history" => crate::tools_sessions::handle_file_history(id, args),
             other => McpResponse::error(id, -32602, format!("Unknown tool: {other}")),
         }
     }

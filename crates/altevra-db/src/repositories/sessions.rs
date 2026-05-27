@@ -293,6 +293,183 @@ impl<'a> SessionsRepository<'a> {
             .collect())
     }
 
+    /// List sessions with an optional `since` cutoff. Empty `since` = no filter.
+    pub async fn list_sessions_since(
+        &self,
+        tool: Option<&str>,
+        project: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SessionRow>> {
+        let since_str = since.map(|t| ts_to_text(&t));
+        let rows = match (tool, project, &since_str) {
+            (Some(t), Some(p), Some(s)) => {
+                sqlx::query(
+                    r#"SELECT * FROM sessions
+                   WHERE tool = ? AND project_name = ? AND started_at >= ?
+                   ORDER BY started_at DESC LIMIT ?"#,
+                )
+                .bind(t)
+                .bind(p)
+                .bind(s)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            (Some(t), None, Some(s)) => {
+                sqlx::query(
+                    r#"SELECT * FROM sessions WHERE tool = ? AND started_at >= ?
+                   ORDER BY started_at DESC LIMIT ?"#,
+                )
+                .bind(t)
+                .bind(s)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            (None, Some(p), Some(s)) => {
+                sqlx::query(
+                    r#"SELECT * FROM sessions WHERE project_name = ? AND started_at >= ?
+                   ORDER BY started_at DESC LIMIT ?"#,
+                )
+                .bind(p)
+                .bind(s)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            (None, None, Some(s)) => {
+                sqlx::query(
+                    r#"SELECT * FROM sessions WHERE started_at >= ?
+                   ORDER BY started_at DESC LIMIT ?"#,
+                )
+                .bind(s)
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+            }
+            _ => {
+                return self.list_sessions(tool, project, limit).await;
+            }
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SessionRow {
+                id: uuid_from_text(r.get::<String, _>("id")),
+                tool: r.get("tool"),
+                project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+                project_name: r.get("project_name"),
+                started_at: ts_from_text(r.get::<String, _>("started_at")),
+                ended_at: opt_ts_from_text(r.get::<Option<String>, _>("ended_at")),
+                summary: r.get("summary"),
+                tokens_in_total: r.get("tokens_in_total"),
+                tokens_out_total: r.get("tokens_out_total"),
+                cost_usd_estimate: r.get("cost_usd_estimate"),
+                turn_count: r.get("turn_count"),
+                metadata: serde_json::from_str(&r.get::<String, _>("metadata"))
+                    .unwrap_or(serde_json::json!({})),
+            })
+            .collect())
+    }
+
+    /// Full-text search across turn content. Uses BM25-style ranking via simple
+    /// token overlap (no SQLite FTS5 dependency — works in-process).
+    /// Returns the top `limit` turns by score; ties broken by recency.
+    pub async fn search_turns(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        tool: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(TurnRow, f32)>> {
+        let q_tokens: Vec<String> = query
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|t| t.len() > 2)
+            .map(String::from)
+            .collect();
+        if q_tokens.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Pull candidate turns via SQL LIKE per token (OR), join to sessions
+        // when project/tool filter present.
+        let mut sql = String::from(
+            "SELECT t.*, s.tool AS s_tool, s.project_name AS s_project
+             FROM turns t LEFT JOIN sessions s ON t.session_id = s.id WHERE (",
+        );
+        for (i, _) in q_tokens.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(" OR ");
+            }
+            sql.push_str("LOWER(t.content) LIKE ?");
+        }
+        sql.push(')');
+        if tool.is_some() {
+            sql.push_str(" AND s.tool = ?");
+        }
+        if project.is_some() {
+            sql.push_str(" AND s.project_name = ?");
+        }
+        sql.push_str(" ORDER BY t.created_at DESC LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        for t in &q_tokens {
+            q = q.bind(format!("%{t}%"));
+        }
+        if let Some(t) = tool {
+            q = q.bind(t);
+        }
+        if let Some(p) = project {
+            q = q.bind(p);
+        }
+        // Cap candidate set generously; final ranking is in-process.
+        q = q.bind(limit * 4);
+
+        let rows = q.fetch_all(self.pool).await?;
+
+        let mut scored: Vec<(TurnRow, f32)> = rows
+            .into_iter()
+            .map(|r| {
+                let content: String = r.get("content");
+                let lc = content.to_lowercase();
+                let mut score = 0.0_f32;
+                for t in &q_tokens {
+                    let count = lc.matches(t.as_str()).count();
+                    if count > 0 {
+                        score += (count as f32).ln_1p();
+                    }
+                }
+                let row = TurnRow {
+                    id: uuid_from_text(r.get::<String, _>("id")),
+                    session_id: uuid_from_text(r.get::<String, _>("session_id")),
+                    turn_idx: r.get("turn_idx"),
+                    role: r.get("role"),
+                    content,
+                    tool_calls: r
+                        .get::<Option<String>, _>("tool_calls")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    tool_name: r.get("tool_name"),
+                    model: r.get("model"),
+                    tokens_in: r.get("tokens_in"),
+                    tokens_out: r.get("tokens_out"),
+                    latency_ms: r.get("latency_ms"),
+                    file_changes: r
+                        .get::<Option<String>, _>("file_changes")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    redacted_count: r.get("redacted_count"),
+                    created_at: ts_from_text(r.get::<String, _>("created_at")),
+                };
+                (row, score)
+            })
+            .collect();
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit as usize);
+        Ok(scored)
+    }
+
     pub async fn file_history(&self, path: &str, limit: i64) -> anyhow::Result<Vec<FileChangeRow>> {
         let rows = sqlx::query(
             r#"SELECT * FROM file_changes WHERE path = ?
@@ -470,5 +647,117 @@ mod tests {
             .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].tool, "claude-code");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_since_filters_by_time() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        // Old session
+        let mut old = sample_session();
+        old.started_at = Utc::now() - chrono::Duration::days(30);
+        repo.start_session(&old).await.unwrap();
+        // Recent session
+        let recent = sample_session();
+        repo.start_session(&recent).await.unwrap();
+
+        let cutoff = Utc::now() - chrono::Duration::days(7);
+        let list = repo
+            .list_sessions_since(None, None, Some(cutoff), 10)
+            .await
+            .unwrap();
+        // Only the recent one should match
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, recent.id);
+    }
+
+    #[tokio::test]
+    async fn search_turns_finds_keyword_matches() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        repo.start_session(&s).await.unwrap();
+        for (i, content) in [
+            "unrelated text",
+            "rust agent framework discussion",
+            "more rust",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let t = TurnRow {
+                id: Uuid::new_v4(),
+                session_id: s.id,
+                turn_idx: i as i64,
+                role: "user".into(),
+                content: (*content).into(),
+                tool_calls: None,
+                tool_name: None,
+                model: None,
+                tokens_in: None,
+                tokens_out: None,
+                latency_ms: None,
+                file_changes: None,
+                redacted_count: 0,
+                created_at: Utc::now(),
+            };
+            repo.record_turn(&t).await.unwrap();
+        }
+
+        let hits = repo.search_turns("rust", None, None, 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        // Both matching turns should have positive scores
+        for (_, score) in &hits {
+            assert!(*score > 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn search_turns_filters_by_project() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let mut a = sample_session();
+        a.project_name = Some("altevra".into());
+        let mut b = sample_session();
+        b.project_name = Some("revesta".into());
+        repo.start_session(&a).await.unwrap();
+        repo.start_session(&b).await.unwrap();
+
+        for (sid, content) in [(a.id, "rust altevra core"), (b.id, "rust food surplus")] {
+            let t = TurnRow {
+                id: Uuid::new_v4(),
+                session_id: sid,
+                turn_idx: 0,
+                role: "user".into(),
+                content: content.into(),
+                tool_calls: None,
+                tool_name: None,
+                model: None,
+                tokens_in: None,
+                tokens_out: None,
+                latency_ms: None,
+                file_changes: None,
+                redacted_count: 0,
+                created_at: Utc::now(),
+            };
+            repo.record_turn(&t).await.unwrap();
+        }
+
+        let altevra_hits = repo
+            .search_turns("rust", Some("altevra"), None, 10)
+            .await
+            .unwrap();
+        assert_eq!(altevra_hits.len(), 1);
+        assert!(altevra_hits[0].0.content.contains("altevra core"));
+    }
+
+    #[tokio::test]
+    async fn search_turns_empty_query_returns_empty() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        repo.start_session(&s).await.unwrap();
+        let hits = repo.search_turns("", None, None, 10).await.unwrap();
+        assert!(hits.is_empty());
     }
 }

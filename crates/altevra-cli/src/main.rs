@@ -92,6 +92,13 @@ enum Commands {
     /// Record a single agent turn into the recorder
     Turn(commands::turn::TurnRecordArgs),
 
+    /// Search across recorded turn content (BM25-style)
+    TurnSearch(commands::turn_search::TurnSearchArgs),
+
+    /// File change history (recorded by watcher/hooks)
+    #[command(subcommand)]
+    Files(commands::files::FilesCommands),
+
     /// Handle a tool hook event (reads JSON from stdin)
     HookHandle(commands::hook_handle::HookHandleArgs),
 
@@ -139,6 +146,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Observer(cmd) => commands::observer::run(cmd).await,
         Commands::Session(cmd) => commands::session::run(cmd).await,
         Commands::Turn(args) => commands::turn::run(args).await,
+        Commands::TurnSearch(args) => commands::turn_search::run(args).await,
+        Commands::Files(cmd) => commands::files::run(cmd).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,
         Commands::Embed(cmd) => commands::embed::run(cmd).await,

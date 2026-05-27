@@ -10,6 +10,8 @@ altevra-hooks = { workspace = true }
 altevra-bootstrap = { workspace = true }
 altevra-vault = { workspace = true }
 altevra-memory = { workspace = true }
+altevra-db = { workspace = true }
+sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -18,6 +20,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
