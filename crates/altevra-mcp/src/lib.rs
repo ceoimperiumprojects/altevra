@@ -10,5 +10,6 @@ pub mod tools_setup;
 pub mod tools_skills;
 pub mod tools_tasks;
 pub mod tools_updates;
+pub mod tools_wiki;
 
 pub use server::{McpRequest, McpResponse, McpServer};

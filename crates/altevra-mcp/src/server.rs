@@ -434,6 +434,52 @@ pub fn list_tools() -> Value {
         ),
     ));
 
+    // v0.3 Phase 1: Wiki + Resident foundation
+    tools.push(tool(
+        "get_wiki_page",
+        "Return the synthesized wiki page for a topic.",
+        obj_schema(
+            &["topic"],
+            serde_json::json!({
+                "topic": {"type": "string"},
+                "root": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "search_wiki",
+        "Substring search over wiki topic / title / body.",
+        obj_schema(
+            &["query"],
+            serde_json::json!({
+                "query": {"type": "string"},
+                "limit": {"type": "integer"},
+                "root": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "list_resident_modes",
+        "List resident-agent modes available in this Altevra install.",
+        obj_schema(
+            &[],
+            serde_json::json!({
+                "root": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
+        "get_resident_prompt",
+        "Return the system prompt for a resident-agent mode (`core` or a mode name).",
+        obj_schema(
+            &["mode"],
+            serde_json::json!({
+                "mode": {"type": "string"},
+                "root": {"type": "string"},
+            }),
+        ),
+    ));
+
     serde_json::json!({"tools": tools})
 }
 
@@ -539,6 +585,11 @@ impl McpServer {
             "github_trending" => crate::tools_discovery::handle_github_trending(id, args),
             "web_search" => crate::tools_discovery::handle_web_search(id, args),
             "project_research" => crate::tools_discovery::handle_project_research(id, args),
+            // v0.3 Phase 1: Wiki + Resident
+            "get_wiki_page" => crate::tools_wiki::handle_get_wiki_page(id, args),
+            "search_wiki" => crate::tools_wiki::handle_search_wiki(id, args),
+            "list_resident_modes" => crate::tools_wiki::handle_list_resident_modes(id, args),
+            "get_resident_prompt" => crate::tools_wiki::handle_get_resident_prompt(id, args),
             other => McpResponse::error(id, -32602, format!("Unknown tool: {other}")),
         }
     }

@@ -14,6 +14,7 @@ pulldown-cmark = { workspace = true }
 walkdir = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+regex = { workspace = true }
 altevra-core = { workspace = true }
 
 [dev-dependencies]

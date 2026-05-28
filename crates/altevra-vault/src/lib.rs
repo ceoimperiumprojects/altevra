@@ -7,9 +7,14 @@
 pub mod frontmatter;
 pub mod parser;
 pub mod scanner;
+pub mod wiki;
 pub mod writer;
 
 pub use frontmatter::{parse_frontmatter, serialize_frontmatter, Frontmatter, FrontmatterError};
 pub use parser::{parse_document, parse_document_from_str, ParsedDocument, ParserError};
 pub use scanner::{list_sections, scan_vault, ScannedFile, ScannerError, VaultSection};
+pub use wiki::{
+    extract_wiki_links, list_wiki_pages, parse_wiki_page, WikiConfidence, WikiError, WikiPage,
+    WikiStatus,
+};
 pub use writer::{write_atomic, write_document, WriterError};

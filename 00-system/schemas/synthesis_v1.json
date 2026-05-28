@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "altevra:synthesis_v1",
+  "title": "Resident Agent — Synthesis Mode Output v1",
+  "type": "object",
+  "required": ["summary", "confidence"],
+  "properties": {
+    "summary": { "type": "string" },
+    "key_findings": { "type": "array", "items": { "type": "string" } },
+    "patterns": { "type": "array", "items": { "type": "string" } },
+    "opportunities": { "type": "array", "items": { "type": "string" } },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "contradictions": { "type": "array", "items": { "type": "string" } },
+    "linked_projects": { "type": "array", "items": { "type": "string" } },
+    "linked_wiki_pages": { "type": "array", "items": { "type": "string" } },
+    "recommended_actions": { "type": "array", "items": { "type": "string" } },
+    "proposed_tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": { "type": "string" },
+          "project": { "type": "string" },
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "rationale": { "type": "string" }
+        }
+      }
+    },
+    "memory_writes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "summary"],
+        "properties": {
+          "kind": { "type": "string" },
+          "summary": { "type": "string" },
+          "source": { "type": "string" },
+          "sensitivity": {
+            "type": "string",
+            "enum": ["public", "internal", "private", "secret"]
+          }
+        }
+      }
+    },
+    "review_items": { "type": "array", "items": { "type": "object" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "uncertainties": { "type": "array", "items": { "type": "string" } },
+    "events_to_emit": { "type": "array", "items": { "type": "object" } }
+  }
+}

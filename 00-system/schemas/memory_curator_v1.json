@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "altevra:memory_curator_v1",
+  "title": "Resident Agent — Memory Curator Output v1",
+  "type": "object",
+  "required": ["summary", "confidence"],
+  "properties": {
+    "summary": { "type": "string" },
+    "dedupe_suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["primary_id", "duplicate_ids", "rationale"],
+        "properties": {
+          "primary_id": { "type": "string" },
+          "duplicate_ids": { "type": "array", "items": { "type": "string" } },
+          "rationale": { "type": "string" },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
+    "stale_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "reason"],
+        "properties": {
+          "id": { "type": "string" },
+          "reason": { "type": "string" },
+          "last_referenced": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    "conflicts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["entity", "facts"],
+        "properties": {
+          "entity": { "type": "string" },
+          "facts": { "type": "array", "items": { "type": "string" } },
+          "recommended_resolution": { "type": "string" }
+        }
+      }
+    },
+    "metadata_updates": { "type": "array", "items": { "type": "object" } },
+    "category_suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "example_ids": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "review_items": { "type": "array", "items": { "type": "object" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "events_to_emit": { "type": "array", "items": { "type": "object" } }
+  }
+}

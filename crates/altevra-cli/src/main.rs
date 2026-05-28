@@ -116,6 +116,14 @@ enum Commands {
 
     /// Print the Altevra banner / about screen
     Banner(commands::banner::BannerArgs),
+
+    /// Wiki Layer — list / show / search living knowledge pages
+    #[command(subcommand)]
+    Wiki(commands::wiki::WikiCommands),
+
+    /// Resident Agent — inspect mode prompts (runtime lands in Phase 4)
+    #[command(subcommand)]
+    Resident(commands::resident::ResidentCommands),
 }
 
 #[tokio::main]
@@ -156,5 +164,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Embed(cmd) => commands::embed::run(cmd).await,
         Commands::Brain(cmd) => commands::brain::run(cmd).await,
         Commands::Banner(args) => commands::banner::run(args).await,
+        Commands::Wiki(cmd) => commands::wiki::run(cmd).await,
+        Commands::Resident(cmd) => commands::resident::run(cmd).await,
     }
 }

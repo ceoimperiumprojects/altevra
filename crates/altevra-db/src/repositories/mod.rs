@@ -6,6 +6,7 @@ pub mod sessions;
 pub mod skills;
 pub mod tasks;
 pub mod updates;
+pub mod wiki;
 
 pub use events::EventsRepository;
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
@@ -15,3 +16,4 @@ pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow};
 pub use skills::{SkillRow, SkillsRepository};
 pub use tasks::{DecisionRow, GoalRow, ReviewItemRow, TaskRow, TasksRepository};
 pub use updates::UpdatesRepository;
+pub use wiki::{WikiPageLinkRow, WikiPageRow, WikiPagesRepository};

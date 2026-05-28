@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "altevra:wiki_curator_v1",
+  "title": "Resident Agent — Wiki Curator Output v1",
+  "type": "object",
+  "required": ["action", "topic", "confidence"],
+  "properties": {
+    "action": {
+      "type": "string",
+      "enum": ["create", "update", "split", "merge", "unchanged"]
+    },
+    "topic": { "type": "string" },
+    "summary_of_change": { "type": "string" },
+    "sections_changed": { "type": "array", "items": { "type": "string" } },
+    "new_links": { "type": "array", "items": { "type": "string" } },
+    "open_questions": { "type": "array", "items": { "type": "string" } },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "proposed_page_markdown": {
+      "type": "string",
+      "description": "Full markdown of the proposed page state (with frontmatter). Required when action != unchanged."
+    },
+    "review_required": { "type": "boolean" },
+    "review_reason": { "type": "string" },
+    "events_to_emit": { "type": "array", "items": { "type": "object" } }
+  }
+}

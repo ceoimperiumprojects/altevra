@@ -231,6 +231,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]
@@ -327,6 +328,7 @@ dependencies = [
  "chrono",
  "hex",
  "pulldown-cmark",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

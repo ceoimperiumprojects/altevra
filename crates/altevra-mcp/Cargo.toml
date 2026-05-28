@@ -9,6 +9,7 @@ altevra-skills = { workspace = true }
 altevra-hooks = { workspace = true }
 altevra-bootstrap = { workspace = true }
 altevra-vault = { workspace = true }
+walkdir = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-db = { workspace = true }
 altevra-research = { workspace = true }

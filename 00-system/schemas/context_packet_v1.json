@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "altevra:context_packet_v1",
+  "title": "Resident Agent Context Packet v1",
+  "description": "Strict per-run context envelope. Replaces blanket vault dumps with curated, mode-specific, token-budgeted retrieval. See ALTEVRA_NEXT_ARCHITECTURE.md §7.",
+  "type": "object",
+  "required": [
+    "packet_type",
+    "mode",
+    "allowed_tools",
+    "forbidden_actions",
+    "output_schema",
+    "token_budget"
+  ],
+  "properties": {
+    "packet_type": {
+      "const": "resident_agent_context"
+    },
+    "mode": {
+      "type": "string",
+      "enum": [
+        "memory_curator",
+        "synthesis",
+        "daily_briefing",
+        "wiki_curator",
+        "insight",
+        "observer",
+        "research",
+        "task_goal"
+      ]
+    },
+    "project": {
+      "type": "string"
+    },
+    "goal": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "summary": { "type": "string" }
+      }
+    },
+    "active_task": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "summary": { "type": "string" }
+      }
+    },
+    "relevant_context": {
+      "type": "object",
+      "properties": {
+        "source_of_truth": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "summary", "path"],
+            "properties": {
+              "id": { "type": "string" },
+              "title": { "type": "string" },
+              "summary": { "type": "string" },
+              "path": { "type": "string" }
+            }
+          }
+        },
+        "recent_updates": { "type": "array" },
+        "related_decisions": { "type": "array" },
+        "related_wiki_pages": { "type": "array" },
+        "constraints": { "type": "array" }
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "description": "Mode-specific input payloads (research items, raw turns, etc.)"
+    },
+    "allowed_tools": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "forbidden_actions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "output_schema": {
+      "type": "string",
+      "description": "Schema id the resident's output must conform to (e.g. synthesis_v1)"
+    },
+    "token_budget": {
+      "type": "object",
+      "required": ["max_input_tokens", "max_output_tokens"],
+      "properties": {
+        "max_input_tokens": { "type": "integer", "minimum": 1 },
+        "max_output_tokens": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}
