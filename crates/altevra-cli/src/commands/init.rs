@@ -18,6 +18,11 @@ pub struct InitArgs {
     /// Output as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Skip creating a `~/.local/bin/altevra` symlink to this binary (hooks
+    /// need `altevra` on PATH to function; the symlink is the default fix).
+    #[arg(long)]
+    pub no_symlink: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -93,6 +98,22 @@ pub async fn run(args: InitArgs) -> anyhow::Result<()> {
         created_files.push(tools_path.display().to_string());
     } else {
         already_existed.push(tools_path.display().to_string());
+    }
+
+    // Hooks call `altevra hook-handle ...` so the binary must be on PATH.
+    // Default behaviour: ensure `~/.local/bin/altevra` symlinks to this exe.
+    if !args.no_symlink && !args.dry_run {
+        match ensure_symlink_installed() {
+            Ok(SymlinkResult::Created(p)) => created_files.push(p),
+            Ok(SymlinkResult::Existed(p)) => already_existed.push(p),
+            Ok(SymlinkResult::SkippedConflict(p)) => {
+                tracing::info!(target = %p, "PATH symlink target already exists, not overwriting");
+                already_existed.push(p);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install PATH symlink — hooks may fail");
+            }
+        }
     }
 
     let result = InitResult {
@@ -259,6 +280,7 @@ mod tests {
             force: false,
             dry_run: false,
             json: false,
+            no_symlink: true,
         };
         run(args).await.unwrap();
 
@@ -278,6 +300,7 @@ mod tests {
             force: false,
             dry_run: false,
             json: true,
+            no_symlink: true,
         };
         // Should not panic or error
         run(args).await.unwrap();
@@ -292,6 +315,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 json: false,
+                no_symlink: true,
             };
             run(args).await.unwrap();
         }
@@ -307,6 +331,7 @@ mod tests {
             force: false,
             dry_run: true,
             json: false,
+            no_symlink: true,
         };
 
         run(args).await.unwrap();
@@ -316,4 +341,87 @@ mod tests {
         assert!(!tmp.path().join("07-capabilities").exists());
         assert!(!tmp.path().join("15-generated").exists());
     }
+
+    #[test]
+    fn pick_install_target_returns_local_bin() {
+        let target = pick_install_target();
+        if let Some(t) = target {
+            assert!(t.to_string_lossy().contains(".local/bin/altevra"));
+        }
+    }
+}
+
+// ─── PATH symlink helper ────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum SymlinkResult {
+    /// Symlink created. Returns the target path string.
+    Created(String),
+    /// Symlink already pointed to the current binary.
+    Existed(String),
+    /// Target path is occupied by a different binary/file; we did not overwrite.
+    SkippedConflict(String),
+}
+
+fn pick_install_target() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("bin")
+            .join("altevra"),
+    )
+}
+
+/// Find the best binary to symlink to. Prefer a release build in the same
+/// project; fall back to the currently running exe.
+fn pick_source_binary() -> anyhow::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    // If we're running from target/debug/altevra and a release build exists,
+    // prefer release (it's the production artifact).
+    if current.ends_with("target/debug/altevra") {
+        let release = current
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("release").join("altevra"));
+        if let Some(r) = release {
+            if r.exists() {
+                return Ok(r);
+            }
+        }
+    }
+    Ok(current)
+}
+
+fn ensure_symlink_installed() -> anyhow::Result<SymlinkResult> {
+    let target = pick_install_target()
+        .ok_or_else(|| anyhow::anyhow!("no $HOME set; cannot determine ~/.local/bin"))?;
+    let source = pick_source_binary()?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid target path"))?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let target_str = target.display().to_string();
+    if target.exists() || target.symlink_metadata().is_ok() {
+        // Read existing symlink target (or regular file).
+        if let Ok(existing) = std::fs::read_link(&target) {
+            if existing == source {
+                return Ok(SymlinkResult::Existed(target_str));
+            }
+        }
+        return Ok(SymlinkResult::SkippedConflict(target_str));
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&source, &target)?;
+    }
+    #[cfg(not(unix))]
+    {
+        return Err(anyhow::anyhow!(
+            "PATH symlink install is only implemented on Unix-like systems for now"
+        ));
+    }
+    Ok(SymlinkResult::Created(target_str))
 }

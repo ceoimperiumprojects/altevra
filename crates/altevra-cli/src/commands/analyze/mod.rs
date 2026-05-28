@@ -54,6 +54,7 @@ pub struct ImportedSession {
 }
 
 impl ImportedSession {
+    #[allow(dead_code)]
     pub fn turn_count(&self) -> usize {
         self.turns.len()
     }

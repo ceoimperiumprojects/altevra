@@ -14,7 +14,7 @@ pub struct TurnSearchArgs {
     pub tool: Option<String>,
     #[arg(long, default_value_t = 10)]
     pub limit: i64,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,

@@ -348,9 +348,10 @@ mod tests {
 
     #[test]
     fn search_bm25_helper_works_standalone() {
-        let mut chunks = Vec::new();
-        chunks.push(mk_chunk("BM25 ranking is widely used."));
-        chunks.push(mk_chunk("Vector search uses embeddings."));
+        let chunks = vec![
+            mk_chunk("BM25 ranking is widely used."),
+            mk_chunk("Vector search uses embeddings."),
+        ];
         let hits = search_bm25("bm25 ranking", &chunks, 3);
         assert!(!hits.is_empty());
         assert!(hits[0].snippet.to_lowercase().contains("bm25"));

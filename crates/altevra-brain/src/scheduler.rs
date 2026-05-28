@@ -27,7 +27,7 @@ impl Default for BrainConfig {
     fn default() -> Self {
         Self {
             vault_path: PathBuf::from("."),
-            db_path: PathBuf::from(".altevra/altevra.db"),
+            db_path: altevra_core::default_db_path(),
             daily_summary_hour: 23,
             tick_interval_secs: 30,
             disabled: vec![],
@@ -185,8 +185,6 @@ impl BrainScheduler {
     /// Snapshot of recent run history.
     pub async fn status(pool: &SqlitePool) -> anyhow::Result<BrainStatus> {
         let mut last_runs = HashMap::new();
-        let mut jobs_done = 0i64;
-        let mut jobs_failed = 0i64;
 
         let rows = sqlx::query(
             r#"SELECT kind, MAX(finished_at) AS last_finished
@@ -212,8 +210,8 @@ impl BrainScheduler {
         )
         .fetch_one(pool)
         .await?;
-        jobs_done = sqlx::Row::try_get::<i64, _>(&agg, "done").unwrap_or(0);
-        jobs_failed = sqlx::Row::try_get::<i64, _>(&agg, "failed").unwrap_or(0);
+        let jobs_done = sqlx::Row::try_get::<i64, _>(&agg, "done").unwrap_or(0);
+        let jobs_failed = sqlx::Row::try_get::<i64, _>(&agg, "failed").unwrap_or(0);
 
         Ok(BrainStatus {
             running: false, // CLI fills this from PID file

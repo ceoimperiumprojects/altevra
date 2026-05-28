@@ -2,8 +2,8 @@ use serde_json::Value;
 
 use crate::server::McpResponse;
 
-/// In-memory task store using a local JSON file at .altevra/state/tasks.json.
-/// Real DB-backed implementation lives in altevra-db.
+// In-memory task store using a local JSON file at .altevra/state/tasks.json.
+// Real DB-backed implementation lives in altevra-db.
 
 const STATE_PATH: &str = ".altevra/state/tasks.json";
 const DEC_PATH: &str = ".altevra/state/decisions.json";

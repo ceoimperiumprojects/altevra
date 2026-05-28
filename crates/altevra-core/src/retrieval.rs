@@ -160,7 +160,7 @@ impl RetrievalContext {
             }
         }
 
-        if out.trim() == &format!("# Agent Brief — query: {}", self.query) {
+        if out.trim() == format!("# Agent Brief — query: {}", self.query) {
             out.push_str("_No related context found in vault._\n");
         }
 

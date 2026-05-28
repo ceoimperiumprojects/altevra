@@ -31,13 +31,13 @@ pub enum EmbedCommands {
 
 #[derive(Args)]
 pub struct EmbedSeedArgs {
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
 }
 
 #[derive(Args)]
 pub struct EmbedTickArgs {
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
@@ -50,7 +50,7 @@ pub struct EmbedTickArgs {
 
 #[derive(Args)]
 pub struct EmbedRunArgs {
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long, default_value_t = 100)]
     pub batch_size: usize,
@@ -64,7 +64,7 @@ pub struct EmbedRunArgs {
 
 #[derive(Args)]
 pub struct EmbedStatusArgs {
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,

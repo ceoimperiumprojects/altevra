@@ -4,13 +4,11 @@ use crate::server::McpResponse;
 use serde_json::Value;
 use std::path::PathBuf;
 
-const DEFAULT_DB: &str = ".altevra/altevra.db";
-
 fn db_path_from_args(args: &Value) -> PathBuf {
     args.get("db_path")
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DB))
+        .unwrap_or_else(altevra_core::default_db_path)
 }
 
 async fn open_pool(db_path: &std::path::Path) -> anyhow::Result<sqlx::SqlitePool> {
@@ -226,7 +224,7 @@ mod tests {
         assert!(resp.error.is_none(), "{:?}", resp.error);
         let result = resp.result.unwrap();
         assert_eq!(result["session"]["id"], sid.to_string());
-        assert!(result["turns"].as_array().unwrap().len() >= 1);
+        assert!(!result["turns"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

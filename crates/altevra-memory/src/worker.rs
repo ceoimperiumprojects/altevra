@@ -55,6 +55,10 @@ impl RateLimiter {
         }
     }
 
+    // refill/acquire are kept as legacy helpers for the v0.3.1-era worker.
+    // Live workloads use the async-safe inline snapshot path in EmbedderWorker
+    // (which mirrors `altevra_llm::RateLimiter::acquire`).
+    #[allow(dead_code)]
     fn refill(&mut self) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -62,6 +66,7 @@ impl RateLimiter {
         self.last_refill = now;
     }
 
+    #[allow(dead_code)]
     async fn acquire(&mut self) {
         loop {
             self.refill();
@@ -126,6 +131,7 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
     }
 
     /// Run a single batch. Returns the number of chunks SUCCESSFULLY embedded.
+    #[allow(clippy::await_holding_lock)]
     pub async fn tick(&self) -> anyhow::Result<usize> {
         // Claim a batch: read pending chunks, mark them in_progress in one query.
         let rows = sqlx::query(
@@ -165,8 +171,13 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
             .await;
 
             // Rate-limit before each embed call.
+            // Manual snapshot/drop pattern: pull state from the guard, drop it
+            // before any .await, do the math, then re-lock to commit.
+            // clippy::await_holding_lock is a false positive here because the
+            // guard is explicitly dropped via `drop(g)` before any await.
+            #[allow(clippy::await_holding_lock)]
             {
-                let mut g = self.limiter.lock().unwrap();
+                let g = self.limiter.lock().unwrap();
                 let snapshot = (g.refill_per_sec, g.tokens, g.capacity, g.last_refill);
                 drop(g);
                 // Recreate limiter state in an async-safe path. We re-lock briefly

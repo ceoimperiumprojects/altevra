@@ -47,7 +47,7 @@ pub struct LeverageArgs {
     #[arg(long)]
     pub out_dir: Option<PathBuf>,
     /// SQLite DB path
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -133,7 +133,7 @@ pub struct FeedsCandidatesArgs {
     pub status: String,
     #[arg(long, default_value_t = 50)]
     pub limit: i64,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: std::path::PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -144,7 +144,7 @@ pub struct FeedsPromoteArgs {
     pub candidate_id: String,
     #[arg(long, default_value_t = 0.5)]
     pub trust_weight: f32,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: std::path::PathBuf,
 }
 
@@ -153,7 +153,7 @@ pub struct FeedsRejectArgs {
     pub candidate_id: String,
     #[arg(long)]
     pub reason: Option<String>,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: std::path::PathBuf,
 }
 
@@ -1093,11 +1093,7 @@ async fn run_now(args: RunNowArgs) -> anyhow::Result<()> {
 }
 
 fn slugify_url(url: &str) -> String {
-    let host = url
-        .splitn(4, '/')
-        .nth(2)
-        .unwrap_or("feed")
-        .replace('.', "-");
+    let host = url.split('/').nth(2).unwrap_or("feed").replace('.', "-");
     let now = chrono::Utc::now().timestamp() % 100_000;
     format!("{host}-{now}")
 }

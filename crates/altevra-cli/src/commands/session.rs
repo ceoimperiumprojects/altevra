@@ -26,7 +26,7 @@ pub struct SessionStartArgs {
     pub tool: String,
     #[arg(long)]
     pub project: Option<String>,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -37,7 +37,7 @@ pub struct SessionEndArgs {
     pub session_id: String,
     #[arg(long)]
     pub summary: Option<String>,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
 }
 
@@ -52,7 +52,7 @@ pub struct SessionListArgs {
     pub since: Option<String>,
     #[arg(long, default_value_t = 20)]
     pub limit: i64,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -66,7 +66,7 @@ pub struct SessionReplayArgs {
     pub tool: String,
     #[arg(long, default_value_t = 1000)]
     pub turn_limit: i64,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -77,7 +77,7 @@ pub struct SessionShowArgs {
     pub session_id: String,
     #[arg(long, default_value_t = 100)]
     pub turn_limit: i64,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long)]
     pub json: bool,

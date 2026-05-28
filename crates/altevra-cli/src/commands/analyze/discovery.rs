@@ -7,6 +7,8 @@ pub struct DiscoveryReport {
     pub claude_code_files: Vec<PathBuf>,
     pub codex_state: Option<PathBuf>,
     pub codex_history: Option<PathBuf>,
+    /// Reserved for v0.5+ — tool call telemetry from logs_2.sqlite.
+    #[allow(dead_code)]
     pub codex_logs: Option<PathBuf>,
     pub cursor_jsonl_files: Vec<PathBuf>,
     pub antigravity_history: Option<PathBuf>,

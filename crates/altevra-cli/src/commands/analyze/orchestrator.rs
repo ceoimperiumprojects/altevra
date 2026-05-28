@@ -65,12 +65,8 @@ pub async fn run_analyze(
         None
     };
 
-    let process = |tool: &str| -> bool {
-        opts.only_tool
-            .as_deref()
-            .map(|t| t == tool)
-            .unwrap_or(true)
-    };
+    let process =
+        |tool: &str| -> bool { opts.only_tool.as_deref().map(|t| t == tool).unwrap_or(true) };
 
     // --- Claude Code ---
     if process("claude-code") {
@@ -164,7 +160,9 @@ pub async fn run_analyze(
                         import_one(&repo, s, &mut stats).await;
                     }
                 }
-                Err(e) => stats.errors.push(format!("codex {}: {}", history.display(), e)),
+                Err(e) => stats
+                    .errors
+                    .push(format!("codex {}: {}", history.display(), e)),
             }
             if let Some(pb) = &pb {
                 pb.inc(1);
@@ -212,10 +210,9 @@ pub async fn run_analyze(
                     if altevra_vault::parse_document(&f.path).is_ok() {
                         stats.vault_docs_parsed += 1;
                     } else {
-                        stats.errors.push(format!(
-                            "vault parse failed: {}",
-                            f.path.display()
-                        ));
+                        stats
+                            .errors
+                            .push(format!("vault parse failed: {}", f.path.display()));
                     }
                 }
             }
@@ -356,9 +353,7 @@ async fn summarize_recent(
                 }
             }
             Err(e) => {
-                stats
-                    .errors
-                    .push(format!("summarize {}: {}", sess.id, e));
+                stats.errors.push(format!("summarize {}: {}", sess.id, e));
             }
         }
     }
@@ -368,25 +363,52 @@ async fn summarize_recent(
 pub fn print_report(report: &DiscoveryReport, stats: &ImportStats) {
     println!("\n=== Analyze Everything — Report ===");
     println!("  Discovery:");
-    println!("    Claude Code JSONL files:   {}", report.claude_code_files.len());
+    println!(
+        "    Claude Code JSONL files:   {}",
+        report.claude_code_files.len()
+    );
     println!(
         "    Codex state.sqlite:        {}",
-        if report.codex_state.is_some() { "found" } else { "—" }
+        if report.codex_state.is_some() {
+            "found"
+        } else {
+            "—"
+        }
     );
     println!(
         "    Codex history.jsonl:       {}",
-        if report.codex_history.is_some() { "found" } else { "—" }
+        if report.codex_history.is_some() {
+            "found"
+        } else {
+            "—"
+        }
     );
-    println!("    Cursor chatSessions:       {}", report.cursor_jsonl_files.len());
+    println!(
+        "    Cursor chatSessions:       {}",
+        report.cursor_jsonl_files.len()
+    );
     println!(
         "    Antigravity history.jsonl: {}",
-        if report.antigravity_history.is_some() { "found" } else { "—" }
+        if report.antigravity_history.is_some() {
+            "found"
+        } else {
+            "—"
+        }
     );
-    println!("    Hermes session_*.json:     {}", report.hermes_session_files.len());
-    println!("    Obsidian vaults:           {}", report.obsidian_vaults.len());
+    println!(
+        "    Hermes session_*.json:     {}",
+        report.hermes_session_files.len()
+    );
+    println!(
+        "    Obsidian vaults:           {}",
+        report.obsidian_vaults.len()
+    );
     println!("  Imported:");
     println!("    Sessions:        {}", stats.sessions_imported);
-    println!("    Sessions skipped (duplicates): {}", stats.sessions_skipped);
+    println!(
+        "    Sessions skipped (duplicates): {}",
+        stats.sessions_skipped
+    );
     println!("    Turns:           {}", stats.turns_imported);
     println!("    Secrets captured: {}", stats.secrets_captured);
     println!("    LLM summaries:   {}", stats.llm_summaries);

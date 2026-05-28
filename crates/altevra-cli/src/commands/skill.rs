@@ -264,7 +264,7 @@ pub fn load_skills_from_dir(registry: &mut SkillRegistry, dir: &Path) -> anyhow:
             let content = std::fs::read_to_string(&path)?;
             if let Ok(_parsed) = parse_skill(&content) {
                 let path_str = path.display().to_string();
-                if let Ok(_) = registry.register(&path_str, &content) {
+                if registry.register(&path_str, &content).is_ok() {
                     count += 1;
                 }
             }

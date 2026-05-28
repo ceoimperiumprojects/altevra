@@ -41,7 +41,7 @@ pub fn extract_feed_links(base_url: &str, html: &str) -> Vec<String> {
 
     for link in doc.select(&link_sel) {
         let ty = link.value().attr("type").unwrap_or("");
-        if !FEED_MIME_TYPES.iter().any(|m| *m == ty) {
+        if !FEED_MIME_TYPES.contains(&ty) {
             continue;
         }
         let href = link.value().attr("href").unwrap_or("");

@@ -112,7 +112,7 @@ fn load_recent_updates_for_prompt(limit: usize) -> Vec<UpdateFeedItem> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str(l).ok())
         .collect();
-    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items.sort_by_key(|i| std::cmp::Reverse(i.created_at));
     // Filter out noise/low if there are many
     if items.len() > limit {
         items.retain(|i| i.importance >= Importance::Medium);

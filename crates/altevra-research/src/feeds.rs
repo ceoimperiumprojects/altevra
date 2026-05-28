@@ -7,18 +7,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FeedKind {
+    #[default]
     Rss,
     Atom,
     JsonFeed,
-}
-
-impl Default for FeedKind {
-    fn default() -> Self {
-        Self::Rss
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,18 +65,13 @@ impl Default for BriefPaths {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProjectKeywordsSource {
+    #[default]
     ImperiumIdentity,
     VaultReadmes,
     Inline,
-}
-
-impl Default for ProjectKeywordsSource {
-    fn default() -> Self {
-        Self::ImperiumIdentity
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

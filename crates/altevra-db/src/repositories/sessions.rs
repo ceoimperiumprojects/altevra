@@ -652,7 +652,9 @@ mod tests {
         let repo = SessionsRepository::new(&pool);
         let s = sample_session();
         repo.start_session(&s).await.unwrap();
-        repo.set_summary(s.id, "Built v0.3.8 importer.").await.unwrap();
+        repo.set_summary(s.id, "Built v0.3.8 importer.")
+            .await
+            .unwrap();
         let fetched = repo.get_session(s.id).await.unwrap().unwrap();
         assert_eq!(fetched.summary.as_deref(), Some("Built v0.3.8 importer."));
     }

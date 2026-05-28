@@ -169,9 +169,7 @@ fn detect_section(root: &Path, path: &Path) -> Option<String> {
 
     // Must have at least one more component (i.e. file is inside the section,
     // not the section directory itself which can't happen for a file anyway).
-    if components.next().is_none() {
-        return None;
-    }
+    components.next()?;
     if parse_section_slug(name).is_some() {
         Some(name.to_string())
     } else {

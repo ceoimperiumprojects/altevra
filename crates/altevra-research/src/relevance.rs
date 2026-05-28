@@ -147,14 +147,14 @@ mod tests {
     #[test]
     fn score_zero_when_no_overlap() {
         let item = mk_item("Cats and dogs", "playing in the yard");
-        let s = score_item(&item, &vec!["quantum".into(), "supersymmetry".into()]);
+        let s = score_item(&item, &["quantum".into(), "supersymmetry".into()]);
         assert!(s < 0.01);
     }
 
     #[test]
     fn score_positive_on_match() {
         let item = mk_item("New Rust release v1.80", "compiler improvements");
-        let s = score_item(&item, &vec!["rust".into(), "compiler".into()]);
+        let s = score_item(&item, &["rust".into(), "compiler".into()]);
         assert!(s > 0.0);
     }
 
@@ -164,7 +164,7 @@ mod tests {
             "agent orchestration with rust and sqlite",
             "agent orchestration with rust and sqlite",
         );
-        let s = score_item(&item, &vec!["rust".into(), "sqlite".into(), "agent".into()]);
+        let s = score_item(&item, &["rust".into(), "sqlite".into(), "agent".into()]);
         assert!((s - 1.0).abs() < 1e-3);
     }
 

@@ -86,7 +86,7 @@ fn has_excluded_ancestor(el: scraper::ElementRef<'_>) -> bool {
     while let Some(node) = current {
         if let Some(elem) = node.value().as_element() {
             let tag = elem.name();
-            if STRIP_TAGS.iter().any(|s| *s == tag) {
+            if STRIP_TAGS.contains(&tag) {
                 return true;
             }
         }

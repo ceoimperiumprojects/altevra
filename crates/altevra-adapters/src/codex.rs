@@ -264,7 +264,11 @@ impl ToolAdapter for CodexAdapter {
         let body = Self::agents_md_content(input.project.as_deref());
         // Strip the inline header from body so we let with_managed_header add
         // the canonical one (matching claude_code.rs pattern).
-        let body_no_header = body.splitn(2, "\n\n").nth(1).unwrap_or(&body).to_string();
+        let body_no_header = body
+            .split_once("\n\n")
+            .map(|(_, after)| after)
+            .unwrap_or(&body)
+            .to_string();
         let file = GeneratedFile::new("AGENTS.md", body_no_header).with_managed_header(
             "07-capabilities/agent-tools.yaml",
             self.tool_name(),

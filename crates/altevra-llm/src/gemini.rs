@@ -115,7 +115,11 @@ impl GeminiFlashChat {
         &self.model
     }
 
-    pub async fn complete(&self, messages: &[ChatMessage], opts: ChatOpts) -> anyhow::Result<String> {
+    pub async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        opts: ChatOpts,
+    ) -> anyhow::Result<String> {
         let mut contents: Vec<GenContent> = Vec::with_capacity(messages.len());
         let mut system_instruction: Option<GenContent> = None;
 
@@ -126,18 +130,25 @@ impl GeminiFlashChat {
                 ChatRole::User | ChatRole::Tool => "user",
                 ChatRole::Assistant => "model",
                 ChatRole::System => {
-                    let part = GenPart { text: msg.content.clone() };
+                    let part = GenPart {
+                        text: msg.content.clone(),
+                    };
                     if let Some(ref mut s) = system_instruction {
                         s.parts.push(part);
                     } else {
-                        system_instruction = Some(GenContent { role: "user", parts: vec![part] });
+                        system_instruction = Some(GenContent {
+                            role: "user",
+                            parts: vec![part],
+                        });
                     }
                     continue;
                 }
             };
             contents.push(GenContent {
                 role,
-                parts: vec![GenPart { text: msg.content.clone() }],
+                parts: vec![GenPart {
+                    text: msg.content.clone(),
+                }],
             });
         }
 
@@ -146,7 +157,10 @@ impl GeminiFlashChat {
             if let Some(ref mut s) = system_instruction {
                 s.parts.push(part);
             } else {
-                system_instruction = Some(GenContent { role: "user", parts: vec![part] });
+                system_instruction = Some(GenContent {
+                    role: "user",
+                    parts: vec![part],
+                });
             }
         }
 
@@ -252,10 +266,7 @@ mod tests {
     fn system_message_folds_into_system_instruction() {
         // We can't assert on the serialized body without a transport mock,
         // but we can verify construction does not panic and types align.
-        let msgs = vec![
-            ChatMessage::system("be brief"),
-            ChatMessage::user("hello"),
-        ];
+        let msgs = [ChatMessage::system("be brief"), ChatMessage::user("hello")];
         let opts = ChatOpts::default().with_max_tokens(50);
         assert_eq!(msgs.len(), 2);
         assert!(opts.max_tokens.is_some());
@@ -267,7 +278,9 @@ mod tests {
         // Hit unreachable host by overriding model with garbage so endpoint
         // returns 404. The point is to exercise the error path.
         let c = c.with_model("nonexistent-model-altevra-test");
-        let result = c.complete(&[ChatMessage::user("hi")], ChatOpts::default()).await;
+        let result = c
+            .complete(&[ChatMessage::user("hi")], ChatOpts::default())
+            .await;
         // Either network error or HTTP non-2xx — both are Err.
         assert!(result.is_err());
     }

@@ -233,7 +233,7 @@ mod tests {
         let doc = ingest_file(&path, DEFAULT_CHUNK_SIZE).unwrap();
         assert_eq!(doc.source_path, path);
         assert!(doc.frontmatter.is_some());
-        assert!(doc.chunks.len() >= 1);
+        assert!(!doc.chunks.is_empty());
         // Checksum must match a fresh SHA-256 of the raw bytes.
         let raw = std::fs::read(&path).unwrap();
         assert_eq!(doc.checksum, sha256_hex(&raw));

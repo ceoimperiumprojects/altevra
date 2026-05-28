@@ -37,7 +37,7 @@ impl JobKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "event_classifier" => Self::EventClassifier,
             "observer_scan" => Self::ObserverScan,
@@ -800,7 +800,7 @@ mod tests {
             JobKind::DailySummary,
             JobKind::TaskGrooming,
         ] {
-            assert_eq!(JobKind::from_str(k.as_str()), Some(k));
+            assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }
     }
 

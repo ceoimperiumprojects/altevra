@@ -21,7 +21,7 @@ pub enum BrainCommands {
 pub struct BrainStartArgs {
     #[arg(long, default_value = ".")]
     pub vault: PathBuf,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long, default_value_t = 23)]
     pub daily_summary_hour: u32,
@@ -36,7 +36,7 @@ pub struct BrainStartArgs {
 
 #[derive(Args)]
 pub struct BrainStatusArgs {
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long, default_value = ".altevra/brain.pid")]
     pub pid_file: PathBuf,
@@ -54,7 +54,7 @@ pub struct BrainStopArgs {
 pub struct BrainTickArgs {
     #[arg(long, default_value = ".")]
     pub vault: PathBuf,
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
     #[arg(long, default_value = "daily_summary")]
     pub disabled: String,

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sensitivity {
     Public,
+    #[default]
     Internal,
     Confidential,
     Secret,
@@ -17,12 +18,6 @@ impl std::fmt::Display for Sensitivity {
             Self::Confidential => write!(f, "confidential"),
             Self::Secret => write!(f, "secret"),
         }
-    }
-}
-
-impl Default for Sensitivity {
-    fn default() -> Self {
-        Self::Internal
     }
 }
 

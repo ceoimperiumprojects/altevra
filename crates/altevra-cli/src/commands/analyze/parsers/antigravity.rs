@@ -54,15 +54,20 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Vec<ImportedSession>> {
     }
     let mut grouped: BTreeMap<String, Vec<(AGRecord, DateTime<Utc>)>> = BTreeMap::new();
     let mut fallback_counter = 0usize;
+    let mut skipped_lines = 0usize;
+    let mut first_error: Option<String> = None;
 
-    for (line_no, line) in raw.lines().enumerate() {
+    for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let rec: AGRecord = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!(file = %path.display(), line = line_no, error = %e, "skip malformed antigravity line");
+                skipped_lines += 1;
+                if first_error.is_none() {
+                    first_error = Some(e.to_string());
+                }
                 continue;
             }
         };
@@ -76,6 +81,15 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Vec<ImportedSession>> {
             .and_then(flex_ts_to_utc)
             .unwrap_or_else(Utc::now);
         grouped.entry(conv).or_default().push((rec, ts));
+    }
+
+    if skipped_lines > 0 {
+        tracing::warn!(
+            file = %path.display(),
+            skipped = skipped_lines,
+            sample_error = %first_error.unwrap_or_default(),
+            "skipped malformed antigravity lines"
+        );
     }
 
     let mut sessions = Vec::new();
@@ -114,7 +128,10 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Vec<ImportedSession>> {
         sessions.push(ImportedSession {
             external_id: conv_id,
             tool_id: "antigravity".into(),
-            project_name: workspace.as_deref().and_then(|c| c.rsplit('/').next()).map(String::from),
+            project_name: workspace
+                .as_deref()
+                .and_then(|c| c.rsplit('/').next())
+                .map(String::from),
             started_at,
             ended_at: Some(ended_at),
             model: None,

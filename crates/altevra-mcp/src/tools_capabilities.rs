@@ -20,6 +20,7 @@ fn append_jsonl(path: &str, value: &Value) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn load_jsonl(path: &str) -> Vec<Value> {
     if !std::path::Path::new(path).exists() {
         return vec![];

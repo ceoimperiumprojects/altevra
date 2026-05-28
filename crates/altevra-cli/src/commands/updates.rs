@@ -144,7 +144,7 @@ fn load_local_updates(
         .filter_map(|l| serde_json::from_str(l).ok())
         .filter(|item: &UpdateFeedItem| item.created_at >= since)
         .filter(|item: &UpdateFeedItem| {
-            project.as_deref().map_or(true, |p| {
+            project.as_deref().is_none_or(|p| {
                 item.update_type.contains(p)
                     || item.title.contains(p)
                     || item.short_summary.contains(p)
@@ -157,7 +157,7 @@ fn load_local_updates(
                 .unwrap_or(true)
         })
         .collect();
-    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items.sort_by_key(|i| std::cmp::Reverse(i.created_at));
     items
 }
 

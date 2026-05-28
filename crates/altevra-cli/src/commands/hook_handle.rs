@@ -37,7 +37,7 @@ pub struct HookHandleArgs {
     pub project: Option<String>,
 
     /// SQLite database path.
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
 
     /// Skip stdin reading (for tests).

@@ -59,7 +59,7 @@ pub struct TurnRecordArgs {
     pub no_redact: bool,
 
     /// SQLite database path.
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
 
     /// Emit JSON receipt.

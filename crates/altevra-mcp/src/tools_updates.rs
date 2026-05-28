@@ -91,7 +91,7 @@ fn load_local(
                 .unwrap_or(true)
         })
         .collect();
-    items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    items.sort_by_key(|i| std::cmp::Reverse(i.created_at));
     items
 }
 

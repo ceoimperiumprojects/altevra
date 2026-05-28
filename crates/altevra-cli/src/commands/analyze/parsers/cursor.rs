@@ -127,6 +127,10 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Option<ImportedSession>> {
     }))
 }
 
+/// Walk Cursor / VS Code chatSessions JSONL files.
+/// Currently the orchestrator uses `discovery::discover()` instead; kept here
+/// for tool-specific discovery via MCP in v0.5+.
+#[allow(dead_code)]
 pub fn discover(root: &Path) -> Vec<PathBuf> {
     if !root.exists() {
         return vec![];

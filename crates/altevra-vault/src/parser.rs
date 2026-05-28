@@ -90,15 +90,13 @@ fn extract_first_h1(body: &str) -> Option<String> {
                 in_h1 = true;
                 buf.clear();
             }
-            Event::End(TagEnd::Heading(HeadingLevel::H1)) => {
-                if in_h1 {
-                    let trimmed = buf.trim().to_string();
-                    return if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    };
-                }
+            Event::End(TagEnd::Heading(HeadingLevel::H1)) if in_h1 => {
+                let trimmed = buf.trim().to_string();
+                return if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
             }
             Event::Text(t) if in_h1 => {
                 buf.push_str(&t);

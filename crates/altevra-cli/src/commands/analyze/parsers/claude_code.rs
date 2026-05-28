@@ -233,7 +233,10 @@ fn extract_message(rec: &RawRecord) -> (&'static str, String, Option<String>) {
         if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
             model = Some(m.to_string());
         }
-        let raw = msg.get("content").cloned().unwrap_or(serde_json::Value::Null);
+        let raw = msg
+            .get("content")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         flatten_content(&raw)
     } else {
         String::new()
@@ -276,6 +279,9 @@ fn extract_tool_calls(rec: &RawRecord) -> Option<serde_json::Value> {
 }
 
 /// Walk all `~/.claude/projects/<hash>/*.jsonl` files under `root`.
+/// Currently the orchestrator uses `discovery::discover()` instead; kept here
+/// for tool-specific discovery via MCP in v0.5+.
+#[allow(dead_code)]
 pub fn discover(root: &Path) -> Vec<PathBuf> {
     if !root.exists() {
         return vec![];

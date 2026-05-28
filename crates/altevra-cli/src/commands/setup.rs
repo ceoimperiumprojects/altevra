@@ -35,7 +35,7 @@ pub struct AnalyzeEverythingArgs {
     #[arg(long)]
     pub limit_per_tool: Option<usize>,
     /// Path to the Altevra SQLite database
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: std::path::PathBuf,
     /// Emit JSON report instead of human-readable text
     #[arg(long)]
@@ -107,22 +107,46 @@ async fn run_analyze_everything(args: AnalyzeEverythingArgs) -> anyhow::Result<(
     let report = crate::commands::analyze::discovery::discover();
     if !args.json {
         println!("\nDiscovery:");
-        println!("  Claude Code JSONL files:   {}", report.claude_code_files.len());
+        println!(
+            "  Claude Code JSONL files:   {}",
+            report.claude_code_files.len()
+        );
         println!(
             "  Codex state.sqlite:        {}",
-            if report.codex_state.is_some() { "found" } else { "—" }
+            if report.codex_state.is_some() {
+                "found"
+            } else {
+                "—"
+            }
         );
         println!(
             "  Codex history.jsonl:       {}",
-            if report.codex_history.is_some() { "found" } else { "—" }
+            if report.codex_history.is_some() {
+                "found"
+            } else {
+                "—"
+            }
         );
-        println!("  Cursor chatSessions:       {}", report.cursor_jsonl_files.len());
+        println!(
+            "  Cursor chatSessions:       {}",
+            report.cursor_jsonl_files.len()
+        );
         println!(
             "  Antigravity history.jsonl: {}",
-            if report.antigravity_history.is_some() { "found" } else { "—" }
+            if report.antigravity_history.is_some() {
+                "found"
+            } else {
+                "—"
+            }
         );
-        println!("  Hermes session_*.json:     {}", report.hermes_session_files.len());
-        println!("  Obsidian vaults:           {}", report.obsidian_vaults.len());
+        println!(
+            "  Hermes session_*.json:     {}",
+            report.hermes_session_files.len()
+        );
+        println!(
+            "  Obsidian vaults:           {}",
+            report.obsidian_vaults.len()
+        );
         println!();
     }
 

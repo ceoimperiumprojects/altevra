@@ -195,11 +195,7 @@ pub fn handle_project_research(id: Value, args: &Value) -> McpResponse {
 }
 
 fn sanitize_feed_id(url: &str) -> String {
-    let host = url
-        .splitn(4, '/')
-        .nth(2)
-        .unwrap_or("feed")
-        .replace('.', "-");
+    let host = url.split('/').nth(2).unwrap_or("feed").replace('.', "-");
     let now = chrono::Utc::now().timestamp() % 100_000;
     format!("{host}-{now}")
 }

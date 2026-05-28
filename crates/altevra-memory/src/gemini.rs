@@ -49,6 +49,7 @@ struct ApiError {
 #[derive(Debug, Deserialize)]
 struct ApiErrorBody {
     message: String,
+    #[allow(dead_code)]
     code: Option<i32>,
 }
 

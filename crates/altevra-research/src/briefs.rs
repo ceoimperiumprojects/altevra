@@ -123,7 +123,7 @@ pub fn write_project_brief(
     out.push_str("---\n\n");
     out.push_str(&format!("# Research Brief — {project_id} — {date}\n\n"));
 
-    let mut sorted: Vec<&ScoredItem> = relevant.iter().copied().collect();
+    let mut sorted: Vec<&ScoredItem> = relevant.to_vec();
     sorted.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)

@@ -87,7 +87,7 @@ async fn run_install(args: HookInstallArgs) -> anyhow::Result<()> {
     let adapter = resolve_adapter(&args.tool)?;
     let registry = HookRegistry::with_defaults();
     let hooks: Vec<_> = registry.list();
-    let hook_refs: Vec<&altevra_hooks::universal::UniversalHook> = hooks.iter().copied().collect();
+    let hook_refs: Vec<&altevra_hooks::universal::UniversalHook> = hooks.to_vec();
     let files = adapter.render_hooks(hook_refs)?;
 
     if args.dry_run {

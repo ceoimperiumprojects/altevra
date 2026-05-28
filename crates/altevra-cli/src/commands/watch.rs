@@ -33,7 +33,7 @@ pub struct WatchStartArgs {
     pub index_code_files: bool,
 
     /// SQLite path to write pending_indexing rows.
-    #[arg(long, default_value = ".altevra/altevra.db")]
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
 
     /// JSONL event log path.

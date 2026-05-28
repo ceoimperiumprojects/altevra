@@ -29,7 +29,7 @@ impl SourceKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "rss" => Self::Rss,
             "github-trending" => Self::GitHubTrending,
@@ -67,8 +67,8 @@ mod tests {
             SourceKind::WebSearch,
             SourceKind::MonitorPage,
         ] {
-            assert_eq!(SourceKind::from_str(k.as_str()), Some(k));
+            assert_eq!(SourceKind::parse(k.as_str()), Some(k));
         }
-        assert!(SourceKind::from_str("nope").is_none());
+        assert!(SourceKind::parse("nope").is_none());
     }
 }

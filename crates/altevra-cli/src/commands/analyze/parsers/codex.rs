@@ -2,12 +2,20 @@
 //!
 //! Storage:
 //! - `~/.codex/state_5.sqlite` — `threads` table with thread metadata
-//! - `~/.codex/history.jsonl` — append-only log of all interactions
-//! - `~/.codex/logs_2.sqlite` — tool call telemetry
+//!   (id, title, project, cwd, created_at). NO `messages` / `turns` table
+//!   with actual conversation content — Codex stores those exclusively in
+//!   `history.jsonl`. So turn counts depend entirely on how complete that
+//!   append-only file is. If `history.jsonl` was truncated, deleted, or
+//!   never enabled, sessions will appear with 0-1 turns even though the
+//!   thread metadata indicates real activity.
+//! - `~/.codex/history.jsonl` — append-only log of all interactions,
+//!   keyed by `thread_id`. Source of truth for conversation flow.
+//! - `~/.codex/logs_2.sqlite` — tool call telemetry (not currently used;
+//!   could be joined for tool-call enrichment in v0.5+).
 //!
 //! Strategy: read `history.jsonl`, group lines by `thread_id` field. The
-//! SQLite files are advisory (enrich thread title, project, etc.) — we
-//! don't require them to extract the conversation flow.
+//! state SQLite is advisory — enriches thread title/project/created_at,
+//! never required.
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -35,6 +43,8 @@ struct HistoryLine {
 
 #[derive(Debug, Default, Clone)]
 struct ThreadMetadata {
+    /// Reserved — Codex `threads.title` value, surfaced via MCP in v0.5+.
+    #[allow(dead_code)]
     title: Option<String>,
     project: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -42,19 +52,15 @@ struct ThreadMetadata {
 
 fn load_thread_metadata(state_db: &Path) -> BTreeMap<String, ThreadMetadata> {
     let mut out = BTreeMap::new();
-    let conn = match Connection::open_with_flags(
-        state_db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(db = %state_db.display(), error = %e, "cannot open codex state db");
-            return out;
-        }
-    };
-    let mut stmt = match conn
-        .prepare("SELECT id, title, project, created_at FROM threads")
-    {
+    let conn =
+        match Connection::open_with_flags(state_db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(db = %state_db.display(), error = %e, "cannot open codex state db");
+                return out;
+            }
+        };
+    let mut stmt = match conn.prepare("SELECT id, title, project, created_at FROM threads") {
         Ok(s) => s,
         Err(_) => {
             // Schema may vary — try a forgiving query.
