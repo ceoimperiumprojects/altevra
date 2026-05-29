@@ -3,11 +3,11 @@
 <!-- generated_by: altevra -->
 <!-- adapter: claude-code -->
 <!-- version: 0.1.0 -->
-<!-- checksum: 2a65ee1867ed87bf1ff36aafe41048370868a26fd825f96c3700e859309ad419 -->
+<!-- checksum: b51bc552c0d938782b0f15b9c5b7237462a97798145aa678413e4f8b7f0d16e1 -->
 
 # Altevra Context
 
-Project: altevra
+Project: (set ALTEVRA_PROJECT env var)
 
 ## Session Startup
 
