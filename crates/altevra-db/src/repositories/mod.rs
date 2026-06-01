@@ -1,6 +1,7 @@
 pub mod events;
 pub mod hooks;
 pub mod installations;
+pub mod objects;
 pub mod read_state;
 pub mod sessions;
 pub mod skills;
@@ -11,6 +12,7 @@ pub mod wiki;
 pub use events::EventsRepository;
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
+pub use objects::{LearningRow, LearningsRepository, ObjectIndexRepository, ObjectIndexRow};
 pub use read_state::{ReadStateRepository, UpdateReadState};
 pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow};
 pub use skills::{SkillRow, SkillsRepository};
