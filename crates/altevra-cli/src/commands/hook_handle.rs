@@ -102,7 +102,7 @@ async fn handle_session_start(
 
 async fn handle_session_end(
     repo: &SessionsRepository<'_>,
-    _args: &HookHandleArgs,
+    args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let summary = payload
@@ -119,17 +119,17 @@ async fn handle_session_end(
 
 async fn handle_user_prompt(
     repo: &SessionsRepository<'_>,
-    _args: &HookHandleArgs,
+    args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let content =
         first_field(payload, &["user_prompt", "prompt", "content", "message"]).unwrap_or_default();
-    record_turn(repo, "user", &content, None, payload).await
+    record_turn(repo, "user", &content, None, &args.tool, payload).await
 }
 
 async fn handle_pre_tool_use(
     repo: &SessionsRepository<'_>,
-    _args: &HookHandleArgs,
+    args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let tool_name = payload
@@ -140,12 +140,12 @@ async fn handle_pre_tool_use(
         .get("tool_input")
         .map(|v| v.to_string())
         .unwrap_or_default();
-    record_turn(repo, "tool_call", &content, tool_name, payload).await
+    record_turn(repo, "tool_call", &content, tool_name, &args.tool, payload).await
 }
 
 async fn handle_post_tool_use(
     repo: &SessionsRepository<'_>,
-    _args: &HookHandleArgs,
+    args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let tool_name = payload
@@ -153,7 +153,15 @@ async fn handle_post_tool_use(
         .and_then(serde_json::Value::as_str)
         .map(String::from);
     let response = first_field(payload, &["tool_response", "result", "output"]).unwrap_or_default();
-    record_turn(repo, "tool_result", &response, tool_name, payload).await
+    record_turn(
+        repo,
+        "tool_result",
+        &response,
+        tool_name,
+        &args.tool,
+        payload,
+    )
+    .await
 }
 
 async fn record_turn(
@@ -161,6 +169,7 @@ async fn record_turn(
     role: &str,
     raw_content: &str,
     tool_name: Option<String>,
+    source_tool: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let session_id = match read_current_session()? {
@@ -235,6 +244,7 @@ async fn record_turn(
             .and_then(serde_json::Value::as_i64),
         file_changes: payload.get("file_changes").cloned(),
         redacted_count,
+        source_tool: Some(source_tool.to_string()),
         created_at: Utc::now(),
     };
     repo.record_turn(&turn).await?;

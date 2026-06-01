@@ -284,6 +284,7 @@ async fn import_one(repo: &SessionsRepository<'_>, sess: ImportedSession, stats:
                     latency_ms: turn.latency_ms,
                     file_changes: None,
                     redacted_count: captures.len() as i64,
+                    source_tool: Some(sess.tool_id.clone()),
                     created_at: turn.created_at,
                 };
                 if let Err(e) = repo.record_turn(&trow).await {

@@ -111,6 +111,7 @@ pub async fn run(args: TurnRecordArgs) -> anyhow::Result<()> {
         latency_ms: args.latency_ms,
         file_changes,
         redacted_count,
+        source_tool: None,
         created_at: Utc::now(),
     };
 

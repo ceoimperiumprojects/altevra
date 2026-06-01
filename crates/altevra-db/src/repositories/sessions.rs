@@ -48,6 +48,8 @@ pub struct TurnRow {
     pub latency_ms: Option<i64>,
     pub file_changes: Option<serde_json::Value>,
     pub redacted_count: i64,
+    /// The agent/tool that produced this turn (claude-code | codex | cursor | …).
+    pub source_tool: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -178,8 +180,8 @@ impl<'a> SessionsRepository<'a> {
             r#"INSERT INTO turns
                 (id, session_id, turn_idx, role, content, tool_calls, tool_name,
                  model, tokens_in, tokens_out, latency_ms, file_changes,
-                 redacted_count, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 redacted_count, source_tool, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(t.id.to_string())
         .bind(t.session_id.to_string())
@@ -194,6 +196,7 @@ impl<'a> SessionsRepository<'a> {
         .bind(t.latency_ms)
         .bind(t.file_changes.as_ref().map(|v| v.to_string()))
         .bind(t.redacted_count)
+        .bind(t.source_tool.as_deref())
         .bind(ts_to_text(&t.created_at))
         .execute(self.pool)
         .await?;
@@ -366,6 +369,7 @@ impl<'a> SessionsRepository<'a> {
                     .get::<Option<String>, _>("file_changes")
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 redacted_count: r.get("redacted_count"),
+                source_tool: r.get("source_tool"),
                 created_at: ts_from_text(r.get::<String, _>("created_at")),
             })
             .collect())
@@ -539,6 +543,7 @@ impl<'a> SessionsRepository<'a> {
                         .get::<Option<String>, _>("file_changes")
                         .and_then(|s| serde_json::from_str(&s).ok()),
                     redacted_count: r.get("redacted_count"),
+                    source_tool: r.get("source_tool"),
                     created_at: ts_from_text(r.get::<String, _>("created_at")),
                 };
                 (row, score)
@@ -697,6 +702,7 @@ mod tests {
             latency_ms: None,
             file_changes: None,
             redacted_count: 0,
+            source_tool: None,
             created_at: Utc::now(),
         };
         repo.record_turn(&turn).await.unwrap();
@@ -728,6 +734,7 @@ mod tests {
                 latency_ms: None,
                 file_changes: None,
                 redacted_count: 0,
+                source_tool: None,
                 created_at: Utc::now(),
             };
             repo.record_turn(&turn).await.unwrap();
@@ -829,6 +836,7 @@ mod tests {
                 latency_ms: None,
                 file_changes: None,
                 redacted_count: 0,
+                source_tool: None,
                 created_at: Utc::now(),
             };
             repo.record_turn(&t).await.unwrap();
@@ -868,6 +876,7 @@ mod tests {
                 latency_ms: None,
                 file_changes: None,
                 redacted_count: 0,
+                source_tool: None,
                 created_at: Utc::now(),
             };
             repo.record_turn(&t).await.unwrap();
