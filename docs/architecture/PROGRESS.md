@@ -5,7 +5,14 @@
 
 ## ☀️ MORNING HANDOFF (read this first)
 
-**Brate — ovde je gde sam stigao preko noći. Sve je commitovano, sve zeleno.**
+**Brate — sve commitovano, sve zeleno, LIVE TESTIRANO, i PUSH-ovano na GitHub.** 🔥
+
+### ⭐ Najvažnije (jutarnji TL;DR)
+- **18 commitova** na branch `altevra-overnight-p0`, **push-ovan na GitHub** (PR link: github.com/ceoimperiumprojects/altevra/pull/new/altevra-overnight-p0).
+- **LIVE TEST PROŠAO** — spawn-ovao žive `claude` agente u herdr-u, naterao ih da zovu Altevra MCP. Našao i popravio **3 prava integration bug-a**: (1) altevra nije bio u PATH → symlinkovao, (2) MCP nije registrovan → `claude mcp add --scope user`, (3) `tools/call` vraćao goli JSON umesto MCP `content` envelope → popravljen. **Konekcija sa Claude Code sad radi end-to-end.** Detalji u REAL_TEST_LOG.md.
+- Sutra: **dodaj API ključeve** (P0.5+ resident/LLM); sve ostalo radi bez njih.
+
+
 
 ### Šta RADI (verifikovano, end-to-end)
 - **P0.0 kompletan** — svi core tipovi: 6-nivo Sensitivity (R1), Domain+RiskTag (R3), 6 status familija (R2), Envelope+Provenance, Template sistem + 9 builtina + TemplateGate (R13), contract-validation test, P0 fixtures.
