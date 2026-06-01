@@ -131,15 +131,21 @@ fn is_email_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'%' | b'+' | b'-')
 }
 
-/// The single pre-write guard. `body` is the markdown/text being written;
-/// `envelope` carries domain/categories/object_type; `present_frontmatter_keys`
-/// are the keys actually present (for TemplateGate).
-pub fn ingest_guard(
-    body: &str,
-    envelope: &Envelope,
-    present_frontmatter_keys: &[String],
-    registry: &TemplateRegistry,
-) -> Guarded {
+/// Text-only guard: secret + PII redaction + sensitivity classification, with
+/// NO template/tag enforcement. Used for high-volume activity text (hook-captured
+/// turns, session content) that isn't a templated faced object but MUST still be
+/// scrubbed before persistence (BUILD_TASKS T1.13). `declared_sensitivity` is the
+/// caller's starting point; the guard only ever RAISES it (default-up).
+#[derive(Debug, Clone)]
+pub struct GuardedText {
+    pub value: String,
+    pub redaction_status: RedactionStatus,
+    pub sensitivity: Sensitivity,
+    pub risk_tags: Vec<RiskTag>,
+    pub sightings: Vec<SecretSighting>,
+}
+
+pub fn guard_text(body: &str, declared_sensitivity: Sensitivity) -> GuardedText {
     // ---- 1. detect + redact secrets ----
     let matches = detect_secrets(body);
     let mut sightings = Vec::new();
@@ -148,14 +154,12 @@ pub fn ingest_guard(
     let mut value = body.to_string();
 
     if !matches.is_empty() {
-        // redact ALL detected secrets with a typed placeholder.
         value = redact_with(body, "[REDACTED]");
         for m in &matches {
-            let hard = is_hard_secret(m.kind);
-            had_hard |= hard;
+            had_hard |= is_hard_secret(m.kind);
             // PEM private keys / credentialed DB URLs are the strongest class:
-            // record them as `rejected` (the value must never be stored anywhere,
-            // §2.5); other detected secrets are `redacted` in place.
+            // recorded as `rejected` (value must never be stored, §2.5); others
+            // are `redacted` in place.
             let action = match m.kind {
                 SecretKind::PrivateKey | SecretKind::DatabaseUrl => "rejected",
                 _ => "redacted",
@@ -166,31 +170,21 @@ pub fn ingest_guard(
                 action: action.to_string(),
             });
         }
-        if !risk_tags.contains(&RiskTag::Credential) {
-            risk_tags.push(RiskTag::Credential);
-        }
+        risk_tags.push(RiskTag::Credential);
     }
 
     // ---- 2. PII (emails) ----
     let emails = detect_emails(&value);
     if !emails.is_empty() {
-        // redact back-to-front to preserve offsets
         for (s, e) in emails.iter().rev() {
             value.replace_range(*s..*e, "[REDACTED:email]");
         }
-        if !risk_tags.contains(&RiskTag::ThirdPartyPii) {
-            risk_tags.push(RiskTag::ThirdPartyPii);
-        }
+        risk_tags.push(RiskTag::ThirdPartyPii);
     }
 
-    // ---- 3. classify sensitivity (rule-based; default-up) ----
-    // Start from the envelope's declared sensitivity, raise for detected risk.
-    let mut sensitivity = envelope.sensitivity.clone();
-    if had_hard {
-        // credential-class content raises to at least Confidential.
-        sensitivity = sensitivity.combine(&Sensitivity::Confidential);
-    }
-    if !emails.is_empty() {
+    // ---- 3. classify sensitivity (default-up) ----
+    let mut sensitivity = declared_sensitivity;
+    if had_hard || !emails.is_empty() {
         sensitivity = sensitivity.combine(&Sensitivity::Confidential);
     }
 
@@ -201,7 +195,35 @@ pub fn ingest_guard(
         RedactionStatus::Redacted
     };
 
-    // ---- 5. template + mandatory-tag gate (R13) ----
+    GuardedText {
+        value,
+        redaction_status,
+        sensitivity,
+        risk_tags,
+        sightings,
+    }
+}
+
+/// The single pre-write guard for templated FACED objects. `body` is the markdown
+/// being written; `envelope` carries domain/categories/object_type;
+/// `present_frontmatter_keys` are the keys present (for TemplateGate). Composes
+/// [`guard_text`] (secret/PII/classify) with the R13 template + mandatory-tag gate.
+pub fn ingest_guard(
+    body: &str,
+    envelope: &Envelope,
+    present_frontmatter_keys: &[String],
+    registry: &TemplateRegistry,
+) -> Guarded {
+    let gt = guard_text(body, envelope.sensitivity.clone());
+    let GuardedText {
+        value,
+        redaction_status,
+        sensitivity,
+        risk_tags,
+        sightings,
+    } = gt;
+
+    // ---- template + mandatory-tag gate (R13) ----
     // Build a temp envelope reflecting the (possibly raised) sensitivity.
     let mut env = envelope.clone();
     env.sensitivity = sensitivity.clone();
@@ -217,6 +239,10 @@ pub fn ingest_guard(
         GateOutcome::Pass => (false, Vec::new()),
         GateOutcome::Quarantine(rs) => (true, rs.clone()),
     };
+    // A `rejected`-class sighting (PEM/db-url) means a credential was present.
+    if sightings.iter().any(|s| s.action == "rejected") {
+        reasons.push("credential-class secret detected and redacted".into());
+    }
 
     Guarded {
         value,
@@ -226,12 +252,7 @@ pub fn ingest_guard(
         sightings,
         template,
         quarantined,
-        reasons: {
-            if had_hard {
-                reasons.push("credential-class secret detected and redacted".into());
-            }
-            reasons
-        },
+        reasons,
     }
 }
 

@@ -14,7 +14,7 @@
 //! `tool_name`, `command`, `content`) defensively.
 
 use altevra_db::{create_pool, run_migrations, SessionRow, SessionsRepository, TurnRow};
-use altevra_secrets::{auto_capture, redact, SecretStore};
+use altevra_secrets::{auto_capture, guard_text, SecretStore};
 use chrono::Utc;
 use clap::Args;
 use std::io::Read;
@@ -178,12 +178,22 @@ async fn record_turn(
     // feature — Altevra grabs them once, stores forever, then redacts.
     let store = resolve_capture_store();
     let captures = auto_capture(raw_content, &store).unwrap_or_default();
-    let redacted_count = captures.len() as i64;
-    let final_content = if redacted_count > 0 {
-        redact(raw_content)
-    } else {
-        raw_content.to_string()
-    };
+
+    // PreWriteSafetyGate text path (T1.13): scrub BOTH secrets AND PII (emails)
+    // and classify sensitivity before the turn is persisted. Previously only
+    // secrets were redacted; PII leaked into stored content. guard_text raises
+    // sensitivity (default-up) when credential/PII risk is present.
+    let guarded = guard_text(raw_content, altevra_core::Sensitivity::Internal);
+    let final_content = guarded.value;
+    // redacted_count reflects everything scrubbed: captured secrets, plus a PII
+    // bump when emails were redacted.
+    let mut redacted_count = captures.len().max(guarded.sightings.len()) as i64;
+    if guarded
+        .risk_tags
+        .contains(&altevra_core::RiskTag::ThirdPartyPii)
+    {
+        redacted_count += 1;
+    }
     let capture_meta: Vec<serde_json::Value> = captures
         .iter()
         .map(|c| {
