@@ -37,7 +37,8 @@
 |---|---|---|
 | Baseline | ✅ green | flaky env test fixed (mutex-serialized) |
 | P0.0 contracts+enums+templates | ✅ done | T0.1–T0.10; 81 tests |
-| P0.1 vertical loop | 🟩 spine proven | schema 019-022 ✅, PreWriteSafetyGate ✅, ExposureGate ✅, p0_vertical_smoke ✅; hardening left (repos/vault-mirror/full-packet-module/presence) |
+| P0.1 vertical loop | 🟩 core done | schema 019-022, both gates, presence, repo layer, packet compiler module, p0_vertical_smoke ✅. Hardening left: T1.13 wire guard into all repo writes, T1.14 vault mirror, T1.17 review CLI. |
+| P0.2 capability registry | 🔄 started | T2.2 TrustLevel+Support ✅, T2.1 schema 023 (adapter_dossiers/capability_records/skill_proposals/capability_grants) ✅. Next: T2.3 component-state machine wiring, T2.4 dossier/evidence from verify(), T2.5 watcher before_hash+self-write marker, repos. |
 | P0.1 vertical loop | ⬜ pending | |
 | P0.2 capability registry | ⬜ pending | |
 | P0.3 control plane | ⬜ pending | |
