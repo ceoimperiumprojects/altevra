@@ -1,8 +1,37 @@
 //! MCP tools for v0.3.7 Replay & Query: replay_session, search_turns, file_history.
 
 use crate::server::McpResponse;
+use altevra_db::TurnRow;
 use serde_json::Value;
 use std::path::PathBuf;
+
+/// R11 #4: turn reads (replay/search) are an exposure surface — they must pass
+/// through the ExposureGate, not return raw content. An MCP/agent caller gets a
+/// work ceiling: a turn classified Restricted (health/personal) or not
+/// sufficiently redacted (unscanned) is denied. Turns carry no domain, so we
+/// stamp Business (in the work scope) and let sensitivity + redaction decide —
+/// personal content is excluded by its Restricted level, never by guesswork.
+fn turn_exposable(t: &TurnRow) -> bool {
+    use altevra_core::envelope::{Envelope, Provenance, ProvenanceOrigin};
+    use altevra_core::safety::{ExposureGate, ExposureRequest};
+    use altevra_core::security::Sensitivity;
+    use altevra_core::status::RedactionStatus;
+
+    let mut env = Envelope::new(
+        t.id.to_string(),
+        "turn",
+        t.created_at,
+        Provenance::new(ProvenanceOrigin::Imported),
+    );
+    // unknown sensitivity → Other → ranks max (fail-closed).
+    env.sensitivity = t.sensitivity.parse::<Sensitivity>().unwrap();
+    env.domain = altevra_core::domain::Domain::Business;
+    let redaction = t
+        .redaction_status
+        .parse::<RedactionStatus>()
+        .unwrap_or(RedactionStatus::Unscanned);
+    ExposureGate::decide(&env, &redaction, &ExposureRequest::default_work()).is_allowed()
+}
 
 fn db_path_from_args(args: &Value) -> PathBuf {
     args.get("db_path")
@@ -48,7 +77,10 @@ pub fn handle_replay_session(id: Value, args: &Value) -> McpResponse {
             .get_session(session_uuid)
             .await?
             .ok_or_else(|| anyhow::anyhow!("session not found"))?;
-        let turns = repo.list_turns(session_uuid, turn_limit).await?;
+        let all_turns = repo.list_turns(session_uuid, turn_limit).await?;
+        let total = all_turns.len();
+        let turns: Vec<_> = all_turns.into_iter().filter(turn_exposable).collect();
+        let gated = total - turns.len();
         Ok(serde_json::json!({
             "session": {
                 "id": session.id,
@@ -65,6 +97,8 @@ pub fn handle_replay_session(id: Value, args: &Value) -> McpResponse {
                 "tool_name": t.tool_name,
                 "created_at": t.created_at,
             })).collect::<Vec<_>>(),
+            // transparency: how many turns the exposure gate withheld (no detail).
+            "gated_turns": gated,
         }))
     });
     let _ = rt; // silence unused
@@ -89,7 +123,13 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
     let result: anyhow::Result<Value> = futures::executor::block_on(async {
         let pool = open_pool(&db_path).await?;
         let repo = altevra_db::SessionsRepository::new(&pool);
-        let hits = repo.search_turns(query, project, tool, limit).await?;
+        let raw_hits = repo.search_turns(query, project, tool, limit).await?;
+        // R11 #4: gate every hit — never return a turn above the work ceiling or
+        // insufficiently redacted, regardless of how well it matched the query.
+        let hits: Vec<_> = raw_hits
+            .into_iter()
+            .filter(|(t, _)| turn_exposable(t))
+            .collect();
         Ok(serde_json::json!({
             "query": query,
             "count": hits.len(),
@@ -191,6 +231,8 @@ mod tests {
             file_changes: None,
             redacted_count: 0,
             source_tool: Some("claude-code".into()),
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
             created_at: Utc::now(),
         })
         .await
@@ -256,5 +298,37 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert_eq!(result["count"].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn turn_exposable_gates_restricted_and_unscanned() {
+        let base = |sens: &str, red: &str| TurnRow {
+            id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            turn_idx: 0,
+            role: "user".into(),
+            content: "x".into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: None,
+            sensitivity: sens.into(),
+            redaction_status: red.into(),
+            created_at: Utc::now(),
+        };
+        // R11 #4: an MCP caller gets a work ceiling.
+        assert!(turn_exposable(&base("internal", "clean")));
+        assert!(turn_exposable(&base("internal", "redacted")));
+        // restricted (health/personal) content is withheld...
+        assert!(!turn_exposable(&base("restricted", "clean")));
+        // ...and so is anything not sufficiently redacted (fail-closed).
+        assert!(!turn_exposable(&base("internal", "unscanned")));
+        // unknown sensitivity ranks max → withheld.
+        assert!(!turn_exposable(&base("weird-future-value", "clean")));
     }
 }

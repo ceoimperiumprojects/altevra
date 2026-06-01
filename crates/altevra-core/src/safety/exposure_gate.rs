@@ -91,21 +91,23 @@ pub struct ExposureGate;
 
 impl ExposureGate {
     /// Decide whether an item may be exposed to a request. `redaction` is the
-    /// item's text redaction status (None = no text field / not applicable).
+    /// item's text redaction status and is MANDATORY — there is no fail-open
+    /// "not applicable" path (R11 #8: passing `None` let unscanned items leak).
+    /// A genuinely text-free structural object must pass `RedactionStatus::Clean`
+    /// explicitly; anything not `clean`/`redacted` is denied (fail-closed).
     pub fn decide(
         envelope: &Envelope,
-        redaction: Option<&RedactionStatus>,
+        redaction: &RedactionStatus,
         request: &ExposureRequest,
     ) -> ExposureDecision {
-        // 1. lifecycle (unless history requested)
-        if !request.include_history && !envelope.status.is_default_readable() {
-            // exception: Draft is readable; everything else non-default is hidden
-            if !matches!(envelope.status, ObjectStatus::Draft | ObjectStatus::Active) {
-                return ExposureDecision::Deny(DenyReason::NotCurrent);
-            }
-        }
+        // Existence-protective gates run FIRST. An item above the caller's ceiling
+        // or out of scope must deny with a reason that reveals nothing — even if it
+        // ALSO failed lifecycle. Checking lifecycle first leaked the id/type of an
+        // over-ceiling-AND-superseded item through the (benign) NotCurrent branch
+        // of the packet compiler (R11 re-verify). So ceiling + scope precede
+        // lifecycle + redaction.
 
-        // 2. sensitivity ceiling — ONLY the level is compared (R1)
+        // 1. sensitivity ceiling — ONLY the level is compared (R1)
         if !envelope
             .sensitivity
             .within_ceiling(&request.sensitivity_ceiling)
@@ -113,18 +115,24 @@ impl ExposureGate {
             return ExposureDecision::Deny(DenyReason::OverSensitivityCeiling);
         }
 
-        // 3. domain scope — every domain of the item must be allowed
+        // 2. domain scope — every domain of the item must be allowed
         for d in envelope.all_domains() {
             if !request.domain_scope.contains(&d) {
                 return ExposureDecision::Deny(DenyReason::OutOfScope);
             }
         }
 
-        // 4. redaction — text-bearing items must be scanned + exposable
-        if let Some(r) = redaction {
-            if !redaction_exposable(r) {
-                return ExposureDecision::Deny(DenyReason::RedactionInsufficient);
+        // 3. lifecycle (unless history requested)
+        if !request.include_history && !envelope.status.is_default_readable() {
+            // exception: Draft is readable; everything else non-default is hidden
+            if !matches!(envelope.status, ObjectStatus::Draft | ObjectStatus::Active) {
+                return ExposureDecision::Deny(DenyReason::NotCurrent);
             }
+        }
+
+        // 4. redaction — mandatory, fail-closed: only clean/redacted is exposable.
+        if !redaction_exposable(redaction) {
+            return ExposureDecision::Deny(DenyReason::RedactionInsufficient);
         }
 
         ExposureDecision::Allow
@@ -160,7 +168,7 @@ mod tests {
         let e = item(Domain::Business, Sensitivity::Internal);
         let d = ExposureGate::decide(
             &e,
-            Some(&RedactionStatus::Clean),
+            &RedactionStatus::Clean,
             &ExposureRequest::default_work(),
         );
         assert!(d.is_allowed());
@@ -170,7 +178,11 @@ mod tests {
     fn personal_health_excluded_from_work_packet() {
         // THE primary leak test: a restricted health object in a work request.
         let e = item(Domain::Health, Sensitivity::Restricted);
-        let d = ExposureGate::decide(&e, None, &ExposureRequest::default_work());
+        let d = ExposureGate::decide(
+            &e,
+            &RedactionStatus::Clean,
+            &ExposureRequest::default_work(),
+        );
         // denied for BOTH ceiling and scope; ceiling is checked first.
         assert_eq!(
             d,
@@ -186,7 +198,11 @@ mod tests {
     fn out_of_scope_domain_denied() {
         // internal sensitivity (within ceiling) but a domain not in scope
         let e = item(Domain::Client, Sensitivity::Internal);
-        let d = ExposureGate::decide(&e, None, &ExposureRequest::default_work());
+        let d = ExposureGate::decide(
+            &e,
+            &RedactionStatus::Clean,
+            &ExposureRequest::default_work(),
+        );
         assert_eq!(d, ExposureDecision::Deny(DenyReason::OutOfScope));
     }
 
@@ -196,11 +212,11 @@ mod tests {
         e.status = ObjectStatus::Superseded;
         let mut req = ExposureRequest::default_work();
         assert_eq!(
-            ExposureGate::decide(&e, None, &req),
+            ExposureGate::decide(&e, &RedactionStatus::Clean, &req),
             ExposureDecision::Deny(DenyReason::NotCurrent)
         );
         req.include_history = true;
-        assert!(ExposureGate::decide(&e, None, &req).is_allowed());
+        assert!(ExposureGate::decide(&e, &RedactionStatus::Clean, &req).is_allowed());
     }
 
     #[test]
@@ -208,7 +224,7 @@ mod tests {
         let e = item(Domain::Business, Sensitivity::Internal);
         let d = ExposureGate::decide(
             &e,
-            Some(&RedactionStatus::Unscanned),
+            &RedactionStatus::Unscanned,
             &ExposureRequest::default_work(),
         );
         assert_eq!(d, ExposureDecision::Deny(DenyReason::RedactionInsufficient));
@@ -219,6 +235,6 @@ mod tests {
         let e = item(Domain::Business, Sensitivity::Confidential);
         let mut req = ExposureRequest::default_work();
         req.sensitivity_ceiling = Sensitivity::Confidential;
-        assert!(ExposureGate::decide(&e, Some(&RedactionStatus::Clean), &req).is_allowed());
+        assert!(ExposureGate::decide(&e, &RedactionStatus::Clean, &req).is_allowed());
     }
 }

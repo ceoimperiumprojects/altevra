@@ -15,7 +15,7 @@ use altevra_core::domain::Domain;
 use altevra_core::envelope::{Envelope, Provenance, ProvenanceOrigin};
 use altevra_core::safety::{ExposureDecision, ExposureGate, ExposureRequest};
 use altevra_core::security::Sensitivity;
-use altevra_core::status::ObjectStatus;
+use altevra_core::status::{ObjectStatus, RedactionStatus};
 use altevra_core::template::TemplateRegistry;
 use altevra_secrets::ingest_guard;
 use chrono::Utc;
@@ -28,6 +28,8 @@ struct Candidate {
     #[allow(dead_code)] // surfaced in the packet item; not asserted in the smoke
     title: String,
     envelope: Envelope,
+    /// Redaction verdict — the gate fails closed on anything not clean/redacted.
+    redaction_status: RedactionStatus,
 }
 
 #[tokio::test]
@@ -65,7 +67,14 @@ async fn p0_vertical_smoke() {
         &dec_guarded.value,
     )
     .await;
-    upsert_index(&pool, "decision", &dec_env, "Adopt SQLite as P0 store").await;
+    upsert_index(
+        &pool,
+        "decision",
+        &dec_env,
+        "Adopt SQLite as P0 store",
+        &dec_guarded.redaction_status,
+    )
+    .await;
 
     // ---------- 2. restricted personal/health learning ----------
     let health_body = "## Learning\nLate nights hurt next-day focus.";
@@ -88,7 +97,14 @@ async fn p0_vertical_smoke() {
         &health_guarded.value,
     )
     .await;
-    upsert_index(&pool, "learning", &health_env, "Late nights hurt focus").await;
+    upsert_index(
+        &pool,
+        "learning",
+        &health_env,
+        "Late nights hurt focus",
+        &health_guarded.redaction_status,
+    )
+    .await;
 
     // ---------- 3. fake secret must be redacted, never stored raw ----------
     let raw_secret = "sk-FIXTUREfixtureFIXTUREfixture0000";
@@ -112,7 +128,14 @@ async fn p0_vertical_smoke() {
     );
     persist_learning(&pool, &sec_env, "Secret leak note", &sec_guarded.value).await;
     record_sighting(&pool, &sec_guarded).await;
-    upsert_index(&pool, "learning", &sec_env, "Secret leak note").await;
+    upsert_index(
+        &pool,
+        "learning",
+        &sec_env,
+        "Secret leak note",
+        &sec_guarded.redaction_status,
+    )
+    .await;
 
     // ---------- 4. untagged write is quarantined (not persisted) ----------
     let mut untagged = Envelope::new(
@@ -141,7 +164,7 @@ async fn p0_vertical_smoke() {
     let mut included = Vec::new();
     let mut excluded = Vec::new();
     for c in &candidates {
-        match ExposureGate::decide(&c.envelope, None, &request) {
+        match ExposureGate::decide(&c.envelope, &c.redaction_status, &request) {
             ExposureDecision::Allow => included.push(c),
             ExposureDecision::Deny(reason) => excluded.push((c, reason)),
         }
@@ -250,10 +273,16 @@ async fn persist_learning(pool: &altevra_db::DbPool, env: &Envelope, title: &str
     .expect("persist learning");
 }
 
-async fn upsert_index(pool: &altevra_db::DbPool, object_type: &str, env: &Envelope, title: &str) {
+async fn upsert_index(
+    pool: &altevra_db::DbPool,
+    object_type: &str,
+    env: &Envelope,
+    title: &str,
+    redaction: &RedactionStatus,
+) {
     sqlx::query(
-        "INSERT OR REPLACE INTO object_index (type, id, status, sensitivity, domain, scope, title, categories, tags, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?)",
+        "INSERT OR REPLACE INTO object_index (type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)",
     )
     .bind(object_type)
     .bind(&env.id)
@@ -263,6 +292,7 @@ async fn upsert_index(pool: &altevra_db::DbPool, object_type: &str, env: &Envelo
     .bind(env.scope.as_deref())
     .bind(title)
     .bind(serde_json::to_string(&env.categories).unwrap())
+    .bind(redaction.to_string())
     .bind(env.updated_at.to_rfc3339())
     .execute(pool)
     .await
@@ -288,7 +318,7 @@ async fn record_sighting(pool: &altevra_db::DbPool, guarded: &altevra_secrets::G
 
 async fn load_candidates(pool: &altevra_db::DbPool) -> Vec<Candidate> {
     let rows = sqlx::query(
-        "SELECT type, id, status, sensitivity, domain, scope, title, categories FROM object_index",
+        "SELECT type, id, status, sensitivity, domain, scope, title, categories, redaction_status FROM object_index",
     )
     .fetch_all(pool)
     .await
@@ -307,6 +337,7 @@ async fn load_candidates(pool: &altevra_db::DbPool) -> Vec<Candidate> {
             let status: String = r.get("status");
             let sens: String = r.get("sensitivity");
             let dom: String = r.get("domain");
+            let red: String = r.get("redaction_status");
             env.status = status.parse::<ObjectStatus>().unwrap();
             env.sensitivity = sens.parse::<Sensitivity>().unwrap();
             env.domain = dom.parse::<Domain>().unwrap();
@@ -315,6 +346,9 @@ async fn load_candidates(pool: &altevra_db::DbPool) -> Vec<Candidate> {
                 id,
                 title,
                 envelope: env,
+                redaction_status: red
+                    .parse::<RedactionStatus>()
+                    .unwrap_or(RedactionStatus::Unscanned),
             }
         })
         .collect()

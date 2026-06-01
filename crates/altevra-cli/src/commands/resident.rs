@@ -13,6 +13,22 @@ pub enum ResidentCommands {
     Modes(ResidentModesArgs),
     /// Print the system prompt for a specific mode
     Prompt(ResidentPromptArgs),
+    /// Dry-run a resident mode from the registry (P0.5; noop until keys added)
+    Run(ResidentRunArgs),
+}
+
+#[derive(Args)]
+pub struct ResidentRunArgs {
+    /// Registry mode name (e.g. memory_curator, personal_curator, insight)
+    pub mode: String,
+    /// Context packet text to feed the mode (defaults to an empty dry-run packet).
+    #[arg(long)]
+    pub input: Option<String>,
+    /// SQLite database path.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -43,7 +59,77 @@ pub async fn run(cmd: ResidentCommands) -> anyhow::Result<()> {
     match cmd {
         ResidentCommands::Modes(a) => run_modes(a).await,
         ResidentCommands::Prompt(a) => run_prompt(a).await,
+        ResidentCommands::Run(a) => run_resident(a).await,
     }
+}
+
+/// Dry-run a registry mode through the resident runtime. P0.5: every role
+/// resolves to the noop provider (no keys); the run is recorded into brain_jobs
+/// as a `resident_run`. Adding API keys flips the same path live.
+async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
+    use altevra_brain::ResidentRunner;
+    use altevra_llm::ModelRouter;
+
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let repo = altevra_db::ResidentRepository::new(&pool);
+    let mode = repo.get_mode(&args.mode).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown resident mode: '{}' (the registry seeds memory_curator, synthesis, \
+             wiki_curator, daily_briefing, insight, observer, personal_curator, skill_factory_proposer)",
+            args.mode
+        )
+    })?;
+
+    let router = ModelRouter::noop(); // P0.5: no keys → noop; add keys to go live.
+    let runner = ResidentRunner::new(&router);
+    let packet_text = args
+        .input
+        .clone()
+        .unwrap_or_else(|| "(empty context packet — dry run)".to_string());
+    let report = runner.run_dry(&mode, &packet_text).await;
+
+    let output_json = serde_json::to_string(&report.output)?;
+    let run_id = repo
+        .record_run(
+            &report.mode,
+            &report.model_role,
+            &report.provider_id,
+            report.status,
+            report.dry_run,
+            &output_json,
+            report.proposals_emitted(),
+        )
+        .await?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "run_id": run_id,
+                "mode": report.mode,
+                "status": report.status.as_str(),
+                "model_role": report.model_role,
+                "provider": report.provider_id,
+                "proposals_emitted": report.proposals_emitted(),
+                "dry_run": report.dry_run,
+            }))?
+        );
+    } else {
+        println!(
+            "resident run {} [{}]: {} via {} — {} proposal(s){}",
+            &run_id.to_string()[..8],
+            report.mode,
+            report.status.as_str(),
+            report.provider_id,
+            report.proposals_emitted(),
+            if report.dry_run { " (dry-run)" } else { "" }
+        );
+        if report.provider_id == "noop" {
+            println!("  (noop provider — add API keys to enable a real model)");
+        }
+    }
+    Ok(())
 }
 
 async fn run_modes(args: ResidentModesArgs) -> anyhow::Result<()> {

@@ -1,0 +1,937 @@
+[
+  {
+    "phase": "P0.3 — Control plane (CLI/MCP verbs for new objects)",
+    "summary": "P0.3 is almost entirely UN-built. The control-plane verbs T3.1 calls for (sot, redact check, review, forget, audit, capabilities show|verify, adapter, grant, component) do NOT exist: main.rs (crates/altevra-cli/src/main.rs lines 24-127, 140-169) wires 27 commands and none of them is a control-plane verb; commands/mod.rs (lines 1-29) has no module for any of them. The building blocks DO exist and are solid: ExposureGate/ExposureRequest (crates/altevra-core/src/safety/exposure_gate.rs, with default_work() and full deny-reason logic), presence::require_human_presence (crates/altevra-core/src/presence.rs, TTY + ALTEVRA_UNLOCK, HP-1/HP-2 documented and unit-tested), and the backing tables (021_safety.sql: audit_log, exposure_decisions, secret_sightings; 023_capability.sql: adapter_dossiers, capability_records, capability_grants, skill_proposals; review_items via 006 + 019 envelope upgrade with decision/decided_by/decided_at/applied_at columns). The GAP between schema and verbs: repositories/mod.rs (lines 1-23) exposes NO repo for audit_log, exposure_decisions, secret_sightings, adapter_dossiers, capability_grants; capability.rs only covers capability_records + skill_proposals (read-only get/upsert/propose, no list); ReviewItemRow's create_review_item (tasks.rs:208) is a legacy 8-column insert that ignores the 019 envelope/decision columns and has NO list/get/approve/reject methods — so T1.17's 'approval path gated by require_human_presence' is also NOT wired. T3.2: doctor.rs (run_checks lines 103-114) has 8 connector-oriented checks; NONE of the 6 P0.3 checks (unscanned rows, orphan embeddings, drift backlog, secrets-dir 0600 perms, audit-chain, mirror_to_markdown violations) exist, and doctor.rs has no DB pool wiring at all. T3.3: server.rs read tools (get_context_packet/search_memory/get_source_of_truth/get_capabilities, tools_memory.rs + tools_capabilities.rs) do NOT enforce any ceiling/exposure_gate — zero references to ExposureGate/ExposureRequest/ceiling in the entire MCP crate; request_forget and propose_improvement tools do NOT exist (not in list_tools 70-484 nor dispatch 546-617). HP-1 currently holds by ABSENCE (grep for approve/apply/grant/forget/revoke in altevra-mcp/src returns nothing) but there is NO regression test locking it. T3.4: no MCP integration test dir exists (crates/altevra-mcp/tests/ absent); the only integration test is crates/altevra-cli/tests/p0_vertical_smoke.rs (T1.18). Net: T3.1, T3.2, T3.3, T3.4 are all MISSING; the foundation (gate + presence + tables) is DONE, which de-risks the work but every verb, every doctor check, every MCP gate-enforcement and the HP-1 test still need building.",
+    "already_done": [
+      "ExposureGate + ExposureRequest fully implemented with monotone-intersection logic, coarse non-leaking DenyReason codes, and ExposureRequest::default_work() (Internal ceiling / business+project+public scope / Clean redaction / current-only) — crates/altevra-core/src/safety/exposure_gate.rs lines 90-132; re-exported via safety/mod.rs. This is the gate T3.1/T3.3 must route through (R1-INV).",
+      "presence::require_human_presence() implemented (TTY via std::io::IsTerminal + ALTEVRA_UNLOCK one-shot token), with presence_from() testable core and unit tests for tty/token/agent-refused cases — crates/altevra-core/src/presence.rs lines 61-129. The module doc (lines 11-15) explicitly states HP-1 is enforced by the MCP server NOT exposing approve/apply verbs. This is the HP gate T3.1 review-approve/reject, forget --execute, grant approve must call.",
+      "All backing tables for the P0.3 read verbs exist: audit_log, exposure_decisions, secret_sightings (021_safety.sql lines 6-49); adapter_dossiers, capability_records, capability_grants, skill_proposals + installed_components.capability_state/last_verified_at (023_capability.sql lines 7-105); review_items base table (006_update_read_state.sql:61) upgraded with full envelope + decision/decided_by/decided_at/applied_at/required_approver/proposed_diff/rationale columns (019_object_envelope.sql lines 110-128).",
+      "MCP server HP-1 currently HOLDS by absence: grep for approve|apply|grant|forget-execute|revoke across crates/altevra-mcp/src/ returns zero hits; list_tools (server.rs 70-484) and dispatch_tool_call (546-617) expose only reads + create_review_item/report_*_gap (write-proposal-only via tools_capabilities.rs handle_create_review_item, lines 90-107). No agent approve path exists today.",
+      "CapabilityRecordsRepository enforces T7 honesty (supported requires non-empty evidence_ref, capability.rs lines 37-42) and SkillProposalsRepository enforces T12 dedup — these back a future `capabilities show|verify` verb partially (records readable via get(actor,key), but no list-all accessor yet).",
+      "altevra-cli already depends on altevra-core, altevra-db, altevra-secrets, altevra-adapters (Cargo.toml) and altevra-mcp depends on altevra-core + altevra-db — so both surfaces CAN call ExposureGate/presence/repos without new workspace deps."
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T3.1",
+        "what": "Build the control-plane CLI verb group. New `altevra sot show`, `redact check`, `review list|show|approve|reject`, `forget --dry-run`, `audit query`, `capabilities show|verify`, `adapter list|dossier`, `grant list|show|approve|revoke`, `component list`. Each READ verb must route exposed object reads through ExposureGate::decide with an ExposureRequest derived from the caller ceiling (default_work for the human CLI). The three MUTATING verbs — `review approve`/`review reject`, `forget --execute`, `grant approve` — MUST call altevra_core::presence::require_human_presence() FIRST and refuse on Err (HP gate); they then record the decision via core AFTER the presence check (HP-2: never accept an `approved` input flag). `redact check` runs altevra_secrets::detect_secrets on stdin/file and reports SecretMatch kinds+offsets without echoing raw values. This task is blocked by missing repositories (see new_files): there are NO repo accessors for audit_log, exposure_decisions, secret_sightings, adapter_dossiers, capability_grants, and review_items has only an 8-column legacy insert (tasks.rs:208) with no list/get/approve/reject — those repo methods must be added as part of T3.1.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/main.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/mod.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/mod.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/tasks.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/sot.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/redact.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/review.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/forget.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/audit.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/capabilities.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/adapter.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/grant.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/component.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/audit.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/safety.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli --test control_plane && cargo run -p altevra-cli -- review approve fake-id < /dev/null  # last must exit non-zero with requires_human_presence",
+        "invariants": [
+          "HP-1",
+          "HP-2",
+          "R1-INV (exposure_gate enforces ceiling on every read verb)",
+          "cross-surface parity (CLI review plan == MCP propose plan)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T3.2",
+        "what": "Extend `altevra doctor` (crates/altevra-cli/src/commands/doctor.rs) with 6 new checks beyond the existing 8 connector checks in run_checks (lines 103-114): (1) unscanned rows — count durable rows with redaction_status='unscanned' (fail-closed expectation), (2) orphan embeddings — embedder_queue / memory_chunk_vectors_v2 rows with no live source object, (3) drift backlog — installed_components with capability_state in ('drifted','outdated','broken'), (4) secrets-dir perms — assert the encrypted secrets file / .altevra/secrets dir is mode 0600 (use std::os::unix::fs::PermissionsExt), (5) audit-chain — audit_log present and (P0) contiguous/append-only sanity, (6) mirror_to_markdown violations (§2.16) — generated_mirror files that diverge from their authoritative DB object. This requires giving doctor a DB pool (currently doctor.rs does pure filesystem checks with no sqlx pool); add an optional --db arg and an async check path.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/doctor.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli doctor:: && cargo run -p altevra-cli -- doctor --json | grep -E 'unscanned|orphan_embeddings|drift_backlog|secrets_perms|audit_chain|mirror_to_markdown'",
+        "invariants": [
+          "R12-INV (orphan-embedding check must not treat vectors as a retrieval path, only as orphan cleanup)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T3.3",
+        "what": "Harden the MCP read tools and add two write-proposal tools. (a) Wire ExposureGate enforcement into the four read handlers — get_context_packet, search_memory, get_source_of_truth (crates/altevra-mcp/src/tools_memory.rs handlers at lines 7, 40, 72, 91) and get_capabilities (tools_capabilities.rs:36): each must build an ExposureRequest with the MCP CALLER's ceiling (MCP caller ceiling must be strictly below the human CLI — agents never get restricted/secret) and filter results through ExposureGate::decide before returning, emitting an exposure_decision audit row. Today these handlers do raw scan_vault with NO ceiling/gate (zero ExposureGate references in the whole crate). (b) Add `request_forget` (writes a forget-request review_item only — never executes) and `propose_improvement` (writes a review_item / proposal row only) to list_tools (server.rs 70-484) and dispatch_tool_call (546-617). (c) Explicitly KEEP HP-1: no approve/apply/grant/forget-execute tool may be added — request_forget creates a review_item, it does not consume the forget pipeline.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-mcp/src/server.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-mcp/src/tools_memory.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-mcp/src/tools_capabilities.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-mcp ceiling_enforced && cargo test -p altevra-mcp request_forget_writes_review_item_only",
+        "invariants": [
+          "R1-INV (caller ceiling enforced on every read tool)",
+          "HP-1 (no approve/apply/grant/forget-execute MCP tool; request_forget writes a review_item only)",
+          "HP-2 (no 'approved' input field)",
+          "R5-INV (gate writes exposure_decision audit, never auto-purged)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T3.4",
+        "what": "Add the control-plane regression tests. (1) MCP caller ceiling enforcement: a restricted/health object must be EXCLUDED from get_context_packet/search_memory results for an agent caller, with a non-leaking reason (mirrors exposure_gate's personal_health_excluded test but at the MCP boundary). (2) HP-1 lock: an assertion that list_tools() contains NO tool name matching approve|apply|grant|forget_execute|revoke|set_policy — a compile/runtime guard so a future tool can't silently break the boundary. (3) Cross-surface parity: the set of objects a CLI `sot show`/`review list` would expose under a given ceiling equals what the MCP read path exposes under the same ceiling (CLI plan == MCP plan). No altevra-mcp/tests/ dir exists yet; create it.",
+        "files_to_edit": [],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-mcp/tests/hp1_and_ceiling.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/tests/control_plane.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/tests/cross_surface_parity.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-mcp --test hp1_and_ceiling && cargo test -p altevra-cli --test control_plane --test cross_surface_parity",
+        "invariants": [
+          "HP-1",
+          "R1-INV",
+          "cross-surface parity"
+        ],
+        "complexity": "M"
+      }
+    ],
+    "risks": [
+      "No repository layer exists for audit_log, exposure_decisions, secret_sightings, adapter_dossiers, or capability_grants (repositories/mod.rs lines 1-23 list none) — T3.1 read verbs (audit query, adapter list|dossier, grant list, sot show) cannot be built until these accessors are written. Treat the new repo files as part of T3.1, not a separate phase.",
+      "review_items has the right envelope columns (019: decision/decided_by/decided_at/applied_at/required_approver) but create_review_item (tasks.rs:208) is a legacy 8-column INSERT that never populates them, and there are NO list/get/approve/reject methods. T1.17 ('approval path gated by require_human_presence') is therefore NOT actually wired despite the table being ready — T3.1 review verbs must add the repo methods AND the presence gate together. Be skeptical that T1.17 is done.",
+      "MCP read tools currently bypass the gate entirely (raw scan_vault in tools_memory.rs) — this is a LIVE R1-INV / personal-data-leak risk the moment any sensitive object lands in the vault. T3.3 is the security-critical task; prioritize it. The exposure_gate unit test personal_health_excluded passes in core, but nothing calls it from the MCP surface yet.",
+      "HP-1 holds only by absence today with no regression test. A future contributor could add an approve tool and nothing would fail. T3.4's HP-1 lock test must be added or the invariant is unprotected.",
+      "Defining the MCP caller ceiling is a design decision not yet encoded anywhere: there is no per-caller ceiling field on McpRequest/McpServer (server.rs 4-10, 486-502). T3.3 needs a source of truth for 'agent ceiling' (likely Internal max, never Restricted/Secret) — confirm with the contract before implementing so cross-surface parity (T3.4) is well-defined.",
+      "secrets-dir 0600 perm check (T3.2) is Unix-only (PermissionsExt); doctor.rs is currently platform-neutral. Gate behind cfg(unix) to avoid breaking non-Unix builds.",
+      "P0.3 task header in BUILD_TASKS.md line 21 promises '23 CLI cmds, 36 MCP tools' — current count is 27 CLI top-level commands (main.rs) and ~36 MCP tools already listed; the NEW additions are the control-plane verbs and request_forget/propose_improvement. Don't double-count existing commands as done P0.3 work."
+    ],
+    "recommended_migration_numbers": []
+  },
+  {
+    "phase": "P0.4 retrieval hardening (tag/FTS5/graph, NO vectors R12)",
+    "summary": "The deterministic retrieval CORE exists in isolation but is NOT wired together, and the FTS5 substrate that R12 makes load-bearing does not exist yet. Confirmed via grep: zero FTS5/`VIRTUAL TABLE ... USING fts5` anywhere in migrations 001-025 (007_vectors.sql only mentions the optional vec0 extension). The `PacketCompiler` (altevra-core/src/packet/mod.rs) implements Layer-A gates + Layer-B `0.7*tag_match + 0.3*recency` with hardcoded weights and NO bm25/graph signal, and is exercised only in unit tests + the p0_vertical_smoke test — it is never called from the live CLI `context` command or MCP `get_context_packet` (both still use the legacy `scan_vault`+in-memory `SearchIndex` BM25 path, altevra-memory/src/search.rs). `object_index` table (020) carries title+categories+tags but NO `body` column, and `ObjectIndexRepository` exists but has no live caller. `ingest_guard`/`guard_text` (altevra-secrets/src/ingest_guard.rs) are DONE and correct (redaction + TAG-1/TEMPLATE-1 quarantine), but altevra-memory ingestion (ingestion.rs/worker.rs) does NOT route through them — chunks are produced raw and the worker feeds embeddings, not FTS5. `altevra doctor` (altevra-cli/src/commands/doctor.rs) is purely filesystem-based (8 checks, no DB connection) — no tag-coverage or template-conformance audit. NO golden eval harness or leak suites exist (no G01-G15 tests anywhere; only contract_validation.rs + p0_vertical_smoke.rs). NO retrieval-profile config exists. Net: T1.14b, T4.1, T4.2, T4.3, T4.5 and the golden/leak harness are all MISSING; the packet compiler needs the bm25+graph signal added and to be wired into CLI+MCP for INV-14 parity.",
+    "already_done": [
+      "ingest_guard / guard_text DONE and correct: altevra-secrets/src/ingest_guard.rs:148 (guard_text) + :211 (ingest_guard) — secret redaction (raw never survives, only sha256[:12] fingerprint sighting), email PII redaction, default-up sensitivity, and TAG-1/TEMPLATE-1 quarantine via TemplateGate. Tests at :282-349 prove secret-never-in-value, untagged-quarantine, PII-flag, PEM-redaction. This is the I2 source-of-truth the T4.1 chunk path must call.",
+      "object_index table exists: migrations/020_relations_objects.sql:26-42 (type,id,status,sensitivity,domain,scope,title,categories,tags,updated_at + indexes). NOTE it has NO `body` column — FTS5 over title+body+tags (T1.14b) needs body added or sourced from owning tables.",
+      "relations graph edge table exists: migrations/020_relations_objects.sql:5-23 (from/rel/to + weight + indexes idx_relations_from/to/rel) — the graph signal substrate for the compiler is present but unused by ranking.",
+      "ObjectIndexRepository exists: altevra-db/src/repositories/objects.rs:156-222 (upsert + candidates(domain)) — but ONLY called from its own unit test (objects.rs:255); no live caller in CLI/MCP.",
+      "PacketCompiler two-layer gate+rank exists: altevra-core/src/packet/mod.rs:90-206 — Layer-A ExposureGate (hard, never overridden), Layer-B relevance, deterministic sort (score desc, id asc), whole-item token packing with budget_exhausted exclusion records. Tests at :252-340 cover gate-exclusion, tag_match ranking, determinism, budget truncation.",
+      "in-memory BM25 exists (legacy, NOT FTS5): altevra-memory/src/search.rs SearchIndex — BM25 k1=1.5 b=0.75 with stopwords; used by MCP search_memory (tools_memory.rs:7) and `altevra context`. This is the thing R12/T1.14b replaces with SQLite FTS5.",
+      "turn search exists (LIKE-based, NOT FTS5): altevra-db/src/repositories/sessions.rs:463 search_turns uses SQL `LOWER(content) LIKE ?` per token + in-process scoring; wired to CLI turn_search.rs and MCP tools_sessions.rs:78. Functional but not the FTS5 substrate R12 wants.",
+      "p0_vertical_smoke leak test exists: altevra-cli/tests/p0_vertical_smoke.rs — capture→ingest_guard→envelope→object_index→ExposureGate→exposure_decision path asserts business-included / restricted-excluded / secret-redacted / untagged-quarantined. This is the SEED pattern the golden G01-G15 harness should extend (it is NOT the golden harness itself).",
+      "exposure_decisions audit table exists: migrations/021_safety.sql:36-49 (append-only why-exposed record) — but NO repository writer exists anywhere (grep for exposure_decisions writer returned nothing); the compiler does not emit it yet."
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T1.14b",
+        "what": "Create the FTS5 retrieval substrate: SQLite FTS5 virtual table over title+body+tags as an external-content table mirroring object_index (R12 primary substrate, NO vectors). FTS5 is a built-in SQLite module (NOT the optional `vec` extension), so `CREATE VIRTUAL TABLE ... USING fts5` CAN live in a migration — the 007_vectors.sql caveat only applies to the vec0 extension. Add a `body` source: either ADD COLUMN body to object_index or build the FTS5 table content from the owning tables (decisions/learnings/wiki_pages/memory_documents/insight_cards). Add triggers (or repo-side maintenance in ObjectIndexRepository::upsert) to keep the FTS5 table in sync. Add a Bm25 query method on ObjectIndexRepository returning (type,id,bm25_score) so the compiler can fuse it.",
+        "files_to_edit": [
+          "crates/altevra-db/src/repositories/objects.rs",
+          "crates/altevra-db/src/repositories/mod.rs"
+        ],
+        "new_files": [
+          "crates/altevra-db/migrations/026_fts5_retrieval.sql"
+        ],
+        "migration": "026_fts5_retrieval.sql",
+        "acceptance_test": "cargo test -p altevra-db fts5",
+        "invariants": [
+          "R12-INV (FTS5 lexical + tag/structured + graph only, no vector path)",
+          "TAG-1 (only tagged objects enter object_index → FTS5)",
+          "determinism byte-equal (bm25 ordering must be stable; tie-break by id)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T1.15-ext",
+        "what": "Extend PacketCompiler Layer-B relevance to the full R12 fusion `bm25 + tag_match + graph + recency` (currently only 0.7*tag_match + 0.3*recency with hardcoded weights at packet/mod.rs:196, NO bm25, NO graph). Add a bm25 score input to PacketCandidate (from T1.14b query) and a graph signal (count/weight of relations edges from the candidate to query-anchor objects via the relations table). Keep gates strictly before ranking (§3.3) and keep the sort total-order deterministic.",
+        "files_to_edit": [
+          "crates/altevra-core/src/packet/mod.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core packet",
+        "invariants": [
+          "R12-INV (no s_emb term)",
+          "determinism byte-equal (fused score + id tie-break)",
+          "gates-before-weights (ExposureGate decides inclusion, relevance only ranks survivors)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T4.1",
+        "what": "Route altevra-memory ingestion through ingest_guard so only redacted text enters chunks, and feed those chunks to FTS5 (T1.14b), NOT embeddings. Today ingestion.rs (ingest_file/ingest_text) produces raw chunks with no secret/PII scrub, and worker.rs feeds the embedder_queue → vectors. Add a guarded ingest path: chunk → guard_text (altevra-secrets) → persist redacted chunk → FTS5 index. The embedder worker path stays but is P1-optional (R12) and must not be the retrieval substrate.",
+        "files_to_edit": [
+          "crates/altevra-memory/src/ingestion.rs",
+          "crates/altevra-memory/src/lib.rs",
+          "crates/altevra-memory/Cargo.toml"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-memory ingest_guard",
+        "invariants": [
+          "I2 (redacted text only into chunks)",
+          "R12-INV (chunks feed FTS5 not embeddings)",
+          "secret-leak=0 (raw secret never in a persisted chunk)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T4.2",
+        "what": "Add versioned retrieval profiles: a config mapping intent → weights over {bm25, tag_match, graph, recency} (§3.3). Currently weights are hardcoded in packet/mod.rs:196 (0.7/0.3). Define a RetrievalProfile struct (versioned: profile_version + named profiles like task_work, person_lookup, history_intent), load from a versioned config (TOML/YAML in vault config or an embedded default), and pass the resolved weights into PacketCompiler::compile via PacketRequest.",
+        "files_to_edit": [
+          "crates/altevra-core/src/packet/mod.rs",
+          "crates/altevra-core/src/lib.rs"
+        ],
+        "new_files": [
+          "crates/altevra-core/src/packet/profiles.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core profiles",
+        "invariants": [
+          "determinism byte-equal (same profile_version + candidates → byte-equal packet)",
+          "R12-INV (weights only over bm25/tag/graph/recency, no embedding weight)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T4.3",
+        "what": "Multilingual (SR+EN) via FTS5 analyzer + mandatory tags, NOT embeddings (R12). Configure the FTS5 tokenizer in 026 (e.g. `tokenize = 'unicode61 remove_diacritics 2'`) so Serbian latinica/diacritics + English tokenize sensibly, and rely on mandatory bilingual tags (TAG-1) as the cross-language bridge. Add a golden case proving an SR query hits an EN-tagged object and vice-versa.",
+        "files_to_edit": [
+          "crates/altevra-db/migrations/026_fts5_retrieval.sql"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-db multilingual",
+        "invariants": [
+          "R12-INV (multilingual via analyzer+tags, never embeddings)",
+          "TAG-1 (tags carry the SR+EN bridge)"
+        ],
+        "complexity": "S"
+      },
+      {
+        "task_id": "T4.5",
+        "what": "Add `altevra doctor` tag-coverage + template-conformance audit (TAG-1/TEMPLATE-1 health). Current doctor.rs run_checks (line 103) is filesystem-only with no DB connection. Add a DB-backed check that opens the pool and reports: % of durable objects with a resolved domain + >=1 governed category (TAG-1), count of quarantined/non-conforming objects (TEMPLATE-1), and FTS5 index freshness (rows in object_index vs FTS5 table). Surface as new DoctorCheck entries with Warn/Fail thresholds.",
+        "files_to_edit": [
+          "crates/altevra-cli/src/commands/doctor.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli doctor",
+        "invariants": [
+          "TAG-1 (audit detects untagged durable objects)",
+          "TEMPLATE-1 (audit detects non-conforming objects)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T-INV14-wire",
+        "what": "Wire PacketCompiler + ObjectIndexRepository + FTS5 into BOTH the live CLI `context` command and MCP `get_context_packet` so they produce the SAME ContextPacket (INV-14 CLI/MCP parity). Today CLI context.rs builds a legacy RetrievalContext via scan_vault, and MCP tools_memory.rs:72 get_context_packet just returns vault sections — neither calls PacketCompiler, ObjectIndexRepository, or the ExposureGate. Also add an exposure_decisions repository writer (table exists at 021_safety.sql:36 but has zero writers) and emit the audit on every compile (R5).",
+        "files_to_edit": [
+          "crates/altevra-cli/src/commands/context.rs",
+          "crates/altevra-mcp/src/tools_memory.rs",
+          "crates/altevra-db/src/repositories/objects.rs",
+          "crates/altevra-db/src/repositories/mod.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli context_packet_parity",
+        "invariants": [
+          "INV-14 (CLI/MCP packet parity — byte-equal packet for same request)",
+          "R5 (every compile emits an exposure_decision audit)",
+          "R12-INV (both surfaces use FTS5+tag+graph+recency, no vectors)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T-golden",
+        "what": "Build the golden eval + leak-suite harness covering G01,G02,G03,G04,G05,G07,G08,G09,G10,G14,G15 (the non-embedding set per RECONCILIATION:127 and R12:225). Each case = synthetic fixtures → ingest_guard → object_index/FTS5 → PacketCompiler → assert inclusion/exclusion/ordering. Leak suites G03 (personal-leak via sensitivity gate) and G09 (fake-secret via redaction) MUST assert == 0 leaks. p0_vertical_smoke.rs is the seed pattern but is a single smoke test, not the G01-G15 harness. Exclude the embedding cases G06/G11/G12/G13-via-embeddings (R12 dropped them).",
+        "files_to_edit": [],
+        "new_files": [
+          "crates/altevra-cli/tests/golden_eval.rs",
+          "fixtures/golden/"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli --test golden_eval",
+        "invariants": [
+          "R12-INV (only non-embedding cases run)",
+          "leak=0 for G03 (sensitivity) and G09 (secret)",
+          "determinism byte-equal (G08)",
+          "TAG-1/TEMPLATE-1 (untagged/non-conforming never surface)"
+        ],
+        "complexity": "L"
+      }
+    ],
+    "risks": [
+      "Migration-number collision: BUILD_TASKS.md:128/139/164 plans 026=resident(P0.5), 027=proposals(P0.6), 028=domains(P0.8), but live numbering already drifted (024_domain_policy + 025_turn_source_tool exist, vs the doc's 024_decision_status/025_capability). Next free number is 026. If this phase claims 026_fts5_retrieval.sql, P0.5/P0.6/P0.8 must shift to 027/028/029 — coordinate so two phases don't both write 026.",
+      "object_index has NO body column (020:26-42) — FTS5 over title+body+tags needs a body source. Two options: ADD COLUMN body to object_index (simplest, but bloats the gate-point index) OR build the FTS5 content table from the 6+ owning tables (decisions/learnings/wiki_pages/memory_documents/insight_cards/...) — pick one before writing 026 or the substrate is wrong.",
+      "FTS5 availability: sqlx 0.7 uses the system/bundled libsqlite3; FTS5 is a standard compile-time SQLite module but is NOT guaranteed enabled on every libsqlite3. Verify `PRAGMA compile_options` includes ENABLE_FTS5 in the test pool (in-memory) before relying on it — if absent, the migration fails at run_migrations and every test breaks. Add a doctor check for FTS5 presence.",
+      "INV-14 parity is currently FALSE: CLI context (legacy RetrievalContext/scan_vault) and MCP get_context_packet (vault sections only) produce totally different shapes and neither uses PacketCompiler. Wiring both to the same compiler is the single largest task (L) and is a prerequisite for the golden harness to be meaningful across surfaces.",
+      "exposure_decisions has zero writers — R5 audit is unenforced. The compiler emits a ContextPacket but never persists the why-exposed record. Golden/leak suites that assert audit content will fail until the writer is added.",
+      "Determinism risk in bm25 fusion: SQLite FTS5 bm25() scores are floats; fusing them into the packet score can introduce ordering instability across SQLite versions. Must normalize + always tie-break by object_id (already done in packet/mod.rs:125) and pin profile_version so packets stay byte-equal (R12 determinism claim).",
+      "T4.1 scope creep: routing ingestion through ingest_guard requires altevra-memory to depend on altevra-secrets (currently it does not — secrets depends on core, memory is separate). Adding that dep risks a cycle if secrets ever needs memory; verify the dependency direction (memory→secrets→core is acyclic and fine)."
+    ],
+    "recommended_migration_numbers": [
+      "026_fts5_retrieval.sql"
+    ]
+  },
+  {
+    "phase": "P0.5 — Resident runtime (dry-run, noop provider)",
+    "summary": "P0.5 is at \"seam ready\" — only the LLM routing seam (T5.1, the hard part) is built; the entire resident execution layer is missing. provider.rs DONE: ChatProvider + ModelRole(6 roles) + NoopProvider + ModelRouter with SI-7 enforced (local_private rejects non-local provider, verified by test local_private_rejects_non_local_provider). The shared §3 packet compiler (T1.15, altevra-core/src/packet/mod.rs) and ExposureGate (sensitivity_ceiling, 6-level Sensitivity ladder with within_ceiling) already exist, so the packet INPUT for the contract is ready. What is entirely absent: migration 026 (no resident_run columns on brain_jobs, no resident_mode registry table, no resident_budget table — migrations stop at 025), the resident_mode registry generalizing JobKind (still a hardcoded 10-variant enum in altevra-brain/src/jobs.rs), the resident runtime contract (input=packet, schema-validated output, resident_run row per run, SI-6 self-write exclusion, SI-7 role↔ceiling), and all P0.5 tests. Two structural blockers: (1) altevra-brain does NOT depend on altevra-llm, so role routing cannot be wired without adding the dep; (2) there is NO durable output sink — no proposal/insight_card table or repo exists yet (RECONCILIATION R9 schedules proposal for P0.6/028, insight_card for P0.8/029), so a P0.5 dry-run literally has nowhere schema-valid to write outputs except resident_run.outputs JSON. The CLI `altevra resident` only inspects prompt files (Modes/Prompt subcommands); the spec'd `altevra resident run <mode> --dry-run|--once` verb does not exist. T5.1's EmbeddingProvider half is unbuilt in altevra-llm (only a lib.rs doc comment claims it; the real AsyncEmbeddingProvider lives in altevra-memory) — but R12 defers embeddings to P1, so for P0.5 dry-run a noop embedding stub is sufficient.",
+    "already_done": [
+      "T5.1 (ChatProvider half) DONE: altevra-llm/src/provider.rs:46-54 ChatProvider trait (id/is_local/complete); lines 16-41 ModelRole enum with all 6 roles (cheap_worker/strong_reasoner/local_private/embedding/reranker/none); lines 59-78 NoopProvider (deterministic, is_local=true, content-free stub); lines 83-122 ModelRouter::noop()/with_provider()/resolve() with SI-7 enforced at lines 107-115 (local_private + non-local provider => falls back to local noop). Tests at 142-171 prove SI-7 (local_private_rejects_non_local_provider) and noop-everything routing.",
+      "Packet compiler INPUT for the contract is ready: altevra-core/src/packet/mod.rs PacketCompiler::compile() (deterministic, now passed in), PacketRequest{intent,project,query_terms,exposure,token_budget}, ContextPacket{items,excluded,...}, WhyIncluded/ExclusionRecord (T1.16). Calls ExposureGate before ranking (Layer A gates / Layer B relevance separation).",
+      "ExposureGate + 6-level Sensitivity ladder ready for role↔ceiling math: altevra-core/src/safety/exposure_gate.rs ExposureRequest{sensitivity_ceiling, domain_scope, min_redaction, include_history} + default_work(); altevra-core/src/security.rs Sensitivity enum (Public<Shareable<Internal<Confidential<Secret<Restricted via level()) + within_ceiling().",
+      "Scheduler tick()/dispatch() pattern that T5.3 must reuse is solid: altevra-brain/src/scheduler.rs:66-167 tick() inserts a brain_jobs row 'running' then UPDATEs to 'done'/'failed' with duration+summary/error — this is the exact resident_run lifecycle to extend. dispatch() in jobs.rs:726-743 matches JobKind to job fns.",
+      "context_packets + context_packet_sources tables exist (migration 022) and exposure_decisions table exists (migration 021) — the input_packet_ref + audit targets for resident_run already have homes.",
+      "object_index + LearningsRepository exist (altevra-db/src/repositories/objects.rs) — the envelope-aware repo pattern resident output repos should follow; a learning is the one personal-sensitive durable type already landed (R9 P0.1)."
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T5.2",
+        "what": "Create migration 026_resident.sql: (a) ALTER brain_jobs to add the §4.2.2 resident_run columns (mode_slug — alias of existing `kind`, or add nullable mode_slug; trigger_ref, model_role, model_id, input_packet_ref, inputs_digest, outputs JSON, tokens_in/tokens_out, cost_estimate, decision, schema_valid, plus envelope columns to match R8 conformance) — one history table per R10; (b) CREATE TABLE resident_mode registry (slug PK, trigger JSON, model_role, input_profile, input_intent, output_types JSON, write_authority, prompt_ref, budget_ref, enabled, personal_data_allowed, min_evidence, self_authored_excluded + envelope cols); (c) CREATE TABLE resident_budget (id PK, scope, max_runs_per_window, window_secs, min_run_interval_secs, max_tokens_per_day, max_proposals_per_run, max_open_proposals, max_auto_applies_per_day, rejection_cooldown_days + envelope cols). Seed resident_mode rows for the existing 10 JobKinds so they keep working. Additive ALTER ADD COLUMN only (the pattern all 25 migrations use); existing brain_jobs rows backfill decision='completed' where status='done', schema_valid=1.",
+        "files_to_edit": [],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/migrations/026_resident.sql"
+        ],
+        "migration": "026_resident.sql",
+        "acceptance_test": "cargo test -p altevra-db",
+        "invariants": [
+          "R10 (extend brain_jobs, one history table)",
+          "R8 (additive non-breaking ALTER ADD COLUMN, envelope conformance)",
+          "TAG-1 (resident_mode/resident_budget carry domain+category)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T5.3",
+        "what": "Generalize JobKind into a resident_mode registry while keeping the existing 10 jobs working. Add altevra-llm as a dependency of altevra-brain (currently ABSENT — hard blocker for role routing). Introduce a ResidentMode struct (loaded from resident_mode table, or a static registry that maps each of the 10 JobKind variants to a mode with its model_role + personal_data_allowed + write_authority) and a ResidentRun record type mirroring brain_jobs+026 columns. Resident dispatch reuses the scheduler tick()/dispatch() pattern: each mode resolves its model_role through a ModelRouter (noop in P0), compiles a packet, runs, and records a resident_run row. Per MOD-2, each mode stays single-purpose; do NOT collapse into a mega-agent. Keep the 10 existing job fns callable (the registry wraps them).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/Cargo.toml",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/lib.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/scheduler.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/resident.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-brain",
+        "invariants": [
+          "R10 (one history table, reuse scheduler)",
+          "R14/MOD-2 (small single-purpose modes, no monolith)",
+          "SI-7 (model_role routing per mode)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T5.4",
+        "what": "Implement the §4.4 resident runtime contract: (1) dry-run/proposal-first — a mode may only emit insight_card/wiki_page candidates + proposal rows, never write a canonical fact directly (SI-1); (2) input is a context packet compiled via the shared T1.15 compiler with the mode's OWN sensitivity ceiling derived from its model_role (SI-7: personal_data_allowed mode ⇒ model_role=local_private ⇒ ceiling may include restricted; a cheap_worker mode is capped at internal — a pure role→ceiling fn in core); (3) output is schema-validated against §4.2 output_types, else resident_run.decision=failed, schema_valid=false, ZERO partial writes (SI-14 — validate-then-write); (4) every run writes a resident_run row with inputs_digest (sha256 of signal-set+packet), model_role, outputs, tokens, decision, redacted summary; (5) self-write exclusion (SI-6) — packet/signal input excludes objects whose provenance.captured_by is any resident mode. NOTE BLOCKER: there is NO proposal/insight_card durable table or repo yet (R9 puts proposal at P0.6/027, insight_card at P0.8/029); for P0.5 dry-run, outputs must be recorded in resident_run.outputs JSON only, OR P0.5 must own a minimal proposal sink — coordinate with P0.6 to avoid double-owning migration 027. Add the `altevra resident run <mode> --dry-run|--once [--explain] [--json]` CLI verb (current resident.rs only inspects prompt files).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/resident.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/resident.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/resident/mod.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/resident/contract.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/resident.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core resident && cargo test -p altevra-brain resident",
+        "invariants": [
+          "SI-6 (self-write exclusion via provenance.captured_by)",
+          "SI-7 (role↔ceiling; personal_data_allowed⇒local_private)",
+          "SI-14 (schema-invalid output ⇒ failed + zero writes)",
+          "SI-1 (write_authority ≤ auto_apply_tier0; dry-run proposal-only)",
+          "HP-1 (no MCP approve/apply path)",
+          "R5-INV (resident_run input_packet_ref points at ephemeral packet; exposure_decision audit untouched)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T5.5",
+        "what": "P0.5 test suite (no network, noop provider): (a) dry-run mode produces schema-valid proposal-only output and a resident_run row, zero canonical writes; (b) schema-invalid mode output ⇒ resident_run.decision=failed, schema_valid=false, ZERO rows written anywhere (SI-14); (c) a personal_data_allowed mode is forced to model_role=local_private and its packet ceiling ≤ role ceiling, and routing resolves to the local noop provider not a cloud one (SI-7); (d) self-authored signal/object excluded from a mode's input (SI-6). Optionally the §4.17 vertical-loop spine (fixture events → signal → proposal → resident_run) gated to whatever output sink T5.4 lands. All deterministic, in-memory SQLite, noop ModelRouter.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/resident.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/resident/contract.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/tests/resident_dryrun.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-brain --test resident_dryrun && cargo test -p altevra-llm provider",
+        "invariants": [
+          "SI-14 (failed run lands nothing)",
+          "SI-7 (personal_data_allowed⇒local_private, noop is local)",
+          "SI-6 (self-authored excluded)",
+          "determinism (no Utc::now() inside compile; inputs_digest stable)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T5.1b",
+        "what": "Complete the T5.1 EmbeddingProvider half in altevra-llm. lib.rs:5 documents an EmbeddingProvider trait but NONE exists in altevra-llm — the only embedding traits are in altevra-memory (AsyncEmbeddingProvider/EmbeddingProvider, a different crate for the vault embedder worker). Add a minimal EmbeddingProvider trait + NoopEmbeddingProvider to altevra-llm so the embedding ModelRole resolves to a noop in P0 (consistent with R12: embeddings are an OPTIONAL P1 add-on, so this is a stub seam, not a real embedder). This closes the 'verify EmbeddingProvider too' check: it is currently UNVERIFIED/missing.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-llm/src/provider.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-llm/src/lib.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-llm",
+        "invariants": [
+          "R12 (embeddings optional/P1; P0 stub only, no vector path in retrieval)",
+          "SI-7 (embedding role routes through router too)"
+        ],
+        "complexity": "S"
+      }
+    ],
+    "risks": [
+      "OUTPUT SINK GAP (highest): P0.5 dry-run modes are spec'd to emit `proposal` and `insight_card` rows, but per RECONCILIATION R9 the `proposal` table lands in P0.6 (migration 027) and `insight_card` in P0.8 (029) — neither exists now. P0.5 therefore has nowhere schema-valid to persist outputs except a JSON blob in resident_run.outputs. Decision needed: either (A) P0.5 records outputs ONLY in resident_run.outputs (proposal/insight_card durable rows deferred to P0.6/P0.8 — keeps SI-14 testable since 'zero rows' = zero resident_run mutations), or (B) P0.5 co-owns a minimal proposal table — but that would steal migration 027 from P0.6. Recommend (A); coordinate explicitly with the P0.6 owner.",
+      "DEPENDENCY BLOCKER: altevra-brain/Cargo.toml does NOT list altevra-llm. Role routing (T5.3/T5.4) is impossible until this dep is added. Trivial fix but easy to miss; without it the ModelRouter cannot be reached from the scheduler.",
+      "brain_jobs.kind vs resident_mode.slug aliasing: the §4.2.2 spec says `mode_slug = brain_jobs.kind`. Extending brain_jobs in-place (R10) means the existing scheduler INSERT (scheduler.rs:114) must keep populating `kind`; if a new `mode_slug` column is added separately, both must stay in sync or status()/aggregates break. Cleanest: treat `kind` AS mode_slug, add only the new analytic columns.",
+      "SI-7 role→ceiling mapping is NOT yet a defined function. provider.rs enforces local_private≠cloud at the PROVIDER layer, but the CEILING side (cheap_worker capped at internal, local_private may reach restricted) has no implementation — T5.4 must add a pure role→Sensitivity-ceiling fn in core and prove `packet ceiling ≤ role ceiling`. Getting this backwards leaks personal data into a cheap cloud worker's packet (FM-7).",
+      "SI-6 self-write exclusion needs a provenance.captured_by field populated by resident modes; verify the Envelope/Provenance struct carries captured_by (provenance JSON shape) before relying on it for the exclusion filter — if absent, self-write exclusion can't be enforced and FM-3 (observer feedback loop) reopens.",
+      "inputs_digest determinism: resident_run.inputs_digest must be a stable sha256 of the signal-set + packet. The packet compiler is already deterministic (now passed in), but signal ordering must be canonicalized (sort by id) or the digest is non-reproducible, breaking replay and the SI-14 'same input ⇒ same decision' guarantee."
+    ],
+    "recommended_migration_numbers": [
+      "026"
+    ]
+  },
+  {
+    "phase": "P0.6 — Self-improvement loop + runaway firewall",
+    "summary": "P0.6 is entirely unimplemented in code. Verified: altevra-core/src/selfimprove/ does NOT exist; no migration for proposal/improvement_signal/prompt/prompt_eval_result (grep across crates/altevra-db/migrations finds NONE; only 023_capability.sql's narrower skill_proposals table exists); no risk-tier deriver, no runaway firewall (zero hits for runaway/firewall/circuit_break/risk_tier/cooldown/shadow_eval/kill_switch across all .rs); no prompt registry-of-record (prompts.rs is a stateless string-builder, not a versioned DB-canonical Prompt object). What IS done and reusable: ProposalStatus enum + can_transition_to() with the Tier-0 direct-apply / Approved->Applied path (status.rs:130-192, confirmed); the ChatProvider/ModelRouter/ModelRole seam with SI-7 enforced (altevra-llm/src/provider.rs, confirmed); observer detectors + EvidenceRef as a CAPTURE/CLUSTER-stage precedent (observer.rs); the relevance gate min-evidence/dedup pattern (research/relevance.rs + capability repo's dedup-by-hash propose() at repositories/capability.rs:99-137); brain scheduler dispatch() + JobKind pattern to extend for resident modes (brain/jobs.rs:726). CRITICAL CROSS-PHASE BLOCKER: P0.6 T6.2 depends on T5.4 (resident runtime contract) and the resident landing zone — but P0.5 is only ~20% done: migration 026_resident.sql, the resident_mode/resident_run/resident_budget tables, and the resident runtime are ALL ABSENT (grep NONE). Without resident_run rows there is no place for SI-14 'every run logged' nor a runtime to host the 7-stage loop. P0.5 must own 026; P0.6 owns 027; P0.8 owns 028+. The proposal table must be ONE unified table with a kind discriminator (R10); the existing skill_proposals (023) becomes a legacy/folded target, NOT the proposal super-family.",
+    "already_done": [
+      "altevra-core/src/status.rs:130-192 — ProposalStatus string_enum (8 variants: proposed,triaged,approved,applied,rejected,superseded,withdrawn,deprecated) + can_transition_to() correctly encoding Tier-0 direct Proposed->Applied AND gated Approved->Applied, plus Applied->Deprecated. Test proposal_cannot_apply_without_approval_path() present. This is the ProposalStatus the orchestrator confirmed.",
+      "altevra-llm/src/provider.rs — FULL T5.1: ChatProvider trait, ModelRole (CheapWorker/StrongReasoner/LocalPrivate/Embedding/Reranker/None), NoopProvider (offline, key-free, is_local=true), ModelRouter with SI-7 enforced (resolve() forces local_private to local fallback even if a cloud provider is registered; test local_private_rejects_non_local_provider passes). This is the firewall's 'below the LLM' executor seam.",
+      "altevra-core/src/observer.rs — pattern detectors (RecurringDrift, RepeatedHookFailure, etc.) + EvidenceRef{event_id,update_id,source,timestamp} + thresholds (DRIFT_THRESHOLD=3) provide the CAPTURE+CLUSTER precedent and an evidence-floor analog the selfimprove loop should mirror (min_evidence / SI-5). NOT the self-improvement loop itself — it detects patterns about Pavle/tools, not proposals about Altevra's own prompts.",
+      "altevra-db/src/repositories/capability.rs:99-145 — SkillProposalsRepository::propose() dedup-by-hash (existing dedup_hash -> increment occurrences, never a 2nd row). This is the exact reuse pattern for SI-4 (dedup_key merge) and the occurrences>=min_evidence floor. But it is the NARROW skill_proposals table (migration 023), NOT the unified proposal super-family R10 requires.",
+      "altevra-brain/src/jobs.rs:11-72,726-743 — JobKind enum + dispatch() match + period_secs(); the scheduler.tick()/dispatch() pattern T5.3/T6 must extend (not replace) for resident modes. brain_jobs table exists (migration 011) as the resident_run superset target per R10/FM-1.",
+      "altevra-core/src/prompts.rs — layered system-prompt BUILDER (safety>altevra_rules>tool_behavior>...>output_protocol) exists as a pure stateless function with a constant safety_layer()/altevra_rules_layer(). This is the RENDER half of T6.5 but there is NO Prompt object-of-record, no versioning, no DB row, no checksum/active flag, no constitutional_lock — so it does NOT satisfy SI-2/SI-8 and is not the prompt registry.",
+      "migrations 019-025 present and applied (019_object_envelope, 020_relations_objects, 021_safety[secret_sightings/audit_log/exposure_decisions], 022_context_packet, 023_capability[skill_proposals/capability_records/grants], 024_domain_policy, 025_turn_source_tool). Next free migration number = 026 (confirmed by ls)."
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T5.2-PREREQ (P0.5, blocks P0.6)",
+        "what": "Resident landing zone that P0.6 depends on (BUILD_TASKS T6.2 dep T5.4). migration 026_resident.sql: extend brain_jobs into a resident_run history (add §4.2.2 columns: mode_slug, input_digest, model_role, outputs_json, tokens, decision[running|done|failed|aborted_budget|skipped_disabled|completed], schema_valid, redacted_summary, started_at/ended_at) + resident_mode registry (slug, enabled, write_authority[propose_only|auto_apply_tier0], model_role, min_evidence, input_profile, input_intent, personal_data_allowed, sensitivity_ceiling) + resident_budget (scope, max_runs_per_window, window_secs, min_run_interval_secs, max_tokens_per_day, max_proposals_per_run, max_open_proposals, max_auto_applies_per_day, rejection_cooldown_days). VERIFIED ABSENT: grep for resident_run/resident_mode/resident_budget across migrations = NONE; no resident code in altevra-brain/altevra-core. P0.5 OWNS 026 — flagged here because P0.6 cannot land resident_run rows (SI-14) without it.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/migrations/026_resident.sql",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/resident.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/resident.rs"
+        ],
+        "migration": "026_resident.sql",
+        "acceptance_test": "cargo test -p altevra-db --test repository_roundtrip resident_run && cargo test -p altevra-brain",
+        "invariants": [
+          "SI-14",
+          "SI-6",
+          "SI-7"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T6.1",
+        "what": "migration 027_proposals.sql: ONE unified `proposals` table with a `kind` discriminator (R10 — kind in {skill,prompt,hook,schema_gap,retrieval_profile,category_merge,capability_gap,wiki_update,mode_change,policy_change,insight_promotion}) carrying full envelope + risk_tier(0|1|2) + status(ProposalStatus) + dedup_key(UNIQUE for SI-4 merge) + proposed_diff JSON + evidence_refs JSON + success_metric + proposer_mode + review_item_ref + applied_ref + shadow_eval_ref + constitutional_lock flag. Plus `improvement_signals` (signal_kind, subject_ref, occurrences, evidence_refs, dedup_key UNIQUE, first/last_seen_at, status open|consumed|expired), `prompts` (slug, target, layer, body, variables, checksum, version monotonic per slug, active bool with partial-unique-per-slug for SI-8, constitutional_lock bool, eval_baseline_ref, supersedes/superseded_by), `prompt_eval_results` (prompt_ref, proposal_ref, eval_set_version, pass bool, regressions JSON, scores JSON, ran_at — immutable). All envelope-conformant, no raw secrets in fixtures. The existing skill_proposals (023) becomes a legacy/folded source, NOT the super-family.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/mod.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/migrations/027_proposals.sql",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/proposals.rs"
+        ],
+        "migration": "027_proposals.sql",
+        "acceptance_test": "cargo test -p altevra-db --test repository_roundtrip proposal_kind_discriminator -- --nocapture",
+        "invariants": [
+          "R10",
+          "SI-4",
+          "SI-8",
+          "SI-3"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T6.2",
+        "what": "altevra-core/src/selfimprove/ NEW module (VERIFIED: directory does not exist). Implement the 7-stage loop capture->cluster->detect->gate->apply->monitor->retire (§4.5). Evidence-bound: no Proposal emitted with len(evidence) < mode.min_evidence (SI-5); CLUSTER produces/grows improvement_signal rows keyed by dedup_key; CAPTURE excludes self-authored objects (provenance.captured_by == a resident mode) for SI-6. Stage outputs are schema-validated against the §4.2 Proposal/ImprovementSignal shapes (SI-14: schema-invalid => zero writes). Must read input via a context packet at the mode's own ceiling (reuse altevra-core/packet), never a vault dump. Should reuse observer.rs EvidenceRef and the capability repo dedup precedent.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/mod.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/loop_stages.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/signal.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core selfimprove::",
+        "invariants": [
+          "SI-5",
+          "SI-6",
+          "SI-3",
+          "SI-14"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T6.3",
+        "what": "Risk-tier deriver as a PURE function in altevra-core (SI-9): derive_risk_tier(kind, target, sensitivity_level, domain) -> 0|1|2 implementing the §4.6 matrix EXACTLY (insight_promotion/new-category/non-person wiki_update => 0; skill/hook/non-locked-prompt/retrieval_profile/capability_gap/person-or-restricted wiki_update/any-restricted-data => 1; mode_change/policy_change/constitutional_lock-layer prompt/runaway-budget-or-eval-gate-or-safety-primitive change/migration schema_gap => 2). An agent-supplied risk_tier MUST be ignored/overwritten by this fn. Plus the write-authority matrix: write_authority in {propose_only, auto_apply_tier0} only (SI-1) — no mode can auto-apply Tier>=1. Mirror the pure-fn + ordered-ladder style of capability.rs TrustLevel.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/lib.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/mod.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/risk_tier.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core selfimprove::risk_tier -- agent_supplied_tier_ignored",
+        "invariants": [
+          "SI-9",
+          "SI-1"
+        ],
+        "complexity": "S"
+      },
+      {
+        "task_id": "T6.4",
+        "what": "Runaway firewall in Rust BELOW the LLM (§4.7), in altevra-core so no prompt can disable it: (1) budgets/rate-limits -> resident_run.decision=aborted_budget, zero outputs; (2) global circuit breaker (SI-11): count(open proposals) > max_open_proposals => propose_only modes pause (runs still log, zero proposals) + Tier-0 alert; (3) Tier-0 auto-apply cap (SI-12): <= max_auto_applies_per_day, overflow defers to Tier-1; (4) dedup+rejection cooldown (SI-13): rejected dedup_key suppressed for rejection_cooldown_days, only new-evidence-beyond-threshold lifts early and that lift is logged; (5) shadow eval gate (SI-10): prompt/retrieval_profile/policy proposal must produce a passing prompt_eval_result before Approved->Applied, regression => auto-rejected(eval_regression); (6) constitutional lock (SI-2): Tier-2 never auto-applicable and never applied in the same op that proposed it; (7) kill switches: resident_mode.enabled=false + global RESIDENT_DISABLED flag (mirror SYMBIOSIS_DISABLED) checked at top of every run => decision=skipped_disabled. Each is a code gate, not a prompt instruction. Should consume the resident_budget row from migration 026 and the proposals/prompt_eval_results from 027.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/firewall.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core selfimprove::firewall",
+        "invariants": [
+          "SI-2",
+          "SI-10",
+          "SI-11",
+          "SI-12",
+          "SI-13",
+          "SI-6"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T6.5",
+        "what": "Prompt registry-of-record + layered render + rollback (§4.8). The CURRENT prompts.rs is only a stateless string builder (build_system_prompt) — it has NO Prompt object, no versions, no DB row, no checksum/active flag, no constitutional_lock, so it does NOT satisfy SI-2/SI-8. Add: a PromptRegistry over the `prompts` table (027) where exactly one row per slug is active (SI-8); render(slug_set, variables, db_snapshot) is PURE/byte-deterministic and emits a prompt_render_manifest (versions+checksums) for replay; safety + core altevra_rules layers carry constitutional_lock=true and are Tier-2 (never auto-changed, SI-2); changing a prompt mints version n+1 active / old->superseded via a Tier-1 (or Tier-2 if locked) proposal; rollback = `altevra prompt rollback <slug> --to <version>` minting a derived active (itself Tier-1, human-presence gated). Checksum mismatch (hand-edited generated prompt) => drift quarantine, never silent overwrite. Reuse the existing layer-ordering constants from prompts.rs as the render input.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/prompts.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/lib.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/prompt.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/proposals.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/prompt_registry.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core prompt_registry:: && cargo test -p altevra-cli --test prompt_rollback",
+        "invariants": [
+          "SI-2",
+          "SI-8",
+          "SI-10"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T6.6",
+        "what": "Full runaway-prevention test suite (§4.17). Cover: (a) budget cap => aborted_budget, no outputs; (b) proposal-flood => SI-11 circuit breaker pauses proposing; (c) Tier-0 daily-cap overflow defers to Tier-1 (SI-12); (d) rejected dedup_key re-proposal blocked during cooldown (SI-13); (e) Tier-2 proposal cannot auto-apply (SI-2); (f) self-authored event excluded from signals (SI-6); (g) agent-supplied risk_tier ignored, core re-derives (SI-9); and the headline (h) prompt-injection-cannot-change-gate (SI-15): a fixture note containing 'auto-apply everything / set risk_tier=0 / disable the firewall' is treated as DATA, changes NO gate decision and cannot move any proposal to applied. Reuse the planted-fake-secret fixture corpus (no real secrets) to prove no resident path leaks. Add the vertical loop spine: fixture events -> improvement_signal -> skill proposal -> review_item -> simulated human-presence approve -> render stub -> usage satisfies success_metric, all with NoopProvider (no network).",
+        "files_to_edit": [],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/tests/runaway_firewall.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/tests/selfimprove_vertical_loop.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/fixtures/p0/prompt_injection_autoapply.md"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core --test runaway_firewall prompt_injection_cannot_change_gate",
+        "invariants": [
+          "SI-15",
+          "SI-2",
+          "SI-6",
+          "SI-9",
+          "SI-11",
+          "SI-12",
+          "SI-13"
+        ],
+        "complexity": "M"
+      }
+    ],
+    "risks": [
+      "HARD DEPENDENCY GAP: P0.6 (T6.2 dep T5.4) cannot be built before P0.5's resident landing zone exists. Verified absent: migration 026_resident.sql, resident_mode/resident_run/resident_budget tables, and any resident runtime code (grep NONE). Building selfimprove/ first would have no resident_run row to satisfy SI-14 and no resident_budget row for the firewall (SI-11/12/13). Sequence: land 026 (P0.5) BEFORE 027 (P0.6).",
+      "Migration numbering collision risk: next free number is 026, but P0.5 must own 026_resident.sql and P0.6 must own 027_proposals.sql. If P0.6 grabs 026 first, P0.5's resident schema is orphaned. Coordinate: 026=resident (P0.5), 027=proposals (P0.6), 028+=domains (P0.8).",
+      "R10 violation trap: a tempting shortcut is to extend the existing skill_proposals table (migration 023) into the proposal super-family. That breaks R10 (one proposal table, kind discriminator). skill_proposals must stay a co-owned §5 render artifact / legacy-folded source; the new `proposals` table is the §4 super-family. Two different tables.",
+      "SI-2/SI-15 are the load-bearing safety invariants of this phase (a bug = the loop edits the rules that constrain the loop, or a poisoned note disables the firewall). The firewall (T6.4) MUST live in altevra-core Rust below the LLM and the constitutional lock must be enforced by code, not prompt text. The shadow-eval gate (SI-10) needs the §3.10 golden eval set to exist — confirm the golden set id/version is available or stub it deterministically for P0.6.",
+      "HP-1 boundary: the MCP server must NOT gain any approve/apply/grant path for proposals (RECONCILIATION HP-1/HP-2). Tier>=1 apply and all Tier-2 must route through altevra-core presence.rs require_human_presence (TTY/ALTEVRA_UNLOCK), which already exists. T6.4/T6.5 must call it, and the MCP propose path may only create review_item rows (write-only proposal, never approve).",
+      "prompts.rs is a stateless builder, not a registry. T6.5 risks being mis-scoped as 'already done' because a layered prompt builder exists — but it satisfies neither SI-8 (one active per slug, needs a DB row) nor SI-2 (constitutional lock, needs a versioned object). The registry is genuinely new work on top of the 027 prompts table."
+    ],
+    "recommended_migration_numbers": [
+      "027"
+    ]
+  },
+  {
+    "phase": "P0.7 — Skill factory (propose -> render -> install -> monitor)",
+    "summary": "P0.7 has solid foundations but is mostly UNBUILT as an end-to-end loop. The persistence primitives exist: migration 023_capability.sql defines skill_proposals (dedup_hash UNIQUE, occurrences, status proposed|approved|applied|..., proposed_body JSON, target_agents, capability_grade, render_target) and capability_grants (grantee, subject, trust_level, requires_approval, approval_ref) with full envelopes; SkillProposalsRepository.propose() correctly dedups-by-hash (verified test skill_proposal_dedups_by_hash at capability.rs:191) and CapabilityRecordsRepository enforces T7 honesty. The render machinery exists: ToolAdapter::render_skills is implemented in ALL 4 adapters (claude_code renders to .claude/skills/<slug>/SKILL.md, base.rs:122 trait), GeneratedFile carries managed header + checksum, renderer.rs/parser.rs/registry.rs are complete, installed_components repo can persist results. TrustLevel::requires_review() (capability.rs:35) is the kernel of T9. BUT the actual factory loop is absent: (1) NO skill_factory_proposer resident mode exists — there is NO selfimprove module, NO migration 027 proposal/resident_mode/improvement_signal tables, JobKind has only the 10 legacy jobs and no resident_mode registry — meaning T7.1's entire dependency chain (P0.6) is unbuilt, so T7.1 cannot land until P0.5/P0.6 deliver the resident runtime. (2) NO post-approval render path: nothing reads a skill_proposal(applied), materializes the proposed_body JSON into a ParsedSkill/skill object, and drives render_skills -> installed_component; there is NO proposal status-transition method (propose/occurrences only), NO no-secret-in-render gate (T6) anywhere in altevra-adapters (grep for secret/redact/ingest_guard in adapters = 0 hits), and the SkillBody->skill template (TemplateGate, template/mod.rs:85 skill template requires Trigger/Steps/Commands/Pitfalls/Verification sections) is NOT wired into the render path. (3) NO Hermes ToolAdapter — adapters/src has only antigravity/claude_code/codex/cursor; nothing writes to ~/.imperium/skills/shared/ (R10 Q7). (4) NO usage tracking / deprecate-when-stale: zero usage/last_used/usage_count/deprecate code in skills or db repos. (5) NO capability_grants REPOSITORY at all (only the core enum + migration table) so cross-agent grant review-gate is unenforced, and NO factory-specific tests (dedup-via-proposer, render completeness vs template, cross-agent grant review-gate). The skill CLI (skill.rs) only has List/Show/Check/Refresh — no propose/render-from-proposal/install/monitor verbs.",
+    "already_done": [
+      "Migration 023_capability.sql defines skill_proposals (dedup_hash UNIQUE, occurrences, status enum proposed|approved|applied|rejected|withdrawn|deprecated, proposed_body JSON, target_agents, capability_grade, render_target) AND capability_grants (grantee, subject_kind, subject_ref, trust_level, requires_approval, approval_ref, status pending|granted|revoked, UNIQUE(grantee,subject_kind,subject_ref)) with full envelopes — /home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/migrations/023_capability.sql:51-101",
+      "Dedup invariant satisfied at persistence: SkillProposalsRepository::propose() returns (id,is_new); on existing dedup_hash it increments occurrences and returns the existing id, never a 2nd row — verified by test skill_proposal_dedups_by_hash (/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs:99-146, test at :191-206)",
+      "T7 honesty enforced at the capability_records boundary: upsert() bails if support='supported' with empty evidence_ref — capability.rs:36-42, test supported_without_evidence_is_rejected at :160-188",
+      "ToolAdapter trait declares render_skills(Vec<&ParsedSkill>)->Vec<GeneratedFile> and render is implemented in ALL adapters (base.rs:122; claude_code.rs:322-332 writes .claude/skills/<slug>/SKILL.md; codex.rs/cursor.rs/antigravity.rs all have fn render_skills)",
+      "Deterministic, no-timestamp managed header + checksum on every rendered file — GeneratedFile::with_managed_header (base.rs:34-46) with passing determinism tests (base.rs:139-165); renderer.rs render_with_header has matching no-timestamp test",
+      "Skill parsing/registry/versioning complete: parser.rs (parse_skill + frontmatter), registry.rs (register/get/list/check_version_opt + VersionCheckResult incl NotInstalled/NotFound), version.rs, checksum.rs",
+      "TrustLevel ladder + review-gate kernel for T9: TrustLevel (none<read<propose<render<install<execute) with requires_review() true at >=install — /home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/capability.rs:12-78, tests at :119-129",
+      "installed_components persistence ready to record renders: InstallationsRepository::upsert_component / list_components + capability_state/last_verified_at columns (migration 023:104-105) — /home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/installations.rs:108-163",
+      "Skill template (the render-completeness contract) is defined: TemplateGate builtin 'skill' template requires sections ## Trigger/## Steps/## Commands/## Pitfalls/## Verification + frontmatter slug/version/title — /home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/template/mod.rs:85-99 (test skill_template_requires_skillbody_sections at :204)",
+      "SI-7 model-routing guard (local_private never cloud) already enforced in altevra-llm/src/provider.rs per ground truth — usable by the future skill_factory_proposer resident mode"
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T7.1",
+        "what": "skill_factory_proposer resident mode: a small single-purpose resident mode (MOD-2) that scans recent hook turns (turns table, turn_source_tool from migration 025), detects a repeated multi-step workflow, computes a stable dedup_hash over the normalized step sequence, and calls SkillProposalsRepository::propose() so exactly ONE skill_proposal exists per repeated workflow (dedup invariant). Must emit proposal-only output (HP-1: no approve), route through exposure_gate/ceiling, and run as a resident_mode under the brain scheduler. BLOCKED on P0.6: there is NO selfimprove module, NO resident_mode registry, NO proposal/improvement_signal tables — JobKind (altevra-brain/src/jobs.rs:11-22) has only the 10 legacy jobs. Cannot be done standalone; it sits on T5.x/T6.x.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/scheduler.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/skill_factory.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/selfimprove/workflow_dedup.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/proposals.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core skill_factory_proposer_dedup && cargo test -p altevra-brain resident_skill_factory",
+        "invariants": [
+          "dedup (exactly one skill_proposal per repeated workflow)",
+          "MOD-2 (single-purpose resident mode, no monolithic agent)",
+          "HP-1 (proposer never approves/applies)",
+          "SI-6 self-write exclusion (don't propose from Altevra's own writes)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T7.2",
+        "what": "Post-approval render path (§5-owned): after a skill_proposal reaches status='applied' (set only by a human-presence-gated review approval, never by the proposer), parse proposed_body JSON into a SkillBody, materialize it into a skill object/ParsedSkill, validate it against the builtin 'skill' Template (TemplateGate, template/mod.rs:85 — required sections Trigger/Steps/Commands/Pitfalls/Verification), run it through a no-secret-in-render gate (T6: scan rendered content with altevra-secrets before write — currently ZERO secret/redact calls in altevra-adapters), call ToolAdapter::render_skills, then record the result as an installed_component (component_type='skill') via InstallationsRepository::upsert_component. Today: NO proposal status-transition method (capability.rs only has propose/occurrences), NO proposed_body->ParsedSkill materialization, NO T6 secret gate in render, render path not wired to proposals (grep proposed_body in skills/adapters = 0 hits).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-adapters/src/base.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-skills/src/lib.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/skill.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-skills/src/body.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-skills/src/factory.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-skills render_from_applied_proposal_is_complete && cargo test -p altevra-skills render_rejects_secret_in_body",
+        "invariants": [
+          "T6 (no-secret-in-render)",
+          "TEMPLATE-1 (rendered skill must satisfy the skill Template)",
+          "HP-2 ('applied' is core-recorded after presence check, never an input field)",
+          "R10 Q1 (Ahead/conflict -> review, never auto-clobber the installed_component)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T7.3",
+        "what": "Hermes ToolAdapter (R10 Q7): a new module implementing the ToolAdapter trait that renders skills to ~/.imperium/skills/shared/ (Hermes shared skill dir). Must follow MOD-1 (new integration = new adapter module, no core edits): implement tool_name='hermes', detect(), render_skills() (write <slug>/SKILL.md or hermes skill format under ~/.imperium/skills/shared/), render_instructions/render_hooks (likely minimal/none), build_install_plan/install/verify/repair. Register in adapters/src/lib.rs. Today: adapters/src has only antigravity/base/claude_code/codex/cursor — grep hermes in adapters = 0 hits.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-adapters/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-adapters/src/hermes.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-adapters hermes_adapter_renders_skill_to_shared_dir",
+        "invariants": [
+          "MOD-1 (Hermes adapter is a module, not a core edit)",
+          "T6 (no-secret-in-render applies to Hermes target too)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T7.4",
+        "what": "Usage tracking + deprecate-when-stale (§4.5 stage 7): record per-skill usage signals (e.g. observed in hook turns / installed_component last_checked_at + a usage counter), and a brain lifecycle pass that flags a skill_proposal/skill as stale and transitions status to 'deprecated' when usage falls below threshold over a window. Needs a usage column/table (skill_proposals already has occurrences for proposal frequency, but NO post-install usage signal exists) and a deprecate transition (skill_proposals.status supports 'deprecated' in migration 023:64 but nothing sets it). Today: grep usage/last_used/usage_count/deprecate/stale in skills+db repos = 0 hits. Needs a NEW migration (026 is P0.5's, 027 P0.6's, 028 P0.8's — this phase should claim 029 or fold a usage table into the proposals migration owned by P0.6; coordinate so P0.7 does not collide).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/installations.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/skill_usage.rs"
+        ],
+        "migration": "029_skill_usage.sql",
+        "acceptance_test": "cargo test -p altevra-db skill_usage_tracked && cargo test -p altevra-db stale_skill_marked_deprecated",
+        "invariants": [
+          "dedup (deprecate operates on the single deduped proposal/skill row)",
+          "HP-2 (deprecate is a derived/lifecycle transition, destructive/forget stays human-presence gated)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T7.5",
+        "what": "Tests: (a) dedup at the proposer level — the same repeated workflow detected twice yields ONE proposal with occurrences incremented (extends the existing repo-level test up through skill_factory_proposer); (b) render completeness — a rendered skill from an applied proposal contains all required Template sections (Trigger/Steps/Commands/Pitfalls/Verification) and the managed header+checksum, and rendering a body with a fake secret is REJECTED (T6); (c) cross-agent grant review-gate (T9) — granting a skill at trust_level >= install to another agent (e.g. Hermes) requires_review()==true and a capability_grant cannot reach status='granted' without an approval_ref tied to an approved review_item recorded under human presence (HP-1/HP-2). Today: ZERO of these tests exist; the ONLY skill-factory test is the repo dedup test (capability.rs:191).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-skills/tests/factory.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/tests/skill_factory.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-skills --test factory && cargo test -p altevra-db --test skill_factory",
+        "invariants": [
+          "dedup (exactly one skill_proposal per repeated workflow)",
+          "T9 (cross-agent grant review-gate)",
+          "T6 (no-secret-in-render)",
+          "HP-1/HP-2 (no agent approve path; approval is core-recorded under presence)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T7.6-grants-repo",
+        "what": "Implied-but-missing prerequisite for T7.5(c) and T9 enforcement: a CapabilityGrantsRepository. The capability_grants TABLE (migration 023:75-97) and the TrustLevel::requires_review() logic (capability.rs:35) both exist, but there is NO repository to create/approve/revoke grants and NO enforcement that an install/execute-grade grant cannot be 'granted' without approval_ref. Without it the T9 invariant is theoretical (no code path enforces it). grep CapabilityGrantsRepository/INSERT INTO capability_grants in crates = 0 hits.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/capability.rs"
+        ],
+        "new_files": [],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-db install_grade_grant_requires_approval_ref",
+        "invariants": [
+          "T9 (cross-agent grant review-gate)",
+          "HP-1 (MCP/agent caller has no grant-approve path)",
+          "HP-2 (approval recorded by core after presence check)"
+        ],
+        "complexity": "M"
+      }
+    ],
+    "risks": [
+      "HARD DEPENDENCY BLOCK: T7.1 depends on P0.6 (self-improvement loop + resident runtime) which is entirely unbuilt — no altevra-core/src/selfimprove/ module, no migration 027 (proposal/improvement_signal/prompt/resident tables), no resident_mode registry (JobKind in altevra-brain/src/jobs.rs:11 still lists only the 10 legacy jobs). P0.7 cannot deliver the propose stage until P0.5 (resident runtime) and P0.6 (proposal table + firewall) land. Sequence per critical path: P0.5 -> P0.6 -> P0.7.",
+      "T6 (no-secret-in-render) is currently UNENFORCED in altevra-adapters — render_skills writes proposed body content to disk with zero secret scanning. A malicious or accidental secret in a proposed_body would be written verbatim to .claude/skills/ or ~/.imperium/skills/shared/. This is a leak risk that must be closed in T7.2 before any auto-render path is wired.",
+      "T9 is only HALF-real: the TrustLevel::requires_review() predicate and the capability_grants table exist, but there is NO grants repository and NO enforcement, so 'cross-agent grant review-gate' is not actually testable/provable today (T7.5c will fail until T7.6-grants-repo lands).",
+      "skill_proposal status machine is inert: migration 023 declares proposed|approved|applied|rejected|withdrawn|deprecated but SkillProposalsRepository only has propose()/occurrences() — there is no transition method and no human-presence gate on approval, so HP-1/HP-2 are not yet wired for skill proposals.",
+      "Migration numbering coordination: P0.5 owns 026, P0.6 owns 027, P0.8 owns 028. P0.7's only schema need (usage tracking, T7.4) must NOT reuse 026/027/028 — it should claim 029 (after coordinating with P0.8 which the BUILD_TASKS sketch put at 028-029). Confirm 029 is free before authoring 029_skill_usage.sql.",
+      "Render-completeness has a contract (TemplateGate skill template, template/mod.rs:85) but it is NOT invoked by render_skills in any adapter — a proposed_body missing required sections would render an incomplete SKILL.md today. T7.2 must wire TemplateGate into the materialization step or the 'render completeness' acceptance test cannot pass."
+    ],
+    "recommended_migration_numbers": [
+      "029"
+    ]
+  },
+  {
+    "phase": "P0.8 (domains/lifecycle/projects + RTBF) + P0.9 (cloud-sync prep)",
+    "summary": "The schema spine for this phase is well advanced but the RUNTIME for it is almost entirely absent. T8.1 is effectively DONE (migration 024_domain_policy.sql seeds all 9 builtins with the full §6.4 matrix — cloud_sync, mirror, retention, RTBF, legal_hold columns). T8.2 is PARTIAL: `learnings` and `insight_cards` tables already exist (migration 020), and core Templates exist for person/preference/learning/insight_card, but the DB tables for `project` (with parent_id R7), `person`, `relationship`, `preference`, and `event_log_personal` do NOT exist. Everything else (T8.3–T8.8, T9.1–T9.3) is MISSING. Critically: there is NO Rust `DomainPolicy` struct or repository to READ the seeded `domain_policies` table — it's a dormant SQL island. The exposure_gate.rs does enforce most-restrictive multi-domain + ceiling-on-level at READ time (R1/R3 satisfied for reads), but there is no policy-snapshot-at-CREATE (D2/policy_version stamping), no lifecycle/purge JobKind in altevra-brain (LifecycleState enum exists but has no derivation fn), no export/forget/legal-hold CLI verbs (presence.rs exists and is correct but is wired into ZERO commands), no generated_mirror writer for ~/Obsidian/Imperium/, and no cloud_sync sync-set selector or tombstone-hash/conflict-marker model. HP-1 holds (MCP server exposes no approve/forget/export path — verified by absence). Migration numbering must be coordinated: sqlx::migrate! loads by filename, next free = 026; P0.5 owns 026, P0.6 owns 027, so this phase MUST use 028 (domains was already taken as 024, so 028 is free for the projects/personal table) — recommend renaming the plan's 029→028.",
+    "already_done": [
+      "T8.1 domain_policy table + 9-builtin seed: DONE in crates/altevra-db/migrations/024_domain_policy.sql:8-55. All 9 governed domains seeded (business/project/client/personal/relationship/health/legal/financial/public) with the full §6.4 policy matrix: default_sensitivity, max_sensitivity, default_audience_ceiling, cloud_sync (disabled|encrypted_only|allowed), embedding_model_role, obsidian_mirror, retention_class, soft_ttl_days, hard_expiry_days, review_on_write, rtbf_required, legal_hold_capable, export_class. High-water domains correctly default to local_private + cloud_sync=disabled + obsidian_mirror=never (D4). NOTE: it is migration 024 not the planned 028 — orchestrator confirmed; T8.1 is satisfied.",
+      "Domain governed enum (R3): crates/altevra-core/src/domain.rs:15-59 — 9 builtins + Other(String) tolerant parse, is_high_water() correct, serde roundtrip tested. Verified by contract_validation.rs:47-63.",
+      "ExposureGate read-side most-restrictive enforcement (R1/R3): crates/altevra-core/src/safety/exposure_gate.rs:95-131 — ceiling compares ONLY sensitivity_level (R1-INV), domains ⊆ scope is a SEPARATE gate (line 117-121), coarse non-leaking deny reasons (§2.13). Tested incl. the health-leak case (exposure_gate.rs:170-183).",
+      "context_packet/exposure_decision split (R5/R5-INV): migration 022_context_packet.sql (ephemeral body, 14d purge intent in comment) + migration 021_safety.sql exposure_decisions table (append-only, 'never auto-purged'). The R5-INV separation the lifecycle job must honor is structurally in place.",
+      "Personal-type Templates (R13) for the brain types: crates/altevra-core/src/template/mod.rs:124-164 — learning, person (Personal/Restricted), preference (Personal/Confidential), insight_card already registered with high-water defaults. Tested in template/mod.rs:215-222.",
+      "learnings + insight_cards object tables: migration 020_relations_objects.sql:45,76 (+ LearningRow repo in crates/altevra-db/src/repositories/objects.rs:10-140). Two of the seven T8.2 tables already exist.",
+      "Human-presence gate primitive (R4/HP-1/HP-2): crates/altevra-core/src/presence.rs:61-98 — require_human_presence() (TTY or ALTEVRA_UNLOCK), presence_from() testable core, agent-refused path tested (presence.rs:117-128). The MECHANISM is done; it is just not yet CALLED by any verb.",
+      "HP-1 (MCP has no approve/forget/export/policy path): verified by absence — grep of crates/altevra-mcp/src/ for approve|forget|export|set-policy|legal-hold|grant returned ZERO matches. The boundary holds.",
+      "Envelope conflict/sync fields already present (partial T9.2 substrate): crates/altevra-core/src/envelope.rs:111,121,123 — revision:u32, origin_device:Option<String>, checksum:Option<String>, policy_version:Option<u32> all exist on the Envelope struct. ObjectStatus::DeletedTombstone exists (status.rs:72). The DATA MODEL fields exist; the tombstone/conflict LOGIC does not.",
+      "LifecycleState enum (T8.4 value set): crates/altevra-core/src/status.rs:99-110 — all 7 states (fresh/due_for_review/expired/archived/retention_due/delete_due/legal_hold) defined + tested in contract_validation.rs:104-115. Only the enum exists; no derivation function."
+    ],
+    "missing_tasks": [
+      {
+        "task_id": "T8.2",
+        "what": "Migration for the remaining personal-brain + project tables NOT created by migration 020: `project` (with parent_id TEXT NULL for R7 scope hierarchy, full envelope columns), `person`, `relationship` (person↔person or person↔project edges), `preference`, `event_log_personal`. (learnings + insight_cards already exist in 020, do NOT recreate them.) Each table gets the full envelope columns matching the 019 pattern (schema_version, status, domain, scope, sensitivity, provenance, categories, tags, revision, created_at, updated_at) + type-specific fields. project carries imported_readonly provenance mirroring ~/.imperium/identity/projects.yaml (Q-PROJ).",
+        "files_to_edit": [],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/migrations/028_projects_personal.sql",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/personal.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/projects.rs"
+        ],
+        "migration": "028_projects_personal.sql",
+        "acceptance_test": "cargo test -p altevra-db --test repository_roundtrip",
+        "invariants": [
+          "R7 (parent_id scope hierarchy)",
+          "TAG-1 (every row needs domain + >=1 category)",
+          "R3 (domain governed enum)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T8.3",
+        "what": "Policy resolution: a DomainPolicy Rust struct + repository to READ the seeded `domain_policies` table (currently a dormant SQL island — NO Rust reader exists). Then wire it into ingest_guard so that at CREATE time the object's defaults (sensitivity, audience ceiling, cloud_sync, mirror, retention, review_on_write, rtbf/legal-hold flags) are SNAPSHOTTED onto the envelope with policy_version stamped (D2 snapshot-at-create — envelope.policy_version field exists but is never set). For multi-domain objects, resolve MOST-RESTRICTIVE across all member domains (R3): max sensitivity, min cloud_sync, most-restrictive mirror, shortest TTL. The exposure_gate already does most-restrictive at READ; this adds the create-time snapshot + policy table read that is entirely missing.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-secrets/src/ingest_guard.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/domain.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/mod.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/policy.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/domain_policy.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core policy:: && cargo test -p altevra-db --test repository_roundtrip domain_policy",
+        "invariants": [
+          "R3 (most-restrictive multi-domain)",
+          "D2 (snapshot-at-create + policy_version stamp)",
+          "R1-INV (ceiling touches only level)",
+          "TAG-1"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T8.4",
+        "what": "altevra-brain lifecycle job: add a `LifecycleSweep` JobKind to crates/altevra-brain/src/jobs.rs (enum at line 11, as_str at 25, parse at 40, period_secs at 58, dispatch at 731, run_all list at 791 — all need the new arm) + a run_lifecycle_sweep() impl. It must (a) DERIVE LifecycleState from envelope dates (review_after→due_for_review, valid_until→expired, retention class+hard_expiry_days→retention_due/delete_due) — this derivation fn does NOT exist anywhere today; (b) soft-archive standard-retention stale objects (Active→Archived, legal transition already in status.rs:153); (c) ephemeral purge per R-EPH horizons (context_packet body 14d, dismissed research_item 30d, low-importance system_event 90d, embedder_queue on done); (d) review-gate destructive/policy ops. CRITICAL R5-INV: purge ONLY context_packets rows, NEVER exposure_decisions. legal_hold objects are never purged (D7 precedence).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/scheduler.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/status.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/lifecycle.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-brain lifecycle && cargo test -p altevra-core lifecycle::",
+        "invariants": [
+          "R5-INV (purge context_packet body never exposure_decision)",
+          "R-EPH (ephemeral purge horizons)",
+          "D7 (legal-hold blocks purge)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T8.5",
+        "what": "Project lifecycle: archive-demotion (when a project→Archived, its scope multiplier drops so its objects rank lower in the §3 packet scorer — D5), scope-promotion (an object promoted from project-scope to global/parent scope, additive D8), and provenance compaction (session turns rolled up into an archived summary object on session-end, turns→archived). Depends on the project table (T8.2). The scope multiplier read in the compiler (R7) activates here.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-brain/src/jobs.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/src/repositories/projects.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/project_lifecycle.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core project_lifecycle:: && cargo test -p altevra-brain project_lifecycle",
+        "invariants": [
+          "R7 (parent scope multiplier)",
+          "D5 (archive-demotion)",
+          "D8 (scope-promotion additive)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T8.6",
+        "what": "Add `altevra export`, `altevra forget` (RTBF), and `altevra legal-hold` CLI verbs — NONE exist in the Commands enum (crates/altevra-cli/src/main.rs:25-127). export writes a sovereign dump (export_class per domain_policy decides what is includable); forget --execute runs the §2.8 soft-forget→tombstone pipeline (Active→Forgotten→DeletedTombstone, status.rs transitions exist); legal-hold sets/clears a hold that BLOCKS forget/purge (D7 precedence: legal-hold > RTBF). ALL THREE plus export --raw MUST call presence::require_human_presence() FIRST (R4) — presence.rs exists but is wired into zero commands today. Approval is core-recorded with decided_by/method (HP-2), never a payload flag. MCP must NOT get these verbs (HP-1).",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/main.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/mod.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/export.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/forget.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/src/commands/legal_hold.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/rtbf.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core rtbf:: && cargo test -p altevra-cli --test forget_legal_hold",
+        "invariants": [
+          "R4 (human-presence gated)",
+          "HP-1 (MCP never gets approve/forget/export)",
+          "HP-2 (approved is never an input field)",
+          "D7 (legal-hold > RTBF precedence)"
+        ],
+        "complexity": "L"
+      },
+      {
+        "task_id": "T8.7",
+        "what": "Imperium-vault generated_mirror writer (Q-VAULT/R10): Altevra writes ~/Obsidian/Imperium/ ONLY as generated_mirror — never authoritative. The current crates/altevra-vault/src/writer.rs is a generic atomic writer with no mirror semantics. Add a mirror writer that (a) stamps frontmatter provenance origin=generated_mirror + a 'do not hand-edit / Altevra-managed' marker, (b) refuses to overwrite a file whose frontmatter shows human edits since last mirror (human-canonical precedence), (c) only mirrors objects whose domain_policy.obsidian_mirror != never (high-water domains never mirror — D4). The human_edit_generated_mirror.md fixture (T0.7) is the conflict test target.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-vault/src/lib.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-vault/src/mirror.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-vault mirror",
+        "invariants": [
+          "D4 (high-water domains never mirror)",
+          "Q-VAULT (Imperium vault human-canonical; Altevra writes generated_mirror only)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T8.8",
+        "what": "§6.12 test suite: policy seed (9 builtins match matrix), default application (create stamps policy_version + domain defaults), multi-domain most-restrictive, lifecycle derivation/soft-archive, project archive-demotion, scope-promotion, provenance compaction, export, RTBF + legal-hold precedence, policy-change safety, sync ceiling, and cross-domain leak=0. Extend the existing p0_vertical_smoke pattern (crates/altevra-cli/tests/p0_vertical_smoke.rs) which already proves health-object exclusion + secret leak=0.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/tests/p0_vertical_smoke.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-cli/tests/p0_8_domains_lifecycle.rs",
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-db/tests/domain_policy_seed.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-cli --test p0_8_domains_lifecycle && cargo test -p altevra-db --test domain_policy_seed",
+        "invariants": [
+          "R3",
+          "R5-INV",
+          "R-EPH",
+          "R4",
+          "D7",
+          "cross-domain leak=0"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T9.1",
+        "what": "Per-domain cloud_sync ceiling enforcement in an export/sync-set selector. Reads domain_policy.cloud_sync (disabled|encrypted_only|allowed) per object's resolved domains (most-restrictive across multi-domain, R3/D3) and builds a sync set that EXCLUDES anything resolving to disabled. No daemon — selector only. Depends on the DomainPolicy reader from T8.3.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/policy.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/sync_set.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core sync_set::",
+        "invariants": [
+          "D3 (per-domain cloud_sync ceiling)",
+          "R3 (most-restrictive multi-domain)",
+          "R1-INV"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T9.2",
+        "what": "Tombstone-as-id+hash model + revision/origin_device/checksum conflict markers (NO last-writer-wins). A forget/delete leaves a tombstone row carrying ONLY {id, checksum/content-hash, revision, origin_device} — never the body. On a future sync, divergent (revision, origin_device, checksum) triples produce a CONFLICT MARKER for review, never a silent overwrite. The Envelope fields (revision, origin_device, checksum at envelope.rs:111-123) and ObjectStatus::DeletedTombstone (status.rs:72) exist; the tombstone construction + conflict-detection LOGIC does not exist anywhere.",
+        "files_to_edit": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/status.rs"
+        ],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/src/tombstone.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core tombstone::",
+        "invariants": [
+          "no last-writer-wins (conflict marker on divergent revision/origin_device/checksum)",
+          "tombstone = id+hash only (no body)"
+        ],
+        "complexity": "M"
+      },
+      {
+        "task_id": "T9.3",
+        "what": "Tests: restricted-domain object is EXCLUDED from the sync set (cloud_sync=disabled), and a reclassified-up object (e.g. business→restricted, or sensitivity raised post-create) is HELD BACK from sync rather than synced under its stale classification.",
+        "files_to_edit": [],
+        "new_files": [
+          "/home/pavle/projekti/ai-tooling/altevra/crates/altevra-core/tests/sync_set_ceiling.rs"
+        ],
+        "migration": "",
+        "acceptance_test": "cargo test -p altevra-core --test sync_set_ceiling",
+        "invariants": [
+          "D3 (cloud_sync ceiling)",
+          "reclassified-up held back",
+          "cross-domain leak=0"
+        ],
+        "complexity": "S"
+      }
+    ],
+    "risks": [
+      "MIGRATION NUMBER COLLISION: migrations load via sqlx::migrate!(\"./migrations\") by FILENAME order (crates/altevra-db/src/pool.rs:94). T8.1 was already shipped as 024 (not the plan's 028), so 028 is FREE for the projects/personal table. But P0.5 owns 026 (resident) and P0.6 owns 027 (proposals) per BUILD_TASKS.md:128,139. This phase MUST take 028 for T8.2 and NOT reuse 029 as the plan literally states (029 would be fine too, but 028 is the lowest free slot after this phase's 024). Coordinate so two parallel phases don't both grab the same number — sqlx will fail on a duplicate version prefix.",
+      "T8.3 is the linchpin and is entirely missing: the domain_policies SQL table (024) has NO Rust reader. Until a DomainPolicy struct + repo exists and is wired into ingest_guard for snapshot-at-create, the envelope.policy_version field stays None forever and D2 is unenforced. T9.1 (sync ceiling) and T8.6 (export_class) also block on this reader. Build T8.3 FIRST.",
+      "T8.4 lifecycle purge is the single most dangerous task for R5-INV: a naive 'purge expired packets' that JOINs or cascades into exposure_decisions would destroy the forensic audit trail. The job must DELETE FROM context_packets only, and must skip any object with LifecycleState::LegalHold. Recommend an explicit test asserting exposure_decisions row count is unchanged after a purge sweep.",
+      "presence.rs (R4) is correct but UNWIRED — it is currently called by zero commands. T8.6 must wire it into export/forget/legal-hold, and the existing connect/setup verbs that touch external state arguably should too (out of this phase's scope but note it). Risk: an agent driving the CLI non-interactively could trigger a destructive verb if presence isn't called at the very top of each handler.",
+      "T8.2: do NOT recreate learnings/insight_cards — they already exist in migration 020 (lines 45,76) with a LearningRow repo. A migration that re-CREATEs them is harmless (IF NOT EXISTS) but a re-INSERT of seed rows or an ALTER could conflict. Scope 028 strictly to project/person/relationship/preference/event_log_personal.",
+      "Multi-domain most-restrictive (R3) is implemented at READ in exposure_gate but the CREATE-time resolver (T8.3) must use the SAME combine() semantics (max level, min cloud_sync, most-restrictive mirror, shortest TTL) or reads and writes will disagree — a subtle leak surface. Reuse Sensitivity::combine() from security.rs rather than re-deriving."
+    ],
+    "recommended_migration_numbers": [
+      "028"
+    ]
+  }
+]

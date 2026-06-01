@@ -15,7 +15,9 @@
 //! fire when the wall clock crosses the scheduled boundary.
 
 pub mod jobs;
+pub mod resident;
 pub mod scheduler;
 
 pub use jobs::{JobKind, JobResult};
+pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};

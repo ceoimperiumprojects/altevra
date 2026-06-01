@@ -6,7 +6,7 @@
 //! is "full content + tool args" with safety via redaction, not omission.
 
 use altevra_db::{create_pool, run_migrations, SessionsRepository, TurnRow};
-use altevra_secrets::{detect_secrets, redact};
+use altevra_secrets::guard_text;
 use chrono::Utc;
 use clap::Args;
 use std::path::PathBuf;
@@ -74,23 +74,59 @@ pub async fn run(args: TurnRecordArgs) -> anyhow::Result<()> {
     // Resolve content: literal, stdin, or file
     let raw_content = resolve_content(&args.content)?;
 
-    // Detect + redact secrets unless explicitly disabled
-    let (final_content, redacted_count) = if args.no_redact {
-        (raw_content, 0i64)
-    } else {
-        let matches = detect_secrets(&raw_content);
-        let count = matches.len() as i64;
-        (redact(&raw_content), count)
-    };
+    // Guard secrets + PII unless raw persist is explicitly authorized. `--no-redact`
+    // alone is NOT enough (R11 #10: it was a silent raw-persist bypass); the operator
+    // must also set ALTEVRA_ALLOW_RAW_PERSIST so a raw write is a deliberate act.
+    let allow_raw = args.no_redact && std::env::var("ALTEVRA_ALLOW_RAW_PERSIST").is_ok();
 
-    let tool_calls = args
+    // Parse the side-channel JSON args up front.
+    let raw_tool_calls = args
         .tool_calls
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-    let file_changes = args
+    let raw_file_changes = args
         .file_changes
         .as_deref()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+    let (final_content, tool_calls, file_changes, redacted_count, sensitivity, redaction_status) =
+        if allow_raw {
+            eprintln!(
+                "[altevra] WARNING: raw persist (no redaction) — content + tool args stored unscanned"
+            );
+            (
+                raw_content,
+                raw_tool_calls,
+                raw_file_changes,
+                0i64,
+                "internal".to_string(),
+                "unscanned".to_string(),
+            )
+        } else {
+            if args.no_redact {
+                eprintln!("[altevra] --no-redact ignored (set ALTEVRA_ALLOW_RAW_PERSIST to honor it); guarding content");
+            }
+            use altevra_core::status::RedactionStatus;
+            let g = guard_text(&raw_content, altevra_core::Sensitivity::Internal);
+            let mut sens = g.sensitivity.clone();
+            let mut red = g.redaction_status.clone();
+            let mut count = g.sightings.len() as i64
+                + i64::from(g.risk_tags.contains(&altevra_core::RiskTag::ThirdPartyPii));
+            // R11 re-verify HIGH: `--tool-calls`/`--file-changes` were persisted RAW
+            // here (unlike the hook/import paths). Scrub them through guard_json too.
+            let mut scrub = |v: serde_json::Value| {
+                let (vv, c, s) = crate::commands::hook_handle::guard_json(&v);
+                count += c;
+                sens = sens.combine(&s);
+                if c > 0 {
+                    red = RedactionStatus::Redacted;
+                }
+                vv
+            };
+            let tc = raw_tool_calls.map(&mut scrub);
+            let fc = raw_file_changes.map(&mut scrub);
+            (g.value, tc, fc, count, sens.to_string(), red.to_string())
+        };
 
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
@@ -112,6 +148,8 @@ pub async fn run(args: TurnRecordArgs) -> anyhow::Result<()> {
         file_changes,
         redacted_count,
         source_tool: None,
+        sensitivity,
+        redaction_status,
         created_at: Utc::now(),
     };
 

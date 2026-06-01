@@ -50,6 +50,12 @@ pub struct TurnRow {
     pub redacted_count: i64,
     /// The agent/tool that produced this turn (claude-code | codex | cursor | …).
     pub source_tool: Option<String>,
+    /// Sensitivity verdict from the guard (default-up). Persisted so the turn
+    /// read path can fail-closed on the ceiling (R11 #5).
+    pub sensitivity: String,
+    /// Redaction verdict from the guard. Reads fail closed on anything not
+    /// clean/redacted (R11 #5).
+    pub redaction_status: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -180,8 +186,8 @@ impl<'a> SessionsRepository<'a> {
             r#"INSERT INTO turns
                 (id, session_id, turn_idx, role, content, tool_calls, tool_name,
                  model, tokens_in, tokens_out, latency_ms, file_changes,
-                 redacted_count, source_tool, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 redacted_count, source_tool, sensitivity, redaction_status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(t.id.to_string())
         .bind(t.session_id.to_string())
@@ -197,6 +203,8 @@ impl<'a> SessionsRepository<'a> {
         .bind(t.file_changes.as_ref().map(|v| v.to_string()))
         .bind(t.redacted_count)
         .bind(t.source_tool.as_deref())
+        .bind(&t.sensitivity)
+        .bind(&t.redaction_status)
         .bind(ts_to_text(&t.created_at))
         .execute(self.pool)
         .await?;
@@ -370,6 +378,8 @@ impl<'a> SessionsRepository<'a> {
                     .and_then(|s| serde_json::from_str(&s).ok()),
                 redacted_count: r.get("redacted_count"),
                 source_tool: r.get("source_tool"),
+                sensitivity: r.get("sensitivity"),
+                redaction_status: r.get("redaction_status"),
                 created_at: ts_from_text(r.get::<String, _>("created_at")),
             })
             .collect())
@@ -544,6 +554,8 @@ impl<'a> SessionsRepository<'a> {
                         .and_then(|s| serde_json::from_str(&s).ok()),
                     redacted_count: r.get("redacted_count"),
                     source_tool: r.get("source_tool"),
+                    sensitivity: r.get("sensitivity"),
+                    redaction_status: r.get("redaction_status"),
                     created_at: ts_from_text(r.get::<String, _>("created_at")),
                 };
                 (row, score)
@@ -703,6 +715,8 @@ mod tests {
             file_changes: None,
             redacted_count: 0,
             source_tool: None,
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
             created_at: Utc::now(),
         };
         repo.record_turn(&turn).await.unwrap();
@@ -735,6 +749,8 @@ mod tests {
                 file_changes: None,
                 redacted_count: 0,
                 source_tool: None,
+                sensitivity: "internal".into(),
+                redaction_status: "clean".into(),
                 created_at: Utc::now(),
             };
             repo.record_turn(&turn).await.unwrap();
@@ -837,6 +853,8 @@ mod tests {
                 file_changes: None,
                 redacted_count: 0,
                 source_tool: None,
+                sensitivity: "internal".into(),
+                redaction_status: "clean".into(),
                 created_at: Utc::now(),
             };
             repo.record_turn(&t).await.unwrap();
@@ -877,6 +895,8 @@ mod tests {
                 file_changes: None,
                 redacted_count: 0,
                 source_tool: None,
+                sensitivity: "internal".into(),
+                redaction_status: "clean".into(),
                 created_at: Utc::now(),
             };
             repo.record_turn(&t).await.unwrap();

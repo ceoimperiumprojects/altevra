@@ -164,6 +164,51 @@ async fn handle_post_tool_use(
     .await
 }
 
+/// Recursively scrub every string leaf of a JSON value through `guard_text`.
+/// Tool inputs and file diffs are the richest source of raw secrets/PII (Edit
+/// payloads, `export OPENAI_API_KEY=...`, customer emails in file contents), so
+/// they must be scrubbed before persistence (R11 #2 — content-only redaction
+/// left these sibling columns raw). Returns the scrubbed value, the count of
+/// redacted leaves, and the worst-case sensitivity across all leaves.
+pub(crate) fn guard_json(
+    v: &serde_json::Value,
+) -> (serde_json::Value, i64, altevra_core::security::Sensitivity) {
+    use altevra_core::security::Sensitivity;
+    use altevra_core::status::RedactionStatus;
+    match v {
+        serde_json::Value::String(s) => {
+            let g = guard_text(s, Sensitivity::Internal);
+            let n = i64::from(matches!(g.redaction_status, RedactionStatus::Redacted));
+            (serde_json::Value::String(g.value), n, g.sensitivity)
+        }
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            let mut count = 0i64;
+            let mut sens = Sensitivity::Internal;
+            for item in arr {
+                let (vv, c, sn) = guard_json(item);
+                out.push(vv);
+                count += c;
+                sens = sens.combine(&sn);
+            }
+            (serde_json::Value::Array(out), count, sens)
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            let mut count = 0i64;
+            let mut sens = Sensitivity::Internal;
+            for (k, vv) in map {
+                let (rv, c, sn) = guard_json(vv);
+                out.insert(k.clone(), rv);
+                count += c;
+                sens = sens.combine(&sn);
+            }
+            (serde_json::Value::Object(out), count, sens)
+        }
+        other => (other.clone(), 0, Sensitivity::Internal),
+    }
+}
+
 async fn record_turn(
     repo: &SessionsRepository<'_>,
     role: &str,
@@ -203,6 +248,28 @@ async fn record_turn(
     {
         redacted_count += 1;
     }
+    let mut turn_sensitivity = guarded.sensitivity.clone();
+    let mut turn_redaction = guarded.redaction_status.clone();
+
+    // R11 #2: scrub the side-channel columns (tool_input + file_changes) too —
+    // never persist them raw. Worst-case sensitivity is folded into the turn.
+    let guarded_tool_input = payload.get("tool_input").map(guard_json);
+    let guarded_file_changes = payload.get("file_changes").map(guard_json);
+    let mut side_channel_redacted = false;
+    for g in [&guarded_tool_input, &guarded_file_changes]
+        .into_iter()
+        .flatten()
+    {
+        redacted_count += g.1;
+        turn_sensitivity = turn_sensitivity.combine(&g.2);
+        side_channel_redacted |= g.1 > 0;
+    }
+    if side_channel_redacted {
+        turn_redaction = altevra_core::status::RedactionStatus::Redacted;
+    }
+    let scrubbed_tool_input = guarded_tool_input.map(|(v, _, _)| v);
+    let scrubbed_file_changes = guarded_file_changes.map(|(v, _, _)| v);
+
     let capture_meta: Vec<serde_json::Value> = captures
         .iter()
         .map(|c| {
@@ -223,10 +290,10 @@ async fn record_turn(
         role: role.to_string(),
         content: final_content,
         tool_calls: if capture_meta.is_empty() {
-            payload.get("tool_input").cloned()
+            scrubbed_tool_input.clone()
         } else {
             Some(serde_json::json!({
-                "tool_input": payload.get("tool_input").cloned(),
+                "tool_input": scrubbed_tool_input.clone(),
                 "captured_secrets": capture_meta,
             }))
         },
@@ -242,9 +309,11 @@ async fn record_turn(
         latency_ms: payload
             .get("latency_ms")
             .and_then(serde_json::Value::as_i64),
-        file_changes: payload.get("file_changes").cloned(),
+        file_changes: scrubbed_file_changes,
         redacted_count,
         source_tool: Some(source_tool.to_string()),
+        sensitivity: turn_sensitivity.to_string(),
+        redaction_status: turn_redaction.to_string(),
         created_at: Utc::now(),
     };
     repo.record_turn(&turn).await?;
@@ -339,5 +408,26 @@ mod tests {
         assert!(!tmp.path().join(CURRENT_SESSION_FILE).exists());
 
         std::env::set_current_dir(cwd).unwrap();
+    }
+
+    #[test]
+    fn guard_json_scrubs_secret_and_pii_in_tool_input() {
+        // R11 #2: tool_input/file_changes used to persist RAW. guard_json must
+        // scrub every string leaf (secrets + PII) and raise sensitivity.
+        let v = serde_json::json!({
+            "command": "export OPENAI_API_KEY=sk-ant-AAAAAAAAAAAAAAAAAAAAAAAA",
+            "edits": ["contact alice@example.com", 42, null],
+        });
+        let (scrubbed, count, sens) = guard_json(&v);
+        let s = scrubbed.to_string();
+        assert!(
+            !s.contains("sk-ant-AAAAAAAAAAAAAAAAAAAAAAAA"),
+            "secret leaked through tool_input: {s}"
+        );
+        assert!(!s.contains("alice@example.com"), "email leaked: {s}");
+        assert!(count >= 2, "expected ≥2 redacted leaves, got {count}");
+        assert!(sens >= altevra_core::security::Sensitivity::Confidential);
+        // non-string leaves survive untouched.
+        assert!(s.contains("42"));
     }
 }

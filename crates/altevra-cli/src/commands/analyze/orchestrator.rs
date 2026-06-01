@@ -263,28 +263,52 @@ async fn import_one(repo: &SessionsRepository<'_>, sess: ImportedSession, stats:
             *stats.by_tool.entry(sess.tool_id.clone()).or_insert(0) += 1;
             stats.sessions_imported += 1;
             for turn in &sess.turns {
-                // Redact + auto-capture secrets before persisting.
+                // Guard secrets + PII before persisting. R11 #6: the import path
+                // used secrets-only redact() (no PII, no classification) and stored
+                // tool_calls RAW — mass-ingesting historical emails/keys in plaintext.
                 let store = altevra_secrets::SecretStore::new_keyring("altevra");
                 let captures =
                     altevra_secrets::auto_capture(&turn.content, &store).unwrap_or_default();
                 stats.secrets_captured += captures.len() as u64;
-                let content = altevra_secrets::redact(&turn.content);
+                let guarded =
+                    altevra_secrets::guard_text(&turn.content, altevra_core::Sensitivity::Internal);
+                let mut sensitivity = guarded.sensitivity.clone();
+                let mut redaction = guarded.redaction_status.clone();
+                let mut redacted_count = captures.len() as i64
+                    + i64::from(
+                        guarded
+                            .risk_tags
+                            .contains(&altevra_core::RiskTag::ThirdPartyPii),
+                    );
+                let scrubbed_tool_calls = if let Some(tc) = turn.tool_calls.as_ref() {
+                    let (v, c, s) = crate::commands::hook_handle::guard_json(tc);
+                    redacted_count += c;
+                    sensitivity = sensitivity.combine(&s);
+                    if c > 0 {
+                        redaction = altevra_core::status::RedactionStatus::Redacted;
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
 
                 let trow = TurnRow {
                     id: Uuid::new_v4(),
                     session_id: actual_id,
                     turn_idx: turn.turn_idx,
                     role: turn.role.clone(),
-                    content,
-                    tool_calls: turn.tool_calls.clone(),
+                    content: guarded.value,
+                    tool_calls: scrubbed_tool_calls,
                     tool_name: turn.tool_name.clone(),
                     model: turn.model.clone(),
                     tokens_in: turn.tokens_in,
                     tokens_out: turn.tokens_out,
                     latency_ms: turn.latency_ms,
                     file_changes: None,
-                    redacted_count: captures.len() as i64,
+                    redacted_count,
                     source_tool: Some(sess.tool_id.clone()),
+                    sensitivity: sensitivity.to_string(),
+                    redaction_status: redaction.to_string(),
                     created_at: turn.created_at,
                 };
                 if let Err(e) = repo.record_turn(&trow).await {

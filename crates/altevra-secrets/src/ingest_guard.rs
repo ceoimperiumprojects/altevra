@@ -12,6 +12,7 @@
 //! `secrets` already depends on `core`, so this avoids a dependency cycle.
 
 use crate::detector::{detect_secrets, SecretKind};
+use crate::pii::{detect_pii, PiiKind};
 use crate::redactor::redact_with;
 use altevra_core::domain::RiskTag;
 use altevra_core::envelope::Envelope;
@@ -70,18 +71,24 @@ fn secret_kind_label(kind: SecretKind) -> &'static str {
     match kind {
         SecretKind::OpenAIKey => "openai",
         SecretKind::AnthropicKey => "anthropic",
+        SecretKind::StripeKey => "stripe",
         SecretKind::AwsAccessKey => "aws",
+        SecretKind::GoogleApiKey => "google",
+        SecretKind::NpmToken => "npm",
         SecretKind::GitHubToken => "github",
         SecretKind::SlackToken => "slack",
+        SecretKind::SlackWebhook => "slack_webhook",
         SecretKind::GenericApiKey => "generic",
+        SecretKind::BearerToken => "bearer",
         SecretKind::JwtToken => "jwt",
         SecretKind::PrivateKey => "pem_private_key",
         SecretKind::DatabaseUrl => "db_url",
     }
 }
 
-/// A `hard_secret` is credential-class material that must never be stored raw
-/// even redacted-in-place is mandatory (private keys / cloud roots / db creds).
+/// A `hard_secret` is credential-class material that must never be stored raw —
+/// redacted-in-place is mandatory (private keys / cloud roots / db creds / live
+/// API keys). Covers every kind that is a usable live credential.
 fn is_hard_secret(kind: SecretKind) -> bool {
     matches!(
         kind,
@@ -90,11 +97,18 @@ fn is_hard_secret(kind: SecretKind) -> bool {
             | SecretKind::DatabaseUrl
             | SecretKind::AnthropicKey
             | SecretKind::OpenAIKey
+            | SecretKind::StripeKey
+            | SecretKind::GoogleApiKey
+            | SecretKind::NpmToken
             | SecretKind::GitHubToken
+            | SecretKind::SlackToken
+            | SecretKind::SlackWebhook
+            | SecretKind::BearerToken
     )
 }
 
-/// Minimal P0 PII detection (T1.7): emails. Extended (phone/IBAN/card) later.
+/// Email PII detection (T1.7). Phone/IBAN/card detection lives in [`crate::pii`]
+/// and is applied alongside this in [`guard_text`].
 fn detect_emails(text: &str) -> Vec<(usize, usize)> {
     // simple, allocation-light scan; good enough for the P0 PII flag.
     let mut spans = Vec::new();
@@ -173,7 +187,7 @@ pub fn guard_text(body: &str, declared_sensitivity: Sensitivity) -> GuardedText 
         risk_tags.push(RiskTag::Credential);
     }
 
-    // ---- 2. PII (emails) ----
+    // ---- 2. PII: emails ----
     let emails = detect_emails(&value);
     if !emails.is_empty() {
         for (s, e) in emails.iter().rev() {
@@ -182,17 +196,68 @@ pub fn guard_text(body: &str, declared_sensitivity: Sensitivity) -> GuardedText 
         risk_tags.push(RiskTag::ThirdPartyPii);
     }
 
-    // ---- 3. classify sensitivity (default-up) ----
+    // ---- 2b. PII: phone / IBAN / payment-card (R11 — was email-only) ----
+    let pii = detect_pii(&value);
+    if !pii.is_empty() {
+        let mut had_phone = false;
+        let mut had_financial = false;
+        for m in pii.iter().rev() {
+            let placeholder = match m.kind {
+                PiiKind::Phone => {
+                    had_phone = true;
+                    "[REDACTED:phone]"
+                }
+                PiiKind::Iban => {
+                    had_financial = true;
+                    "[REDACTED:iban]"
+                }
+                PiiKind::CreditCard => {
+                    had_financial = true;
+                    "[REDACTED:card]"
+                }
+            };
+            value.replace_range(m.start..m.end, placeholder);
+        }
+        if had_phone && !risk_tags.contains(&RiskTag::ThirdPartyPii) {
+            risk_tags.push(RiskTag::ThirdPartyPii);
+        }
+        if had_financial && !risk_tags.contains(&RiskTag::Financial) {
+            risk_tags.push(RiskTag::Financial);
+        }
+    }
+
+    // ---- 2c. content high-water markers (coarse P0 net; LLM refines in P0.5) ----
+    for rt in high_water_keywords(&value) {
+        if !risk_tags.contains(&rt) {
+            risk_tags.push(rt);
+        }
+    }
+
+    let redacted_any = !matches.is_empty() || !emails.is_empty() || !pii.is_empty();
+
+    // ---- 3. classify sensitivity (default-UP, fail-closed) ----
+    // A high-water risk tag (health/relationship/legal/financial) forces the
+    // top of the ladder — this is the personal-first parity rule (R11 #4): such
+    // content must never default-down to Internal and leak into work packets.
     let mut sensitivity = declared_sensitivity;
-    if had_hard || !emails.is_empty() {
+    let has_high_water = risk_tags.iter().any(|t| {
+        matches!(
+            t,
+            RiskTag::Health | RiskTag::Relationship | RiskTag::Legal | RiskTag::Financial
+        )
+    });
+    if has_high_water {
+        sensitivity = sensitivity.combine(&Sensitivity::Restricted);
+    } else if had_hard || !risk_tags.is_empty() {
+        // credential / third-party-PII present but no high-water domain marker.
         sensitivity = sensitivity.combine(&Sensitivity::Confidential);
     }
 
     // ---- 4. redaction status ----
-    let redaction_status = if matches.is_empty() && emails.is_empty() {
-        RedactionStatus::Clean
-    } else {
+    let redaction_status = if redacted_any {
         RedactionStatus::Redacted
+    } else {
+        RedactionStatus::Clean
     };
 
     GuardedText {
@@ -202,6 +267,68 @@ pub fn guard_text(body: &str, declared_sensitivity: Sensitivity) -> GuardedText 
         risk_tags,
         sightings,
     }
+}
+
+/// Coarse keyword net for personal high-water content that carries NO secret and
+/// NO structured PII (e.g. "my HIV diagnosis", "raskid sa devojkom"). Returns the
+/// risk tags implied so the classifier can raise sensitivity to `Restricted`.
+/// Deliberately small + high-precision; the P0.5 LLM classifier supersedes it.
+/// Fail-closed bias: a false positive only over-protects.
+fn high_water_keywords(text: &str) -> Vec<RiskTag> {
+    let lc = text.to_lowercase();
+    let mut tags = Vec::new();
+    const HEALTH: &[&str] = &[
+        "diagnosis",
+        "diagnosed",
+        "therapist",
+        "psychiatrist",
+        "antidepressant",
+        "chemotherapy",
+        " hiv ",
+        "cancer",
+        "depression",
+        "anxiety disorder",
+        "suicidal",
+        "suicide",
+        "abortion",
+        "miscarriage",
+        "prozac",
+        "xanax",
+        "zoloft",
+        "dijagnoza",
+        "terapeut",
+        "psihijatar",
+        "antidepresiv",
+        "depresij",
+        "anksioznost",
+        "samoubist",
+    ];
+    const RELATIONSHIP: &[&str] = &[
+        "my girlfriend",
+        "my boyfriend",
+        "my partner",
+        "my wife",
+        "my husband",
+        "breakup",
+        "divorce",
+        "raskid",
+        "devojka mi",
+        "moja devojka",
+        "moj dečko",
+        "moja žena",
+        "moj muž",
+    ];
+    const LEGAL: &[&str] = &["lawsuit", "attorney-client", "tužba", "advokat"];
+    if HEALTH.iter().any(|k| lc.contains(k)) {
+        tags.push(RiskTag::Health);
+    }
+    if RELATIONSHIP.iter().any(|k| lc.contains(k)) {
+        tags.push(RiskTag::Relationship);
+    }
+    if LEGAL.iter().any(|k| lc.contains(k)) {
+        tags.push(RiskTag::Legal);
+    }
+    tags
 }
 
 /// The single pre-write guard for templated FACED objects. `body` is the markdown
@@ -218,10 +345,20 @@ pub fn ingest_guard(
     let GuardedText {
         value,
         redaction_status,
-        sensitivity,
+        mut sensitivity,
         risk_tags,
         sightings,
     } = gt;
+
+    // ---- domain-driven escalation (R3 most-restrictive, fail-closed) ----
+    // A high-water domain (personal/relationship/health/legal/financial/client)
+    // forces the top of the ladder regardless of content — so even prose with no
+    // detectable secret/PII cannot default-down and leak (R11 #4).
+    let high_water_domain =
+        envelope.domain.is_high_water() || envelope.domains.iter().any(|d| d.is_high_water());
+    if high_water_domain {
+        sensitivity = sensitivity.combine(&Sensitivity::Restricted);
+    }
 
     // ---- template + mandatory-tag gate (R13) ----
     // Build a temp envelope reflecting the (possibly raised) sensitivity.
@@ -235,12 +372,15 @@ pub fn ingest_guard(
     let gate = TemplateGate::new(registry);
     let template = gate.check(&env, &value, present_frontmatter_keys);
 
-    let (quarantined, mut reasons) = match &template {
+    let (mut quarantined, mut reasons) = match &template {
         GateOutcome::Pass => (false, Vec::new()),
         GateOutcome::Quarantine(rs) => (true, rs.clone()),
     };
-    // A `rejected`-class sighting (PEM/db-url) means a credential was present.
+    // A `rejected`-class sighting (PEM / db-url credentials) means a credential
+    // was present — force quarantine so a human reviews it, never silently store
+    // (R11 Codex #7: is_safe_to_persist must not stay true on a rejected secret).
     if sightings.iter().any(|s| s.action == "rejected") {
+        quarantined = true;
         reasons.push("credential-class secret detected and redacted".into());
     }
 
@@ -319,6 +459,74 @@ mod tests {
             &["title".into()],
             &reg,
         );
+        assert!(g.quarantined);
+        assert!(!g.is_safe_to_persist());
+    }
+
+    #[test]
+    fn phone_and_iban_redacted_and_classified_restricted() {
+        // R11 #5/#4: a turn with phone + IBAN but NO email/secret used to persist
+        // Clean/Internal. Now PII is redacted and Financial high-water → Restricted.
+        let g = guard_text(
+            "call Elena at +381 64 123 4567, IBAN GB82WEST12345698765432",
+            Sensitivity::Internal,
+        );
+        assert!(
+            !g.value.contains("+381 64 123 4567"),
+            "phone leaked: {}",
+            g.value
+        );
+        assert!(!g.value.contains("GB82WEST12345698765432"), "iban leaked");
+        assert_eq!(g.redaction_status, RedactionStatus::Redacted);
+        assert!(g.risk_tags.contains(&RiskTag::Financial));
+        assert_eq!(g.sensitivity, Sensitivity::Restricted);
+    }
+
+    #[test]
+    fn health_prose_classified_restricted() {
+        // R11 #4: pure health prose with no secret/PII must not default-down.
+        let g = guard_text(
+            "my HIV diagnosis is under control now",
+            Sensitivity::Internal,
+        );
+        assert!(g.risk_tags.contains(&RiskTag::Health));
+        assert_eq!(g.sensitivity, Sensitivity::Restricted);
+        // A plain work sentence stays at the declared level.
+        let work = guard_text(
+            "the staging server is healthy and deploys clean",
+            Sensitivity::Internal,
+        );
+        assert_eq!(work.sensitivity, Sensitivity::Internal);
+        assert_eq!(work.redaction_status, RedactionStatus::Clean);
+    }
+
+    #[test]
+    fn high_water_domain_forces_restricted() {
+        // R11 #4: a high-water DOMAIN (health) forces Restricted even for benign
+        // prose with no detectable marker at all.
+        let reg = TemplateRegistry::with_builtins();
+        let mut e = decision_env();
+        e.domain = altevra_core::domain::Domain::Health;
+        let g = ingest_guard(
+            "## Decision\nroutine note\n## Rationale\nnothing sensitive in the words",
+            &e,
+            &["title".into()],
+            &reg,
+        );
+        assert_eq!(g.sensitivity, Sensitivity::Restricted);
+    }
+
+    #[test]
+    fn rejected_secret_forces_quarantine() {
+        // R11 Codex #7: a credential-class (db-url) sighting must quarantine.
+        let reg = TemplateRegistry::with_builtins();
+        let g = ingest_guard(
+            "## Decision\ndb postgres://u:longpasswordvalue123@h/db\n## Rationale\nx",
+            &decision_env(),
+            &["title".into()],
+            &reg,
+        );
+        assert!(g.sightings.iter().any(|s| s.action == "rejected"));
         assert!(g.quarantined);
         assert!(!g.is_safe_to_persist());
     }

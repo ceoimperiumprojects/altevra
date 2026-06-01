@@ -150,6 +150,9 @@ pub struct ObjectIndexRow {
     pub title: Option<String>,
     pub categories: String,
     pub tags: String,
+    /// Redaction verdict from `ingest_guard` — the exposure gate fails closed on
+    /// anything other than `clean`/`redacted` (R11: was missing → fail-open).
+    pub redaction_status: String,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -166,8 +169,8 @@ impl<'a> ObjectIndexRepository<'a> {
     pub async fn upsert(&self, row: &ObjectIndexRow) -> anyhow::Result<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO object_index \
-             (type, id, status, sensitivity, domain, scope, title, categories, tags, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.object_type)
         .bind(&row.id)
@@ -178,6 +181,7 @@ impl<'a> ObjectIndexRepository<'a> {
         .bind(row.title.as_deref())
         .bind(&row.categories)
         .bind(&row.tags)
+        .bind(&row.redaction_status)
         .bind(ts_to_text(&row.updated_at))
         .execute(self.pool)
         .await?;
@@ -189,7 +193,7 @@ impl<'a> ObjectIndexRepository<'a> {
     pub async fn candidates(&self, domain: Option<&str>) -> anyhow::Result<Vec<ObjectIndexRow>> {
         let rows = if let Some(d) = domain {
             sqlx::query(
-                "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, updated_at \
+                "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at \
                  FROM object_index WHERE domain = ? ORDER BY updated_at DESC",
             )
             .bind(d)
@@ -197,7 +201,7 @@ impl<'a> ObjectIndexRepository<'a> {
             .await?
         } else {
             sqlx::query(
-                "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, updated_at \
+                "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at \
                  FROM object_index ORDER BY updated_at DESC",
             )
             .fetch_all(self.pool)
@@ -215,6 +219,7 @@ impl<'a> ObjectIndexRepository<'a> {
                 title: r.get("title"),
                 categories: r.get("categories"),
                 tags: r.get("tags"),
+                redaction_status: r.get("redaction_status"),
                 updated_at: crate::util::ts_from_text(r.get::<String, _>("updated_at")),
             })
             .collect())
@@ -263,6 +268,7 @@ mod tests {
             title: Some("A decision".into()),
             categories: "[\"gtm\"]".into(),
             tags: "[]".into(),
+            redaction_status: "clean".into(),
             updated_at: Utc::now(),
         })
         .await

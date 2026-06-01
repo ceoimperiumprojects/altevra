@@ -321,6 +321,13 @@ fn write_encrypted_map(path: &Path, key_env: &str, map: &BTreeMap<String, String
     }
     fs::write(path, hex::encode(&blob))
         .with_context(|| format!("write encrypted secrets file {}", path.display()))?;
+    // Owner-only perms (best-effort; the blob is AES-encrypted regardless). R11 #1:
+    // the captured secret never lands world-readable in plaintext.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
     Ok(())
 }
 

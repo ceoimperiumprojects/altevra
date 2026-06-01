@@ -63,3 +63,12 @@ not just protocol-shaped.
 **Note:** Cursor live spawn not separately driven, but it shares the same MCP
 server + the (now-fixed) response format, and `connect --tool cursor` config is
 verified above.
+
+## 2026-06-01 (session 2) — MCP live smoke after R11 + P0.5 + P0.6
+- `scripts/p0_mcp_smoke.sh` against release binary: **PASS**.
+  - initialize → serverInfo altevra v0.3.0 ✓
+  - tools/list → all tools present incl. gated `replay_session` / `search_turns` (R11 J) ✓
+  - tools/call `get_capabilities` → proper MCP content envelope, isError=false ✓
+- Confirms the R11 turn-read gating + P0.5/P0.6 additions did NOT break the live MCP connection.
+- `altevra resident run <mode>` live-verified separately (P0.5): personal_curator→local_private→noop(local), recorded as resident_run.
+- Pending interactive half: Cursor spawn in herdr (Claude side previously live-tested).

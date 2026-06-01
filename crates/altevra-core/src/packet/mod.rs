@@ -13,8 +13,9 @@
 //! is explained. Deterministic given the same candidates + request.
 
 use crate::envelope::Envelope;
-use crate::safety::{ExposureGate, ExposureRequest};
+use crate::safety::{DenyReason, ExposureGate, ExposureRequest};
 use crate::security::Sensitivity;
+use crate::status::RedactionStatus;
 use chrono::{DateTime, Utc};
 
 /// A candidate object for packet compilation (from `object_index`).
@@ -24,6 +25,9 @@ pub struct PacketCandidate {
     pub title: String,
     /// Governed categories + tags used for the tag-match relevance signal.
     pub categories: Vec<String>,
+    /// The candidate's redaction verdict — the gate fails closed on anything
+    /// other than clean/redacted (R11 #8: was hard-coded `None` → fail-open).
+    pub redaction_status: RedactionStatus,
 }
 
 /// The retrieval request (lightweight; full §3.4 RetrievalRequest is a superset).
@@ -59,10 +63,17 @@ pub struct ContextPacketItem {
 }
 
 /// A candidate that did NOT make it — typed, non-leaking reason.
+///
+/// For denials that would reveal the existence of a higher-classified item
+/// (over-ceiling / out-of-scope), `object_type`/`object_id` are `None` and the
+/// record is a single content-free aggregate — the precise id/type live only in
+/// the (non-exposed) `exposure_decision` audit (R11 #9 existence-leak fix). For
+/// benign exclusions the caller is otherwise allowed to see (budget, redaction,
+/// not-current), the id/type are retained.
 #[derive(Debug, Clone)]
 pub struct ExclusionRecord {
-    pub object_type: String,
-    pub object_id: String,
+    pub object_type: Option<String>,
+    pub object_id: Option<String>,
     pub reason: String, // coarse code from DenyReason or "budget_exhausted"
 }
 
@@ -82,7 +93,7 @@ impl ContextPacket {
     pub fn exclusion_reason(&self, id: &str) -> Option<&str> {
         self.excluded
             .iter()
-            .find(|e| e.object_id == id)
+            .find(|e| e.object_id.as_deref() == Some(id))
             .map(|e| e.reason.as_str())
     }
 }
@@ -102,17 +113,38 @@ impl PacketCompiler {
 
         // ---- Layer A: hard gates (ExposureGate) ----
         for c in candidates {
-            match ExposureGate::decide(&c.envelope, None, &request.exposure) {
+            match ExposureGate::decide(&c.envelope, &c.redaction_status, &request.exposure) {
                 crate::safety::ExposureDecision::Allow => {
                     let (score, why) = Self::relevance(c, request, now);
                     survivors.push((c, score, why));
                 }
                 crate::safety::ExposureDecision::Deny(reason) => {
-                    excluded.push(ExclusionRecord {
-                        object_type: c.envelope.object_type.clone(),
-                        object_id: c.envelope.id.clone(),
-                        reason: reason.code().to_string(),
-                    });
+                    // Over-ceiling / out-of-scope must NOT reveal the hidden item's
+                    // id/type/count (existence leak, R11 #9) — emit ONE content-free
+                    // aggregate per reason. Benign exclusions keep their handle.
+                    let leaks_existence = matches!(
+                        reason,
+                        DenyReason::OverSensitivityCeiling | DenyReason::OutOfScope
+                    );
+                    let code = reason.code().to_string();
+                    if leaks_existence {
+                        if !excluded
+                            .iter()
+                            .any(|e| e.object_id.is_none() && e.reason == code)
+                        {
+                            excluded.push(ExclusionRecord {
+                                object_type: None,
+                                object_id: None,
+                                reason: code,
+                            });
+                        }
+                    } else {
+                        excluded.push(ExclusionRecord {
+                            object_type: Some(c.envelope.object_type.clone()),
+                            object_id: Some(c.envelope.id.clone()),
+                            reason: code,
+                        });
+                    }
                 }
             }
         }
@@ -133,8 +165,9 @@ impl PacketCompiler {
             let tok = (c.title.len() / 4).max(1);
             if tokens_used + tok > request.token_budget && !items.is_empty() {
                 excluded.push(ExclusionRecord {
-                    object_type: c.envelope.object_type.clone(),
-                    object_id: c.envelope.id.clone(),
+                    // within ceiling+scope (a survivor) — id is safe to surface.
+                    object_type: Some(c.envelope.object_type.clone()),
+                    object_id: Some(c.envelope.id.clone()),
                     reason: "budget_exhausted".to_string(),
                 });
                 truncated = true;
@@ -236,6 +269,7 @@ mod tests {
             envelope: e,
             title: title.to_string(),
             categories: cats.iter().map(|s| s.to_string()).collect(),
+            redaction_status: RedactionStatus::Clean,
         }
     }
 
@@ -270,10 +304,62 @@ mod tests {
         let pkt = PacketCompiler::compile(&cands, &work_request(&["storage"]), now());
         assert!(pkt.includes("d1"));
         assert!(!pkt.includes("h1"));
-        assert_eq!(
-            pkt.exclusion_reason("h1"),
-            Some("items_above_ceiling_omitted")
+        // Existence not leaked: the over-ceiling item has NO per-id handle in the
+        // packet (R11 #9) — a caller cannot probe by id to confirm it exists.
+        assert_eq!(pkt.exclusion_reason("h1"), None);
+        // Only a single content-free aggregate notice is present.
+        assert!(pkt
+            .excluded
+            .iter()
+            .any(|e| e.reason == "items_above_ceiling_omitted" && e.object_id.is_none()));
+        assert!(pkt
+            .excluded
+            .iter()
+            .all(|e| e.object_id.as_deref() != Some("h1")));
+    }
+
+    #[test]
+    fn unscanned_candidate_excluded_redaction_insufficient() {
+        // R11 #8: an unscanned object within ceiling+scope must be denied at the
+        // redaction gate, not exposed (the gate used to receive None and skip it).
+        let mut c = cand(
+            "u1",
+            Domain::Business,
+            Sensitivity::Internal,
+            &["x"],
+            "Unscanned note",
         );
+        c.redaction_status = RedactionStatus::Unscanned;
+        let pkt = PacketCompiler::compile(&[c], &work_request(&["x"]), now());
+        assert!(!pkt.includes("u1"));
+        // within ceiling+scope, so the id may be surfaced (not an existence leak).
+        assert_eq!(pkt.exclusion_reason("u1"), Some("redaction_insufficient"));
+    }
+
+    #[test]
+    fn over_ceiling_and_superseded_item_does_not_leak_id() {
+        // R11 re-verify: a Restricted item that is ALSO superseded must still be
+        // denied for the CEILING (content-free aggregate), not NotCurrent (which
+        // would surface its id/type). Gate now checks ceiling before lifecycle.
+        let mut c = cand(
+            "h_old",
+            Domain::Health,
+            Sensitivity::Restricted,
+            &["x"],
+            "old health note",
+        );
+        c.envelope.status = crate::status::ObjectStatus::Superseded;
+        let pkt = PacketCompiler::compile(&[c], &work_request(&["x"]), now());
+        assert!(!pkt.includes("h_old"));
+        assert_eq!(
+            pkt.exclusion_reason("h_old"),
+            None,
+            "id leaked via NotCurrent"
+        );
+        assert!(pkt
+            .excluded
+            .iter()
+            .all(|e| e.object_id.as_deref() != Some("h_old")));
     }
 
     #[test]

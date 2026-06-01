@@ -3,6 +3,76 @@
 > Live task tracker for the autonomous run. Top = morning handoff summary. Below = per-task log.
 > Authority: `OVERNIGHT_GOAL.md` + `RECONCILIATION.md` (R1–R14) + `BUILD_TASKS.md`.
 
+## 🛑 R11 SAFETY GATE — found leaks, fixed them (2026-06-01 afternoon)
+
+**The "P0.1 core done / leak suites = 0" claim was only true for the tested fixtures.**
+A real cross-engine adversarial pass (3 Claude lenses + Codex — the R11 gate that was
+never properly run) found the gate had **multiple critical raw-data-leak paths**. All
+critical/high findings are now FIXED + regression-tested; baseline fully green.
+
+Commits: `888c360` (detector regex gaps), `05fdfe4` (PII + high-water classification +
+PEM block + quarantine), `b56ade1` (exposure_gate fail-closed + no existence leak),
+`dde2c40` (scan tool_calls/file_changes + persist verdict + gate turn reads).
+
+Cross-engine consensus must-fix list (A–L) — status:
+- A detector missed `sk-proj-`/Stripe/`postgresql://`/AIza/AWS-STS/npm/Slack-webhook/Bearer → FIXED
+- B db_url leaked password-after-first-`@` → FIXED (captures whole user:pass)
+- C PEM redacted header only (key body leaked) → FIXED (full BEGIN..END block)
+- D PII was email-only → FIXED (`altevra-secrets/pii.rs`: phone/IBAN-mod97/card-Luhn)
+- E health/personal prose default-DOWN to Internal → FIXED (high-water tags/domain → Restricted)
+- F `tool_calls`/`file_changes` persisted RAW → FIXED (`guard_json` recursive scrub)
+- G exposure_gate FAIL-OPEN on `None` redaction → FIXED (mandatory `&RedactionStatus`)
+- H ExclusionRecord leaked id/type of denied items → FIXED (content-free aggregate)
+- I turns dropped sensitivity/redaction verdict → FIXED (migration 026 + persist)
+- J MCP replay/search ungated → FIXED (`turn_exposable` work-ceiling gate)
+- K import used secrets-only redact(); `--no-redact` silent bypass → FIXED
+- L rejected-class sighting didn't quarantine → FIXED
+- M auto_capture vaults raw secret (by-design encrypted store) — confirm store perms (low)
+
+Re-verification (Claude red-team v2 + Codex) PROVED the leaks closed. Migration
+numbering shifted: 026 = safety_columns (turns+object_index); 027 = resident (P0.5);
+028 = proposals (P0.6); P0.8 projects will own 029.
+
+### R11 re-verify result (round 2) — CLOSED
+Cross-engine re-verify found regressions the round-1 patches introduced + residuals.
+All fixed in `61645a6`: PEM body-when-no-footer (CRITICAL), db_url slash-in-password
+(HIGH), `turn record` side-channel raw persist (HIGH, Codex), exposure_gate order
+(over-ceiling+superseded id leak), generic `access_key=`, spaced/lowercase IBAN,
+keyword net, 0o600 secrets file. Codex verdict moved FAIL→8/10-closed→(after fixes)
+clean; Claude verifiers re-run clean. **R11 gate CLOSED.**
+
+## 🚀 SESSION 2 PROGRESS (2026-06-01 afternoon → P0.5/P0.6)
+
+**P0.5 resident runtime — DONE** (`2a942e4`). The "just add keys" seam:
+- migration 027: resident_run cols on brain_jobs (R10); resident_modes (8 builtins
+  seeded, MOD-2) + resident_budgets. personal_curator=local_private (SI-7).
+- core::resident (ResidentMode/Output, SI-7 validate, SI-14 schema parse);
+  db::ResidentRepository; brain::ResidentRunner (noop dry-run, proposal-only SI-6).
+- CLI `altevra resident run <mode>` — LIVE-verified: personal_curator→local_private→
+  noop(local), recorded as resident_run. Every role→noop until keys; keys flip live.
+
+**P0.6 self-improve risk model + runaway firewall — CORE DONE** (`b836bc3`):
+- migration 028: proposals (kind discriminator, dedup) + improvement_signals +
+  prompts (safety/altevra_rules locked, SI-2) + prompt_eval_results (SI-10).
+- core::selfimprove: derive_risk_tier (SI-9) + firewall_check — pure Rust below the
+  LLM enforcing kill/constitutional-lock(SI-2)/no-Tier1-2-auto(SI-2)/circuit(SI-11)/
+  budget/Tier-0-cap(SI-12)/cooldown(SI-13)/shadow-eval(SI-10)/injection-proof(SI-15).
+  Full runaway suite green.
+- Remainder (noop-stubbed / LLM-wired): proposals repo + 7-stage orchestration +
+  prompt registry render/rollback (T6.2/T6.5 LLM-driven half).
+
+### ⬜ Still pending (exact plan in GAP_MAP.json)
+- **P0.3** control plane CLI/MCP verbs (sot/redact/review/forget/audit/capabilities/
+  adapter/grant/component + doctor checks + MCP ceiling enforcement + HP-1 test). No migration.
+- **P0.4** FTS5 substrate (T1.14b) + wire PacketCompiler into live CLI `context`/MCP
+  `get_context_packet` (T-INV14) + golden eval harness + retrieval profiles. (legacy
+  scan_vault still serves live retrieval; packet compiler not yet wired live.)
+- **P0.7** skill factory (proposer mode + post-approval render path + Hermes adapter).
+- **P0.8** migration 029 projects/person/relationship/preference + DomainPolicy repo +
+  lifecycle job + export/forget/legal-hold CLI (presence-gated) + Imperium mirror writer.
+- **P0.9** per-domain cloud_sync ceiling selector + tombstone model.
+- **Cursor live spawn** in herdr (Claude side live-tested; Cursor pending).
+
 ## ☀️ MORNING HANDOFF (read this first)
 
 **Brate — sve commitovano, sve zeleno, LIVE TESTIRANO, i PUSH-ovano na GitHub.** 🔥

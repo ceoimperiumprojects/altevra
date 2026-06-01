@@ -146,6 +146,8 @@ mod tests {
             file_changes: None,
             redacted_count: 0,
             source_tool: Some("claude-code".into()),
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
             created_at: Utc::now(),
         };
         repo.record_turn(&t).await.unwrap();

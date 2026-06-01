@@ -10,24 +10,34 @@ use std::sync::OnceLock;
 /// The kind of secret a detector pattern matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SecretKind {
-    /// OpenAI API key (`sk-...`).
+    /// OpenAI API key — legacy `sk-...` AND modern `sk-proj-`/`sk-svcacct-`/`sk-admin-`.
     OpenAIKey,
     /// Anthropic API key (`sk-ant-...`).
     AnthropicKey,
-    /// AWS access key id (`AKIA...`).
+    /// Stripe secret/restricted key (`sk_live_`, `sk_test_`, `rk_live_`, `rk_test_`).
+    StripeKey,
+    /// AWS access key id (`AKIA`, `ASIA`, `AROA`, `AIDA`, ...).
     AwsAccessKey,
+    /// Google API key (`AIza...`).
+    GoogleApiKey,
+    /// npm access token (`npm_...`).
+    NpmToken,
     /// GitHub personal access token (`ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`,
     /// or `github_pat_...`).
     GitHubToken,
     /// Slack token (`xoxb-`, `xoxp-`, `xoxa-`, `xoxr-`, `xoxs-`).
     SlackToken,
-    /// Generic `api_key=`, `secret=`, or `token=` assignment.
+    /// Slack incoming-webhook URL (`hooks.slack.com/services/...`).
+    SlackWebhook,
+    /// Generic `api_key=`, `secret=`, `token=`, `password=`, `client_secret=` assignment.
     GenericApiKey,
+    /// `Authorization: Bearer <token>` header value.
+    BearerToken,
     /// JSON Web Token (`eyJ...eyJ...`).
     JwtToken,
     /// PEM private key header.
     PrivateKey,
-    /// Database connection URL with embedded password.
+    /// Database connection URL with embedded credentials (`user:pass@`).
     DatabaseUrl,
 }
 
@@ -40,7 +50,8 @@ pub struct SecretMatch {
     /// Byte offset (exclusive) where the matched fragment ends.
     pub end: usize,
     /// The substring that should be redacted. For `DatabaseUrl` this is the
-    /// password only, not the entire URL.
+    /// whole `user:pass` credential segment (so a password containing `@`
+    /// cannot partially leak), not the entire URL.
     pub matched: String,
 }
 
@@ -49,11 +60,16 @@ pub struct SecretMatch {
 struct Patterns {
     openai: Regex,
     anthropic: Regex,
+    stripe: Regex,
     aws: Regex,
+    google: Regex,
+    npm: Regex,
     github_prefix: Regex,
     github_pat: Regex,
     slack: Regex,
+    slack_webhook: Regex,
     generic: Regex,
+    bearer: Regex,
     jwt: Regex,
     private_key: Regex,
     db_url: Regex,
@@ -63,19 +79,47 @@ fn patterns() -> &'static Patterns {
     static CELL: OnceLock<Patterns> = OnceLock::new();
     CELL.get_or_init(|| Patterns {
         // Anthropic check happens first; OpenAI must not absorb `sk-ant-`.
-        openai: Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap(),
+        // OpenAI: legacy `sk-<alnum>` AND modern `sk-proj-`/`sk-svcacct-`/`sk-admin-`
+        // (those contain hyphens), so the char class allows `_-` after `sk-`.
+        openai: Regex::new(r"sk-[A-Za-z0-9_-]{20,}").unwrap(),
         anthropic: Regex::new(r"sk-ant-[A-Za-z0-9_\-]{20,}").unwrap(),
-        aws: Regex::new(r"AKIA[0-9A-Z]{16}").unwrap(),
+        // Stripe secret/restricted keys (underscore form — distinct from OpenAI's dash).
+        stripe: Regex::new(r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}").unwrap(),
+        // AWS access-key ids: long-term (AKIA) + temporary/STS (ASIA) + role/user/etc.
+        aws: Regex::new(r"(?:AKIA|ASIA|AROA|AIDA|AGPA|ANPA|ANVA|AIPA)[0-9A-Z]{16}").unwrap(),
+        google: Regex::new(r"AIza[0-9A-Za-z_\-]{35}").unwrap(),
+        npm: Regex::new(r"npm_[A-Za-z0-9]{36}").unwrap(),
         github_prefix: Regex::new(r"(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36}").unwrap(),
         github_pat: Regex::new(r"github_pat_[A-Za-z0-9_]{82}").unwrap(),
         slack: Regex::new(r"xox[bpars]-[A-Za-z0-9-]{10,}").unwrap(),
+        slack_webhook: Regex::new(r"hooks\.slack\.com/services/[A-Za-z0-9/_+-]{20,}").unwrap(),
+        // Leading `[\w-]*?` lets trailing-token forms match (`aws_secret_access_key=`,
+        // `gcp_api_key=`) — the bare keyword alternation alone missed them.
         generic: Regex::new(
-            r#"(?i)(api[-_]?key|secret|token)\s*[=:]\s*['"]?([A-Za-z0-9_+/=\-]{20,})"#,
+            r#"(?i)([\w-]*?(?:api[-_]?key|secret|token|password|passwd|pwd|client[-_]?secret|access[-_]?key|apikey))\s*[=:]\s*['"]?([A-Za-z0-9_+/=\-]{20,})"#,
         )
         .unwrap(),
+        bearer: Regex::new(r"(?i)bearer\s+([A-Za-z0-9_\-./=+]{20,})").unwrap(),
         jwt: Regex::new(r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+").unwrap(),
-        private_key: Regex::new(r"-----BEGIN [A-Z ]*PRIVATE KEY-----").unwrap(),
-        db_url: Regex::new(r"(postgres|mysql|mongodb)://[^:\s]+:([^@\s]+)@").unwrap(),
+        // Match the WHOLE PEM block (header → base64 body → footer), not just the
+        // header line — otherwise the key material leaks (R11 Codex #3 + re-verify).
+        // `(?s)` so `.` spans newlines. Two alternatives: (1) header..END footer
+        // when present; (2) header + the trailing base64 body when the footer is
+        // ABSENT (truncated/streamed paste) — without (2) a header-only paste
+        // redacted just the 27-byte header and leaked the whole body.
+        private_key: Regex::new(
+            r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|(?:[\r\n]+[A-Za-z0-9+/=]{16,})+)?",
+        )
+        .unwrap(),
+        // Capture the FULL `user:pass` credential segment (greedy up to the LAST `@`
+        // before the host). The password class must allow `/` and `@` (common in
+        // un-percent-encoded base64 passwords) — restricting it to `[^/\s]` leaked
+        // any DB password containing a slash (re-verify HIGH). The trailing host
+        // token (no `/@:` ) anchors the final `@`.
+        db_url: Regex::new(
+            r"(?:postgres|postgresql|mysql|mongodb|mongodb\+srv|redis|rediss|amqp|amqps)://([^\s]+:[^\s]+)@[^\s/@:?#]+",
+        )
+        .unwrap(),
     })
 }
 
@@ -109,9 +153,33 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
             matched: m.as_str().to_string(),
         });
     }
+    for m in p.stripe.find_iter(text) {
+        out.push(SecretMatch {
+            kind: SecretKind::StripeKey,
+            start: m.start(),
+            end: m.end(),
+            matched: m.as_str().to_string(),
+        });
+    }
     for m in p.aws.find_iter(text) {
         out.push(SecretMatch {
             kind: SecretKind::AwsAccessKey,
+            start: m.start(),
+            end: m.end(),
+            matched: m.as_str().to_string(),
+        });
+    }
+    for m in p.google.find_iter(text) {
+        out.push(SecretMatch {
+            kind: SecretKind::GoogleApiKey,
+            start: m.start(),
+            end: m.end(),
+            matched: m.as_str().to_string(),
+        });
+    }
+    for m in p.npm.find_iter(text) {
+        out.push(SecretMatch {
+            kind: SecretKind::NpmToken,
             start: m.start(),
             end: m.end(),
             matched: m.as_str().to_string(),
@@ -141,6 +209,14 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
             matched: m.as_str().to_string(),
         });
     }
+    for m in p.slack_webhook.find_iter(text) {
+        out.push(SecretMatch {
+            kind: SecretKind::SlackWebhook,
+            start: m.start(),
+            end: m.end(),
+            matched: m.as_str().to_string(),
+        });
+    }
     for m in p.jwt.find_iter(text) {
         out.push(SecretMatch {
             kind: SecretKind::JwtToken,
@@ -148,6 +224,17 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
             end: m.end(),
             matched: m.as_str().to_string(),
         });
+    }
+    // `Authorization: Bearer <token>` — report the token value group only.
+    for caps in p.bearer.captures_iter(text) {
+        if let Some(val) = caps.get(1) {
+            out.push(SecretMatch {
+                kind: SecretKind::BearerToken,
+                start: val.start(),
+                end: val.end(),
+                matched: val.as_str().to_string(),
+            });
+        }
     }
     for m in p.private_key.find_iter(text) {
         out.push(SecretMatch {
@@ -168,14 +255,15 @@ pub fn detect_secrets(text: &str) -> Vec<SecretMatch> {
             });
         }
     }
-    // Database URLs — capture password only.
+    // Database URLs — redact the WHOLE `user:pass` credential segment (group 1),
+    // not just the password, so a password containing `@` cannot partially leak.
     for caps in p.db_url.captures_iter(text) {
-        if let Some(pw) = caps.get(2) {
+        if let Some(cred) = caps.get(1) {
             out.push(SecretMatch {
                 kind: SecretKind::DatabaseUrl,
-                start: pw.start(),
-                end: pw.end(),
-                matched: pw.as_str().to_string(),
+                start: cred.start(),
+                end: cred.end(),
+                matched: cred.as_str().to_string(),
             });
         }
     }
@@ -303,18 +391,169 @@ mod tests {
     }
 
     #[test]
-    fn detects_db_url_password_only() {
+    fn private_key_redacts_whole_block_not_just_header() {
+        let pem = "before\n-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8\nAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\nafter";
+        let red = crate::redactor::redact(pem);
+        // The base64 body and footer must be gone, not just the header.
+        assert!(!red.contains("MIIBVwIBAD"), "key body leaked: {red}");
+        assert!(!red.contains("END PRIVATE KEY"), "footer leaked: {red}");
+        assert!(red.starts_with("before"));
+        assert!(red.trim_end().ends_with("after"));
+    }
+
+    #[test]
+    fn private_key_redacts_body_when_footer_missing() {
+        // Header-only paste (no END footer) must still swallow the base64 body
+        // (re-verify CRITICAL: the optional-footer group matched zero body chars).
+        let pem = "key:\n-----BEGIN PRIVATE KEY-----\nMIIBVwIBADANBgkqLEAKEDBODYw0BAQEF\nAAAAAAAAAAAAAAAA\nthen prose";
+        let red = crate::redactor::redact(pem);
+        assert!(
+            !red.contains("LEAKEDBODY"),
+            "body leaked when footer absent: {red}"
+        );
+        assert!(red.contains("then prose"));
+    }
+
+    #[test]
+    fn db_url_password_with_slash_fully_redacted() {
+        // A password containing '/' (un-percent-encoded base64) must not leak
+        // (re-verify HIGH: the password class forbade '/').
+        let cases = [
+            (
+                "postgresql://admin:Xy9/aBc+dEf2gHi@host/db",
+                "Xy9/aBc+dEf2gHi",
+            ),
+            ("postgres://user:pa/ss@host/db", "pa/ss"),
+            ("redis://default:abc/def/ghi@h:6379", "abc/def/ghi"),
+        ];
+        for (url, secret) in cases {
+            let hits = detect_secrets(url);
+            assert!(
+                hits.iter().any(|h| h.kind == SecretKind::DatabaseUrl),
+                "db url not detected: {url}"
+            );
+            let red = crate::redactor::redact(url);
+            assert!(!red.contains(secret), "slash password leaked: {red}");
+        }
+    }
+
+    #[test]
+    fn detects_trailing_token_access_key_assignment() {
+        for s in [
+            "aws_secret_access_key=ABCDEFGHIJKLMNOPQRSTUV",
+            "GCP_API_KEY=ABCDEFGHIJKLMNOPQRSTUV",
+        ] {
+            let hits = detect_secrets(s);
+            assert!(
+                hits.iter().any(|h| h.kind == SecretKind::GenericApiKey),
+                "missed trailing-token assignment: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_db_url_credentials() {
         let url = "postgres://user:hunter2pw@localhost:5432/db";
         let hits = detect_secrets(url);
         let db = hits
             .iter()
             .find(|h| h.kind == SecretKind::DatabaseUrl)
             .expect("expected db url match");
-        assert_eq!(db.matched, "hunter2pw");
+        // The WHOLE user:pass segment is captured (not just the password).
+        assert_eq!(db.matched, "user:hunter2pw");
 
         // No password section — must not match.
         let neg = detect_secrets("postgres://localhost:5432/db");
         assert!(neg.iter().all(|h| h.kind != SecretKind::DatabaseUrl));
+    }
+
+    #[test]
+    fn db_url_password_with_at_does_not_partially_leak() {
+        // A password containing `@` must be fully captured up to the LAST `@`.
+        let url = "postgres://user:p@sswithat@host/db";
+        let hits = detect_secrets(url);
+        let db = hits
+            .iter()
+            .find(|h| h.kind == SecretKind::DatabaseUrl)
+            .expect("expected db url match");
+        assert_eq!(db.matched, "user:p@sswithat");
+        // The redactor must leave NO part of the password behind.
+        let red = crate::redactor::redact(url);
+        assert!(!red.contains("sswithat"), "password leaked: {red}");
+        assert!(red.contains("@host/db"));
+    }
+
+    #[test]
+    fn detects_postgresql_full_scheme_and_other_schemes() {
+        for url in [
+            "postgresql://u:longpasswordvalue123@h/db",
+            "mongodb+srv://u:longpasswordvalue123@h/db",
+            "redis://u:longpasswordvalue123@h:6379",
+        ] {
+            let hits = detect_secrets(url);
+            assert!(
+                hits.iter().any(|h| h.kind == SecretKind::DatabaseUrl),
+                "missed db scheme: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_modern_openai_project_and_service_keys() {
+        // Assembled at compile time (concat!) so the source carries no contiguous
+        // secret literal — keeps GitHub push-protection happy for a detector that,
+        // by nature, must test real key shapes.
+        for key in [
+            concat!("sk-", "proj-", "T3BlbkFJabcdefghijklmnop0123456789"),
+            concat!("sk-", "svcacct-", "abcdefghijklmnop0123456789XYZ"),
+            concat!("sk-", "admin-", "abcdefghijklmnop0123456789XYZ"),
+        ] {
+            let hits = detect_secrets(key);
+            assert!(
+                hits.iter().any(|h| h.kind == SecretKind::OpenAIKey),
+                "missed modern OpenAI key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_stripe_keys() {
+        for key in [
+            concat!("sk", "_live_", "abcdefghijklmnop01234567"),
+            concat!("sk", "_test_", "abcdefghijklmnop01234567"),
+            concat!("rk", "_live_", "abcdefghijklmnop01234567"),
+        ] {
+            let hits = detect_secrets(key);
+            assert!(
+                hits.iter().any(|h| h.kind == SecretKind::StripeKey),
+                "missed Stripe key: {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn detects_google_and_aws_sts_and_npm() {
+        let g = detect_secrets(concat!("AI", "za", "SyA1234567890abcdefghijklmnopqrstuv0"));
+        assert!(g.iter().any(|h| h.kind == SecretKind::GoogleApiKey));
+        // STS temporary credentials (ASIA prefix) — previously missed.
+        let a = detect_secrets("ASIAIOSFODNN7EXAMPLE");
+        assert!(a.iter().any(|h| h.kind == SecretKind::AwsAccessKey));
+        let n = detect_secrets(&format!("npm_{}", "a".repeat(36)));
+        assert!(n.iter().any(|h| h.kind == SecretKind::NpmToken));
+    }
+
+    #[test]
+    fn detects_slack_webhook_and_bearer_and_password_assignment() {
+        let w = detect_secrets(concat!(
+            "https://hooks.slack.com/",
+            "services/",
+            "T00000000/B00000000/abcdefABCDEF1234"
+        ));
+        assert!(w.iter().any(|h| h.kind == SecretKind::SlackWebhook));
+        let b = detect_secrets("Authorization: Bearer abcdefghijklmnop0123456789");
+        assert!(b.iter().any(|h| h.kind == SecretKind::BearerToken));
+        let p = detect_secrets("password=correcthorsebatterystaple1");
+        assert!(p.iter().any(|h| h.kind == SecretKind::GenericApiKey));
     }
 
     #[test]

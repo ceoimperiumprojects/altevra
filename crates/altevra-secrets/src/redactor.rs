@@ -67,14 +67,16 @@ mod tests {
     }
 
     #[test]
-    fn redact_db_url_strips_password_only() {
+    fn redact_db_url_strips_credentials() {
         let text = "DATABASE_URL=postgres://app:supersecret@db.example.com:5432/prod";
         let redacted = redact(text);
         // Password is gone.
         assert!(!redacted.contains("supersecret"));
-        // Structural parts of the URL still present.
-        assert!(redacted.contains("postgres://app:"));
+        // The whole user:pass credential segment is redacted (fail-closed); the
+        // host/path structure is preserved so the URL is still recognisable.
+        assert!(redacted.contains("postgres://"));
         assert!(redacted.contains("@db.example.com:5432/prod"));
+        assert!(!redacted.contains("app:supersecret"));
     }
 
     #[test]

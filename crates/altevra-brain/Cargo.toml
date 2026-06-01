@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 altevra-core = { workspace = true }
 altevra-db = { workspace = true }
+altevra-llm = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
 altevra-vault = { workspace = true }
@@ -22,3 +23,4 @@ sqlx = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+async-trait = { workspace = true }

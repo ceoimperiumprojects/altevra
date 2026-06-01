@@ -84,10 +84,12 @@ version = "0.1.0"
 dependencies = [
  "altevra-core",
  "altevra-db",
+ "altevra-llm",
  "altevra-memory",
  "altevra-research",
  "altevra-vault",
  "anyhow",
+ "async-trait",
  "chrono",
  "reqwest",
  "serde",

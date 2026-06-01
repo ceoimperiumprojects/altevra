@@ -66,13 +66,18 @@ pub fn derive_key_name(kind: SecretKind, value: &str) -> String {
     let prefix = match kind {
         SecretKind::OpenAIKey => "openai_key",
         SecretKind::AnthropicKey => "anthropic_key",
+        SecretKind::StripeKey => "stripe_key",
         SecretKind::AwsAccessKey => "aws_access_key",
+        SecretKind::GoogleApiKey => "google_key",
+        SecretKind::NpmToken => "npm_token",
         SecretKind::GitHubToken => "github_token",
         SecretKind::SlackToken => "slack_token",
+        SecretKind::SlackWebhook => "slack_webhook",
         SecretKind::GenericApiKey => "api_key",
+        SecretKind::BearerToken => "bearer_token",
         SecretKind::JwtToken => "jwt_token",
         SecretKind::PrivateKey => "private_key",
-        SecretKind::DatabaseUrl => "db_password",
+        SecretKind::DatabaseUrl => "db_credentials",
     };
     format!("{prefix}_{}", fingerprint8(value))
 }
