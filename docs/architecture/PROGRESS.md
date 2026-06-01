@@ -5,7 +5,7 @@
 
 ## Morning handoff (updated as run progresses)
 
-- **Status:** P0.0 done. P0.1 in progress — schema (019-022) ✅, PreWriteSafetyGate ✅. NEXT: presence gate (T1.10), ExposureGate (T1.11), repos for new tables (T1.12), route writes through guard (T1.13), vault mirror (T1.14), tag/FTS5/graph packet compiler (T1.15), p0-vertical-smoke (T1.18).
+- **Status:** P0.1 VERTICAL LOOP PROVEN ✅ — `p0_vertical_smoke` passes end-to-end. Whole workspace green (fmt + clippy --all-targets -D warnings + all tests). NEXT (P0.1 hardening + onward): presence gate (T1.10), proper repo layer for new tables (T1.12/T1.13), vault mirror renderer (T1.14), full tag/FTS5/graph packet compiler as a real module not just the smoke (T1.15), then P0.2 capability registry.
 - **Done & committed:** baseline fix; P0.0 core types (Sensitivity 6-level, Domain+RiskTag, 6 status families, Envelope, Template+9 builtins+TemplateGate, contract-validation, fixtures); P0.1 schema migrations 019-022 (envelope backfill, relations, object_index, learnings, insight_cards, secret_sightings, audit_log, exposure_decisions, context_packets); **PreWriteSafetyGate (altevra-secrets/ingest_guard.rs)** — detect→redact→classify→template-gate, fail-closed.
 - **Live-tested:** (after P0.3)
 - **Awaits API keys:** (P0.5+ resident/LLM — not reached yet)
@@ -21,7 +21,7 @@
 |---|---|---|
 | Baseline | ✅ green | flaky env test fixed (mutex-serialized) |
 | P0.0 contracts+enums+templates | ✅ done | T0.1–T0.10; 81 tests |
-| P0.1 vertical loop | 🔄 in progress | schema 019-022 ✅, PreWriteSafetyGate ✅; next: presence/ExposureGate/repos/packet/smoke |
+| P0.1 vertical loop | 🟩 spine proven | schema 019-022 ✅, PreWriteSafetyGate ✅, ExposureGate ✅, p0_vertical_smoke ✅; hardening left (repos/vault-mirror/full-packet-module/presence) |
 | P0.1 vertical loop | ⬜ pending | |
 | P0.2 capability registry | ⬜ pending | |
 | P0.3 control plane | ⬜ pending | |

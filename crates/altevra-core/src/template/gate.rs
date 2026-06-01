@@ -97,7 +97,6 @@ impl<'a> TemplateGate<'a> {
 mod tests {
     use super::*;
     use crate::envelope::{Envelope, Provenance, ProvenanceOrigin};
-    use crate::security::Sensitivity;
     use chrono::{DateTime, Utc};
 
     fn now() -> DateTime<Utc> {
