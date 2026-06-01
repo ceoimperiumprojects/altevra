@@ -1,5 +1,7 @@
 pub mod classifier;
 pub mod config;
+pub mod domain;
+pub mod envelope;
 pub mod errors;
 pub mod events;
 pub mod observer;
@@ -7,8 +9,12 @@ pub mod paths;
 pub mod prompts;
 pub mod retrieval;
 pub mod security;
+pub mod status;
+pub mod template;
 pub mod updates;
 
+pub use domain::{Domain, RiskTag};
+pub use envelope::{Confidence, Envelope, HasEnvelope, Provenance, ProvenanceOrigin};
 pub use errors::AltevraError;
 pub use observer::{
     detect_decision_conflict, detect_high_session_volume, detect_low_task_velocity,
@@ -17,3 +23,8 @@ pub use observer::{
 };
 pub use paths::{default_db_path, DEFAULT_DB_PATH};
 pub use security::Sensitivity;
+pub use status::{
+    CapabilityState, LifecycleState, ObjectStatus, ProposalStatus, RedactionStatus, ReviewStatus,
+};
+pub use template::gate::{GateOutcome, TemplateGate};
+pub use template::{Template, TemplateRegistry};
