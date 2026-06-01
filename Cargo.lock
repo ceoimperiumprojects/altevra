@@ -46,6 +46,7 @@ version = "0.1.0"
 dependencies = [
  "altevra-core",
  "altevra-hooks",
+ "altevra-secrets",
  "altevra-skills",
  "anyhow",
  "chrono",

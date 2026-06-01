@@ -7,6 +7,7 @@ edition = "2021"
 altevra-core = { workspace = true }
 altevra-skills = { workspace = true }
 altevra-hooks = { workspace = true }
+altevra-secrets = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
