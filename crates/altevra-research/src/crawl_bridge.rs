@@ -213,9 +213,16 @@ fn parse_scrape_output(stdout: &[u8], url: &str) -> anyhow::Result<CrawlResult> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serialize the two tests that mutate IMPERIUM_CRAWL_PATH — process env is
+    // global, so running them in parallel races (one removes while the other
+    // sets/reads). Same pattern as paths.rs ENV_LOCK.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn spec_defaults_to_npx() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("IMPERIUM_CRAWL_PATH");
         let s = imperium_crawl_spec();
         assert!(matches!(s, ImperiumCrawlSpec::Npx));
@@ -224,6 +231,7 @@ mod tests {
 
     #[test]
     fn spec_picks_up_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("IMPERIUM_CRAWL_PATH", "/tmp/dist/index.js");
         let s = imperium_crawl_spec();
         assert!(matches!(s, ImperiumCrawlSpec::LocalNode(_)));
