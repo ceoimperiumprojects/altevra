@@ -1,3 +1,16 @@
+<!-- ───────────────────────────────────────────────────────────────────────
+  ⚠️ PARTIALLY SUPERSEDED (2026-06-01)
+
+  The storage-engine sections of this document (Postgres / pgvector) are
+  SUPERSEDED. Altevra P0 is **SQLite local-first canonical**; Postgres/pgvector
+  is a future opt-in cloud adapter only. See `docs/architecture/RECONCILIATION.md`
+  (R10) and the deep architecture sections in
+  `docs/architecture/ALTEVRA_ARCHITECTURE_WORKING_DRAFT.md`.
+
+  Read this V5 doc for product/feature vision; for the binding P0 data/storage
+  contracts use the reconciled architecture docs, not the Postgres text here.
+─────────────────────────────────────────────────────────────────────── -->
+
 # Altevra Production Architecture v5
 
 > CLI-first. Rust-first. Local-first. MCP-compatible.  

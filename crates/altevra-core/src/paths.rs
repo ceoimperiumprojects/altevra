@@ -26,9 +26,16 @@ pub fn default_db_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `ALTEVRA_DB_PATH` is process-global; Rust runs tests in parallel threads,
+    // so concurrent set/remove on the same var races and makes assertions flaky.
+    // Serialize every env-mutating test through one lock.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // Helper to run a closure with a temporary env var set, restoring afterwards.
     fn with_env<F: FnOnce() -> R, R>(key: &str, value: Option<&str>, f: F) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var(key).ok();
         match value {
             Some(v) => std::env::set_var(key, v),
