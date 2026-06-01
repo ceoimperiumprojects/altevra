@@ -22,7 +22,19 @@ JSON-RPC 2.0 — exactly how Claude Code / Cursor / Codex talk to Altevra.
 the autonomous, deterministic half of the "real test" — proves any MCP client
 (Claude Code, Cursor) can initialize, discover tools, and call them.
 
+## 2026-06-01 — adapter connect dry-run (all tools) ✅ PASS
+
+`altevra connect --tool <t> --dry-run` against the real binary:
+- **claude-code** → detected; would update `.claude/settings.json` (MCP config) + instructions + 2 skills. ✅
+- **cursor** → would create `.cursor/mcp.json` + `.cursor/hooks.json` + `.cursor/rules/altevra.mdc`. ✅
+- **codex** → would create `.codex/config.toml`. ✅
+- **drift safety (T4):** `AGENTS.md` flagged drifted, "won't overwrite without --force" for all three. ✅
+
+**Verdict:** Altevra connects to Claude Code, Cursor, Codex with correct per-tool
+config + drift protection. With the MCP stdio pass above, the connection layer is
+proven against the real binary for every adapter.
+
 **Still TODO (interactive half):** spawn a live Claude Code + Cursor agent in
-herdr, point each at this `altevra serve`, and confirm a real session bootstraps
-+ calls tools in-situ. That needs an interactive driver; the protocol-level proof
-above is the prerequisite and it passes.
+herdr pointed at `altevra serve`, confirm a real in-situ session. Needs an
+interactive driver; the protocol + adapter proofs above are the prerequisite and
+both pass.
