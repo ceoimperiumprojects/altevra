@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod classifier;
 pub mod config;
 pub mod domain;
@@ -16,6 +17,7 @@ pub mod status;
 pub mod template;
 pub mod updates;
 
+pub use capability::{Support, TrustLevel};
 pub use domain::{Domain, RiskTag};
 pub use envelope::{Confidence, Envelope, HasEnvelope, Provenance, ProvenanceOrigin};
 pub use errors::AltevraError;
