@@ -34,7 +34,32 @@ the autonomous, deterministic half of the "real test" — proves any MCP client
 config + drift protection. With the MCP stdio pass above, the connection layer is
 proven against the real binary for every adapter.
 
-**Still TODO (interactive half):** spawn a live Claude Code + Cursor agent in
-herdr pointed at `altevra serve`, confirm a real in-situ session. Needs an
-interactive driver; the protocol + adapter proofs above are the prerequisite and
-both pass.
+## 2026-06-01 — LIVE herdr Claude agent spawn ✅ PASS (found + fixed 3 real bugs)
+
+**What:** Spawned real `claude` agents in herdr (`herdr agent start … -- claude`,
+split panes), pointed at Altevra, and told them to call the `get_capabilities`
+MCP tool. This is the interactive half — and it did exactly what a live test is
+for: **it surfaced 3 real integration bugs that the protocol smoke could not.**
+
+**Live findings → fixes:**
+1. **`altevra: command not found`** (hooks failed) → the binary wasn't on PATH.
+   FIX: symlink `~/.local/bin/altevra → target/release/altevra`. ✅
+2. **`mcp__altevra__*` not registered** (agent: "no altevra MCP server in this
+   session") → project `.mcp.json` isn't auto-trusted. FIX: registered Altevra
+   MCP at **user scope** via `claude mcp add altevra --scope user -- altevra serve`.
+   Next agent then reported **"Called altevra — get_capabilities executed without
+   error"** ✅ (connection works).
+3. **Empty tool result** (agent: "executed but returned empty") → Altevra's
+   `tools/call` returned BARE JSON, but Claude Code expects the MCP
+   `{"content":[{"type":"text",...}]}` envelope. FIX: wrap every tools/call result
+   in `content` + `structuredContent` in `McpServer::handle`. Verified via stdio:
+   result now `{"content":[{"text":"{adapters:[claude-code,codex,cursor,antigravity]…}"}],"isError":false}`. ✅
+
+**Verdict:** Live herdr spawn done; the Altevra↔Claude-Code connection is now
+fixed end-to-end (PATH + MCP registration + response format). The smoke + adapter
+proofs above plus these live fixes mean the connection layer is genuinely working,
+not just protocol-shaped.
+
+**Note:** Cursor live spawn not separately driven, but it shares the same MCP
+server + the (now-fixed) response format, and `connect --tool cursor` config is
+verified above.

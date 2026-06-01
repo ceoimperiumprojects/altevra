@@ -505,7 +505,29 @@ impl McpServer {
         match req.method.as_str() {
             "initialize" => self.handle_initialize(req.id),
             "tools/list" => McpResponse::ok(req.id, list_tools()),
-            "tools/call" => self.dispatch_tool_call(req.id, req.params),
+            "tools/call" => {
+                // Tool handlers return bare JSON; the MCP spec (and Claude Code)
+                // expect tools/call results wrapped in a `content` array, else
+                // the client sees an empty result. Wrap successful results here
+                // so every handler stays simple. (Found via live herdr test.)
+                let id = req.id.clone();
+                let resp = self.dispatch_tool_call(req.id, req.params);
+                match resp.result {
+                    Some(result) => {
+                        let text = serde_json::to_string_pretty(&result)
+                            .unwrap_or_else(|_| result.to_string());
+                        McpResponse::ok(
+                            id,
+                            serde_json::json!({
+                                "content": [{ "type": "text", "text": text }],
+                                "isError": false,
+                                "structuredContent": result,
+                            }),
+                        )
+                    }
+                    None => resp, // error passes through unchanged
+                }
+            }
             other => McpResponse::error(req.id, -32601, format!("Method not found: {other}")),
         }
     }
