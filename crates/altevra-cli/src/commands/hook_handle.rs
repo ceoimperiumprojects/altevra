@@ -102,7 +102,7 @@ async fn handle_session_start(
 
 async fn handle_session_end(
     repo: &SessionsRepository<'_>,
-    args: &HookHandleArgs,
+    _args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let summary = payload

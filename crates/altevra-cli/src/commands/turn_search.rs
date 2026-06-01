@@ -145,6 +145,7 @@ mod tests {
             latency_ms: None,
             file_changes: None,
             redacted_count: 0,
+            source_tool: Some("claude-code".into()),
             created_at: Utc::now(),
         };
         repo.record_turn(&t).await.unwrap();
