@@ -45,7 +45,9 @@
 | Baseline | ✅ green | flaky env test fixed (mutex-serialized) |
 | P0.0 contracts+enums+templates | ✅ done | T0.1–T0.10; 81 tests |
 | P0.1 vertical loop | 🟩 core done | schema 019-022, both gates, presence, repo layer, packet compiler module, p0_vertical_smoke ✅. Hardening left: T1.13 wire guard into all repo writes, T1.14 vault mirror, T1.17 review CLI. |
-| P0.2 capability registry | 🔄 started | T2.2 TrustLevel+Support ✅, T2.1 schema 023 (adapter_dossiers/capability_records/skill_proposals/capability_grants) ✅. Next: T2.3 component-state machine wiring, T2.4 dossier/evidence from verify(), T2.5 watcher before_hash+self-write marker, repos. |
+| P0.2 capability registry | 🔄 good progress | T2.2 TrustLevel+Support ✅, T2.1 schema 023 ✅, capability repos (T7 honesty + dedup) ✅. Next: T2.3 component-state machine wiring (altevra-skills), T2.4 dossier/evidence from verify(), T2.5 watcher before_hash+self-write marker. |
+| P0.3 control plane | ⬜ pending | CLI/MCP verbs for new objects |
+| P0.5 resident runtime | 🔄 seam ready | T5.1 ChatProvider trait + ModelRole routing + NoopProvider ✅ (SI-7 enforced). Next: resident_mode registry (extend brain JobKind), resident_run, dry-run loop. THIS is the 'add keys' seam. |
 | P0.1 vertical loop | ⬜ pending | |
 | P0.2 capability registry | ⬜ pending | |
 | P0.3 control plane | ⬜ pending | |
