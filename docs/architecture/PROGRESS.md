@@ -61,3 +61,12 @@
 - **T0.9/T0.10** ✅ Template + 9 builtins + TemplateGate (quarantine on untagged/non-conforming/ungoverned-domain).
 - **T0.7** ✅ fixtures/p0/ (decision, personal-health, fake-secrets, drift mirror, superseded v1/v2, injection).
 - **T0.8** ✅ contract_validation.rs golden enum lists.
+- **T1.1-T1.5** ✅ `75fce2d` migrations 019-022 (envelope backfill, relations, object_index, learnings, insight_cards, secret_sightings, audit_log, exposure_decisions, context_packets).
+- **T1.7/T1.8** ✅ `67cfdb9` PreWriteSafetyGate (altevra-secrets/ingest_guard) — secrets+PII redact, classify, TemplateGate, fail-closed.
+- **T1.11** ✅ `64bcb77` ExposureGate (core/safety) — non-leaking deny reasons.
+- **T1.18** ✅ `c549c73` p0_vertical_smoke — full chain proven, leak=0.
+- **T1.10** ✅ `000c95f` presence gate (TTY + ALTEVRA_UNLOCK).
+- **T1.12** ✅ `ecf1921` LearningsRepository + ObjectIndexRepository.
+- **T1.15** ✅ `9a92015` Context Packet Compiler module (gates≠weights, tag+recency, no vectors, deterministic, budget packing).
+- **Baseline re-verified:** fmt+clippy(--all-targets -D warnings)+tests all green.
+- _NEXT: T1.13 wire ingest_guard into all repo writes · T1.14 vault mirror renderer · T1.17 review CLI + presence wiring · then live test (build+symlink+herdr spawn) · P0.2._
