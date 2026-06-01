@@ -72,3 +72,12 @@ verified above.
 - Confirms the R11 turn-read gating + P0.5/P0.6 additions did NOT break the live MCP connection.
 - `altevra resident run <mode>` live-verified separately (P0.5): personal_curator→local_private→noop(local), recorded as resident_run.
 - Pending interactive half: Cursor spawn in herdr (Claude side previously live-tested).
+
+## 2026-06-01 (session 2) — Cursor connection validated (autonomous half)
+- `altevra connect --tool cursor` generates AGENTS.md + .cursor/mcp.json + hooks.json
+  + rules/altevra.mdc. mcp.json registers server `altevra` → command `altevra serve`.
+- Smoke through the EXACT spawn command cursor's config uses: initialize OK
+  (altevra 0.3.0) + tools/list OK (36 tools incl get_context_packet). **Cursor would
+  connect correctly.**
+- Interactive half (a live Cursor TUI agent in a herdr pane calling Altevra) is
+  Pavle's hands-on step — cursor CLI + herdr are both installed and ready.
