@@ -1,3 +1,4 @@
+pub mod capability;
 pub mod events;
 pub mod hooks;
 pub mod installations;
@@ -9,6 +10,7 @@ pub mod tasks;
 pub mod updates;
 pub mod wiki;
 
+pub use capability::{CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository};
 pub use events::EventsRepository;
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
