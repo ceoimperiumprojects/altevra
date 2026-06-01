@@ -5,6 +5,7 @@ pub mod brain;
 pub mod config;
 pub mod connect;
 pub mod context;
+pub mod control;
 pub mod doctor;
 pub mod embed;
 pub mod files;

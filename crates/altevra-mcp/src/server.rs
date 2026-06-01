@@ -641,6 +641,34 @@ mod tests {
     }
 
     #[test]
+    fn hp1_no_agent_approve_apply_grant_forget_path() {
+        // HP-1 (R4): an MCP/agent caller can NEVER approve/apply/grant/forget-execute
+        // or set policy. Enforced by ABSENCE — assert no tool name carries those verbs.
+        let tools = list_tools();
+        let forbidden = [
+            "approve",
+            "apply",
+            "grant",
+            "forget_execute",
+            "forget-execute",
+            "set_policy",
+            "set-policy",
+            "revoke",
+            "legal_hold",
+            "execute",
+        ];
+        for t in tools["tools"].as_array().unwrap() {
+            let name = t["name"].as_str().unwrap_or("");
+            for f in forbidden {
+                assert!(
+                    !name.contains(f),
+                    "HP-1 violation: MCP exposes a tool '{name}' containing forbidden verb '{f}'"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_unknown_method_returns_error() {
         let server = McpServer::new("0.1.0");
         let req = McpRequest {

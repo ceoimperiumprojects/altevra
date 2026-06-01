@@ -25,6 +25,15 @@ pub enum PresenceMethod {
     UnlockToken,
 }
 
+impl PresenceMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PresenceMethod::Tty => "tty",
+            PresenceMethod::UnlockToken => "unlock_token",
+        }
+    }
+}
+
 /// Proof that a human authorized a protected action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceProof {

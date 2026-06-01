@@ -224,6 +224,87 @@ impl<'a> TasksRepository<'a> {
         .await?;
         Ok(())
     }
+
+    /// List review items, optionally filtered by status, newest first (P0.3 T3.1).
+    pub async fn list_review_items(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<ReviewItemRow>> {
+        let base = "SELECT id, project_id, kind, title, body, status, created_at, metadata FROM review_items";
+        let rows = if let Some(s) = status {
+            sqlx::query(&format!(
+                "{base} WHERE status = ? ORDER BY created_at DESC LIMIT ?"
+            ))
+            .bind(s)
+            .bind(limit)
+            .fetch_all(self.pool)
+            .await?
+        } else {
+            sqlx::query(&format!("{base} ORDER BY created_at DESC LIMIT ?"))
+                .bind(limit)
+                .fetch_all(self.pool)
+                .await?
+        };
+        Ok(rows.into_iter().map(row_to_review).collect())
+    }
+
+    pub async fn get_review_item(&self, id: Uuid) -> anyhow::Result<Option<ReviewItemRow>> {
+        let row = sqlx::query(
+            "SELECT id, project_id, kind, title, body, status, created_at, metadata \
+             FROM review_items WHERE id = ?",
+        )
+        .bind(id.to_string())
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(row_to_review))
+    }
+
+    /// Record an approve/reject decision. The caller MUST have verified human
+    /// presence FIRST (HP-2: approval is recorded by core after a presence check,
+    /// never accepted as an input flag). Returns true if a row transitioned.
+    pub async fn decide_review_item(
+        &self,
+        id: Uuid,
+        decision: &str,
+        decided_by: &str,
+    ) -> anyhow::Result<bool> {
+        let status = match decision {
+            "approved" => "approved",
+            "rejected" => "rejected",
+            other => anyhow::bail!("invalid decision: {other} (expected approved|rejected)"),
+        };
+        let now = ts_to_text(&Utc::now());
+        let res = sqlx::query(
+            "UPDATE review_items SET status = ?, decision = ?, decided_by = ?, decided_at = ?, \
+             updated_at = ? WHERE id = ? AND status IN ('open','pending_review')",
+        )
+        .bind(status)
+        .bind(decision)
+        .bind(decided_by)
+        .bind(&now)
+        .bind(&now)
+        .bind(id.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+fn row_to_review(r: SqliteRow) -> ReviewItemRow {
+    ReviewItemRow {
+        id: uuid_from_text(r.get::<String, _>("id")),
+        project_id: opt_uuid_from_text(r.get::<Option<String>, _>("project_id")),
+        kind: r.get("kind"),
+        title: r.get("title"),
+        body: r.get("body"),
+        status: r.get("status"),
+        created_at: ts_from_text(r.get::<String, _>("created_at")),
+        metadata: r
+            .get::<Option<String>, _>("metadata")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({})),
+    }
 }
 
 fn row_to_task(r: SqliteRow) -> TaskRow {
