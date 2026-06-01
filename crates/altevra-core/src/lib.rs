@@ -8,6 +8,7 @@ pub mod observer;
 pub mod paths;
 pub mod prompts;
 pub mod retrieval;
+pub mod safety;
 pub mod security;
 pub mod status;
 pub mod template;
@@ -22,6 +23,7 @@ pub use observer::{
     detect_skill_version_divergence, detect_stale_project, EvidenceRef, Insight, InsightKind,
 };
 pub use paths::{default_db_path, DEFAULT_DB_PATH};
+pub use safety::{DenyReason, ExposureDecision, ExposureGate, ExposureRequest};
 pub use security::Sensitivity;
 pub use status::{
     CapabilityState, LifecycleState, ObjectStatus, ProposalStatus, RedactionStatus, ReviewStatus,

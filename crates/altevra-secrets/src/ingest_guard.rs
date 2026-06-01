@@ -321,6 +321,9 @@ mod tests {
         let body = "## Decision\n-----BEGIN PRIVATE KEY-----\n## Rationale\nx";
         let g = ingest_guard(body, &decision_env(), &["title".into()], &reg);
         assert!(!g.value.contains("BEGIN PRIVATE KEY"));
-        assert!(g.sightings.iter().any(|s| s.secret_kind == "pem_private_key"));
+        assert!(g
+            .sightings
+            .iter()
+            .any(|s| s.secret_kind == "pem_private_key"));
     }
 }
