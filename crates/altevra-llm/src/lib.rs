@@ -9,8 +9,10 @@
 
 pub mod chat;
 pub mod gemini;
+pub mod provider;
 pub mod rate_limit;
 
 pub use chat::{ChatMessage, ChatOpts, ChatRole};
 pub use gemini::GeminiFlashChat;
+pub use provider::{ChatProvider, ModelRole, ModelRouter, NoopProvider};
 pub use rate_limit::RateLimiter;
