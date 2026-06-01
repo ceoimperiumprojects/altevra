@@ -61,17 +61,42 @@ clean; Claude verifiers re-run clean. **R11 gate CLOSED.**
 - Remainder (noop-stubbed / LLM-wired): proposals repo + 7-stage orchestration +
   prompt registry render/rollback (T6.2/T6.5 LLM-driven half).
 
+**P0.3 control plane — DONE** (`a45f0ed`): `altevra control review list|show|approve|
+reject` (approve/reject presence-gated, R4 — live-verified REFUSED on non-TTY),
+`redact check` (guard_text report, no raw — live-verified), `audit query`
+(exposure_decisions). TasksRepository review list/get/decide. HP-1 MCP regression
+test (no approve/apply/grant/forget/execute tool exposed).
+
+**P0.8 personal brain + P0.9 sync prep — DONE** (`47410e5`): migration 029
+(projects+parent_id R7, persons, relationships, preferences, event_log_personal).
+DomainPolicyRepository reads the seeded 9-domain policy (no longer a dormant island);
+CloudSync most-restrictive resolution (R3) + sync_eligible (P0.9 T9.1/T9.3 — restricted
+domains excluded from sync set; unknown=fail-closed).
+
+**P0.4 FTS5 substrate — DONE** (`353b7fd`): migration 030 object_fts (FTS5, unicode61
++ remove_diacritics for SR+EN, NO vectors R12). FtsRepository index+bm25 search with
+injection-safe MATCH. The primary lexical retrieval substrate.
+
 ### ⬜ Still pending (exact plan in GAP_MAP.json)
-- **P0.3** control plane CLI/MCP verbs (sot/redact/review/forget/audit/capabilities/
-  adapter/grant/component + doctor checks + MCP ceiling enforcement + HP-1 test). No migration.
-- **P0.4** FTS5 substrate (T1.14b) + wire PacketCompiler into live CLI `context`/MCP
-  `get_context_packet` (T-INV14) + golden eval harness + retrieval profiles. (legacy
-  scan_vault still serves live retrieval; packet compiler not yet wired live.)
-- **P0.7** skill factory (proposer mode + post-approval render path + Hermes adapter).
-- **P0.8** migration 029 projects/person/relationship/preference + DomainPolicy repo +
-  lifecycle job + export/forget/legal-hold CLI (presence-gated) + Imperium mirror writer.
-- **P0.9** per-domain cloud_sync ceiling selector + tombstone model.
-- **Cursor live spawn** in herdr (Claude side live-tested; Cursor pending).
+- **P0.7 skill factory** — proposer mode is SEEDED (027); needs the post-approval
+  render path (skill_proposal→skill→ToolAdapter::render_skills→installed_component,
+  no-secret-in-render) + a Hermes ToolAdapter (skills→~/.imperium/skills/shared/, R10
+  Q7) + usage tracking. Foundations exist (skill_proposals dedup, render_skills in all
+  4 adapters). The Hermes adapter is a full ToolAdapter impl (7 methods).
+- **Runtime remainders (LLM-wired / larger refactors, all noop-ready):**
+  - P0.4 T-INV14: wire FtsRepository + PacketCompiler into live CLI `context` + MCP
+    `get_context_packet` (legacy scan_vault still serves live) + golden eval harness.
+  - P0.6 7-stage orchestration + prompt registry render/rollback (firewall + risk-tier
+    + schema are done; the LLM-driven loop that feeds them is the remainder).
+  - P0.8 lifecycle/purge job (R-EPH), export/forget/legal-hold CLI (presence pattern
+    ready from P0.3), Imperium generated_mirror writer, tombstone conflict model.
+- **Cursor live spawn** in herdr (Claude side live-tested; MCP smoke PASS after all
+  changes; Cursor interactive spawn pending).
+
+### Baseline + push state
+608 tests pass, 0 failed; clippy --workspace --all-targets -D warnings clean; MCP
+live smoke PASS. All work pushed to origin/altevra-overnight-p0. Secret-scanning note:
+detector test fixtures use concat!() so no contiguous secret literal lives in source.
 
 ## ☀️ MORNING HANDOFF (read this first)
 
