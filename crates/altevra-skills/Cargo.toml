@@ -15,3 +15,6 @@ regex = { workspace = true }
 serde_yaml = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

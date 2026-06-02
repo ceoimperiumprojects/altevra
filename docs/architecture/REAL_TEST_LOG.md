@@ -14,6 +14,15 @@ LLM provider work (plan `giggly-humming-ullman.md`, R15). All live, real-world:
 
 Awaits Pavle (honest): `api` mode keys (`altevra secrets set <KEY>`); BGE-M3 real inference (first run downloads ~2GB model — `bge_embeds_with_correct_dim` `#[ignore]` ready); interactive Cursor TUI spawn in a herdr pane (his hands-on; CLI+config verified ready).
 
+## 2026-06-02 (session 4) — temporal recall + skill cross-tool inventory ✅ PASS
+
+Two follow-on features built and live-verified after Pavle's product feedback:
+
+- **Temporal recall LIVE ✅** — answers his exact use case "šta smo radili pre mesec dana sa Amerikancima". `altevra-core::time_window` parses `24h`/`7d`/`30d`/`3mo` + presets `last_week`/`last_month`/etc (fail-closed on garbage — typo never widens a window). `SessionsRepository::search_turns_in_window` added; existing `search_turns` delegates with `None,None` (back-compat preserved across 12+ call sites). MCP `search_turns` tool now accepts `window`/`since`/`until` params. **Live MCP smoke**: `window="last_month"` → correct 30d range echoed; `window="garbage"` → fail-closed error listing valid forms; `since="2026-05-01" until="2026-05-31"` → date-only parsing works. Headline DB test (3 turns: month-old/yesterday/unrelated about "Americans"; window 25-40d back) returns ONLY the month-old Americans turn.
+- **Skill cross-tool inventory LIVE ✅** — answers his use case "kad ubacim skill u Claude da se automatski vidi u svima". `altevra-skills::importer` scans `~/.{claude,codex,cursor,hermes,imperium}/skills/` with a loose YAML parser tolerating Claude/Hermes `name:` AND Altevra `slug:`/`title:` (separate from the strict `parse_skill` — authoring contract untouched). Detects `<!-- ALTEVRA_MANAGED -->` marker. `altevra skill inventory` CLI command — read-only first pass before any propagation. **Live on real disk**: 137 unique skill slugs across 5 tools. `--missing` flag exposes propagation candidates (e.g. `audit` is in claude+codex+cursor but missing from hermes+imperium). No writes performed (sync `--apply` is the next increment).
+
+Baseline 685 tests pass / 0 fail; clippy `--workspace -D warnings` clean. 15 commits on `altevra-overnight-p0`.
+
 ## 2026-06-01 — MCP stdio connection (autonomous half) ✅ PASS
 
 **What:** Built the real release binary (`cargo build --release -p altevra-cli`,

@@ -1,4 +1,5 @@
 use altevra_skills::{
+    importer::{group_by_slug, scan_all, scan_external_dir, ExternalSkill, SourceTool},
     parser::parse_skill,
     registry::{SkillRegistry, VersionCheckResult},
 };
@@ -15,6 +16,24 @@ pub enum SkillCommands {
     Check(SkillCheckArgs),
     /// Refresh a skill from source
     Refresh(SkillRefreshArgs),
+    /// Inventory skills across ALL connected tools (~/.claude, ~/.codex,
+    /// ~/.cursor, ~/.hermes, ~/.imperium, and the Altevra vault). Read-only.
+    Inventory(SkillInventoryArgs),
+}
+
+#[derive(Args)]
+pub struct SkillInventoryArgs {
+    /// Filter to skills present in a specific source tool.
+    #[arg(long)]
+    pub tool: Option<String>,
+    /// Show ONLY skills not in every tool (diff view — sync candidates).
+    #[arg(long)]
+    pub missing: bool,
+    /// Include Altevra vault `06-skills` in the scan (relative to --vault).
+    #[arg(long, default_value = ".")]
+    pub vault: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -61,7 +80,87 @@ pub async fn run(cmd: SkillCommands) -> anyhow::Result<()> {
         SkillCommands::Show(args) => run_show(args).await,
         SkillCommands::Check(args) => run_check(args).await,
         SkillCommands::Refresh(args) => run_refresh(args).await,
+        SkillCommands::Inventory(args) => run_inventory(args).await,
     }
+}
+
+async fn run_inventory(args: SkillInventoryArgs) -> anyhow::Result<()> {
+    // Scan every known tool's skill dir + (optionally) the Altevra vault.
+    let mut skills: Vec<ExternalSkill> = scan_all();
+    let vault_skills_dir = args.vault.join("06-skills");
+    if vault_skills_dir.exists() {
+        skills.extend(scan_external_dir(&vault_skills_dir, SourceTool::Altevra));
+    }
+
+    // Optional --tool filter.
+    if let Some(t) = args.tool.as_deref() {
+        skills.retain(|s| s.source_tool.as_str() == t);
+    }
+
+    let grouped = group_by_slug(&skills);
+
+    // --missing: show only skills NOT present in every distinct tool we found.
+    let tools_in_scan: std::collections::BTreeSet<&str> =
+        skills.iter().map(|s| s.source_tool.as_str()).collect();
+    let total_tools = tools_in_scan.len();
+    let mut rows: Vec<_> = grouped.iter().collect();
+    if args.missing {
+        rows.retain(|(_, list)| {
+            let distinct_tools: std::collections::HashSet<_> =
+                list.iter().map(|s| s.source_tool.as_str()).collect();
+            distinct_tools.len() < total_tools
+        });
+    }
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+
+    if args.json {
+        let out: Vec<_> = rows
+            .iter()
+            .map(|(slug, list)| {
+                serde_json::json!({
+                    "slug": slug,
+                    "tools": list.iter().map(|s| s.source_tool.as_str()).collect::<Vec<_>>(),
+                    "managed": list.iter().any(|s| s.managed),
+                    "instances": list.iter().map(|s| serde_json::json!({
+                        "tool": s.source_tool.as_str(),
+                        "path": s.path,
+                        "version": s.version,
+                        "description": s.description,
+                        "managed": s.managed,
+                        "body_len": s.body_len,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "Skill inventory — {} unique slug(s) across {} tool(s){}:\n",
+            rows.len(),
+            total_tools,
+            if args.missing {
+                " (missing-in-some only)"
+            } else {
+                ""
+            }
+        );
+        for (slug, list) in &rows {
+            let tools: Vec<&str> = {
+                let mut v: Vec<_> = list.iter().map(|s| s.source_tool.as_str()).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            };
+            let has_managed = list.iter().any(|s| s.managed);
+            println!(
+                "  {slug:32}  [{tools}]{m}",
+                tools = tools.join(","),
+                m = if has_managed { "  (managed)" } else { "" }
+            );
+        }
+        println!("\nNext: `altevra skill inventory --missing` to see propagation candidates.");
+    }
+    Ok(())
 }
 
 async fn run_list(args: SkillListArgs) -> anyhow::Result<()> {
