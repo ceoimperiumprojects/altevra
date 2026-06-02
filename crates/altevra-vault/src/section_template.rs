@@ -297,6 +297,71 @@ pub fn scaffold_section(object_type: &str) -> String {
     out.trim_end().to_string() + "\n"
 }
 
+/// A built LLM rewrite prompt (Phase 2 seam). Pure strings — the CLI turns these
+/// into `ChatMessage`s, so `altevra-vault` stays free of an `altevra-llm` dep.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewritePrompt {
+    pub system: String,
+    pub user: String,
+}
+
+/// Build the prompt that asks a reasoning model to RESTRUCTURE a section's existing
+/// free prose into its type's section template — **without losing any fact**. The
+/// system prompt makes information-preservation a hard contract (output must contain
+/// every fact from the input); the model only reorganizes under the required labels.
+///
+/// Pure + deterministic (testable with no LLM). Whether it ever RUNS is gated by the
+/// reasoning mode + `--rewrite --apply` in the CLI; under `delegated` it is a no-op.
+pub fn build_rewrite_prompt(section: &Section, object_type: &str) -> RewritePrompt {
+    let contract = contract_for(object_type);
+    let mut required = Vec::new();
+    let mut optional = Vec::new();
+    for slot in contract.slots {
+        let line = format!(
+            "**{}:** (synonyms accepted: {})",
+            slot.canonical(),
+            slot.synonyms.join(", ")
+        );
+        if slot.required {
+            required.push(line);
+        } else {
+            optional.push(line);
+        }
+    }
+    let required_block = if required.is_empty() {
+        "(none — this type is freeform; keep the prose, just tidy it)".to_string()
+    } else {
+        required.join("\n")
+    };
+    let optional_block = if optional.is_empty() {
+        "(none)".to_string()
+    } else {
+        optional.join("\n")
+    };
+
+    let system = format!(
+        "You restructure a Markdown note section into a fixed template WITHOUT losing \
+         information. HARD RULES:\n\
+         1. Preserve EVERY fact, name, number, date, and nuance from the input. The \
+            output MUST contain all information present in the input. Never invent \
+            facts, never drop facts.\n\
+         2. Reorganize the prose under these bold-label fields for a '{object_type}' \
+            section. Required fields:\n{required_block}\n\
+         Optional fields (include only if the input supports them):\n{optional_block}\n\
+         3. Keep Pavle's language (Serbian/English as written). Keep his voice.\n\
+         4. Output ONLY the section body (the bold-label lines + values). Do NOT \
+            repeat the `## ` heading. Do NOT add commentary.\n\
+         5. If a required field has no supporting content in the input, write the \
+            label with a short '(TODO: …)' note rather than fabricating."
+    );
+    let user = format!(
+        "Section heading: {}\n\nExisting body to restructure:\n---\n{}\n---",
+        section.heading,
+        section.body.trim()
+    );
+    RewritePrompt { system, user }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +527,35 @@ mod tests {
         let s = scaffold_section("decision");
         let c = section_conformance(&sec("new", &s), "decision");
         assert!(!c.conformant);
+    }
+
+    // --- Phase 2: LLM rewrite prompt (pure builder, no LLM) ---
+
+    #[test]
+    fn rewrite_prompt_embeds_required_labels_and_input() {
+        let body = "Razdvojiti build i gtm jer ReVesta ima market signal a Altevra je build.";
+        let p = build_rewrite_prompt(&sec("Split agent lanes", body), "decision");
+        // system prompt carries the required labels + the no-information-loss rule
+        assert!(p.system.contains("**Odluka:**"));
+        assert!(p.system.contains("Preserve EVERY fact"));
+        assert!(p.system.contains("MUST contain all information"));
+        // user prompt carries the heading + the verbatim input body
+        assert!(p.user.contains("Split agent lanes"));
+        assert!(p.user.contains("market signal"));
+    }
+
+    #[test]
+    fn rewrite_prompt_freeform_type_keeps_prose() {
+        let p = build_rewrite_prompt(&sec("A learning", "some prose"), "learning");
+        assert!(p.system.contains("freeform"));
+    }
+
+    #[test]
+    fn rewrite_prompt_is_deterministic() {
+        let s = sec("x", "body text here");
+        assert_eq!(
+            build_rewrite_prompt(&s, "decision"),
+            build_rewrite_prompt(&s, "decision")
+        );
     }
 }

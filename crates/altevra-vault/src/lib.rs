@@ -21,8 +21,8 @@ pub use normalize::{
 pub use parser::{parse_document, parse_document_from_str, ParsedDocument, ParserError};
 pub use scanner::{list_sections, scan_vault, ScannedFile, ScannerError, VaultSection};
 pub use section_template::{
-    contract_for, scaffold_section, section_conformance, LabelSlot, SectionConformance,
-    SectionContract,
+    build_rewrite_prompt, contract_for, scaffold_section, section_conformance, LabelSlot,
+    RewritePrompt, SectionConformance, SectionContract,
 };
 pub use sections::{parse_sections, Section};
 pub use wiki::{

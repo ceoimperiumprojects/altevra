@@ -2,6 +2,45 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 6) — Section templates: per-`##`-section conformance + LLM rewrite seam ✅ PASS
+
+Pavle's follow-up: *"svaki dokument prati šablon ČAK I DELOVE u dokumentu … sve
+lepo da se piše sve"* — every `## ` section must conform to a per-type contract,
+not just the document frontmatter. Built in two phases; baseline 749 → 755 tests,
+0 fail; clippy `--workspace --all-targets -D warnings` clean (incl. `--features
+embedding`).
+
+**Phase 1 — keyless section-template conformance (fully done):**
+- `altevra-vault::section_template` — per-type `SectionContract` with SYNONYM SETS,
+  **calibrated against the real `Memory/*.md`** (decision: `Odluka` + `Zašto`/`Šta
+  znači`/`Razlog`/`Why`/…; person: `Kontekst` + `Uloga`/`Status`/…; learning/daily/
+  note = freeform, since real `Learnings.md` is 12/16 plain prose — labels never
+  forced). Matches block-level AND list-item (`- **X:**`) labels. 18 unit tests.
+- `vault normalize` DRY-RUN now reports section conformance + splits non-conformant
+  into `scaffoldable` (empty/stub) vs `need_rewrite` (prose missing labels).
+  `--scaffold-empty` fills ONLY empty/stub sections (backup-first, idempotent, never
+  touches prose). `capture --atomize` tags each object `conformant`/`needs-structure`.
+- **REAL DRY-RUN ~/Obsidian/Imperium (read-only):** 3891 sections; **27
+  non-conformant across 2 strict-type files** (Decisions 21/31 missing `Zašto`/
+  `Odluka`, People 6/10 missing `Uloga`/`Kontekst`); 0 scaffoldable, 27 need_rewrite
+  (all prose). **REAL atomize of Decisions.md:** 10/31 conformant, 21 needs-structure
+  — calibration confirmed correct (the `Odluka`+`Šta znači` sections pass; a
+  `**Math:**`-style section is genuinely flagged, not a false positive).
+
+**Phase 2 — LLM rewrite seam (wired + noop-tested; NOT run live on the vault):**
+- `altevra-vault::build_rewrite_prompt(section, type) -> RewritePrompt` — pure,
+  deterministic; system prompt makes "preserve EVERY fact (output MUST contain all
+  input facts)" a hard contract; model only reorganizes under the labels. 3 tests.
+- `vault normalize --rewrite` routes `altevra_llm::build_router`. DRY-RUN by default;
+  needs `--apply` + a real provider to write; backup-first.
+- **REAL --rewrite DRY-RUN ~/Obsidian/Imperium (delegated default):** `provider=noop
+  (noop:true)`, `sections_need_rewrite=27`, `would_rewrite=27`, `rewritten=0`,
+  `backup=None` — vault UNCHANGED (frontmatter count still 23). The no-op seam is
+  live-verified with NO model call. Honest status: a live LLM rewrite needs
+  `reasoning_mode = codex_oauth` (ChatGPT Plus, no key) or `api` + `--apply`; that
+  real run is **left to Pavle** (per the hard rule: no live LLM rewrites on the real
+  vault from here).
+
 ## 2026-06-02 (session 5) — Atomizacija: section atomize + vault normalize, live on REAL vault ✅ PASS
 
 Pavle's "Atomizacija" directive — the human writes few files, the machine sees

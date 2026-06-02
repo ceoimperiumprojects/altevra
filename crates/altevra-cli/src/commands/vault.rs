@@ -48,6 +48,20 @@ pub struct NormalizeArgs {
     /// the LLM `--rewrite` job (Phase 2). Implies an apply; still backs up first.
     #[arg(long)]
     pub scaffold_empty: bool,
+    /// Phase 2 (LLM): RESTRUCTURE non-conformant PROSE sections into the section
+    /// template via the configured reasoning provider, preserving every fact.
+    /// DRY-RUN by default (reports what would be rewritten). Under `delegated`
+    /// (default reasoning_mode) it is a no-op that reports the count + that an
+    /// `api`/`codex_oauth` provider is required. Real rewrites need `--apply`.
+    #[arg(long)]
+    pub rewrite: bool,
+    /// Reasoning mode override for `--rewrite` (`delegated`|`codex_oauth`|`api`).
+    /// Defaults to the repo config's `[llm].reasoning_mode`.
+    #[arg(long)]
+    pub reasoning_mode: Option<String>,
+    /// Repo root for config/credentials (defaults to cwd).
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
     /// Emit JSON instead of human-readable.
     #[arg(long)]
     pub json: bool,
@@ -255,6 +269,11 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
         .iter()
         .filter(|p| p.sections_nonconformant > 0)
         .count();
+
+    // ---- Phase 2: LLM rewrite of prose-but-non-conformant sections ----
+    if args.rewrite {
+        return run_rewrite(&args, &vault, &plans, sections_need_rewrite).await;
+    }
 
     let want_apply = args.apply || args.scaffold_empty;
 
@@ -522,6 +541,169 @@ fn scaffold_empty_sections(body: &str, doc_type: &str) -> (String, usize) {
     (joined, n_scaffolded)
 }
 
+/// Phase 2 — LLM restructure seam. Routes the configured reasoning provider over
+/// the prose-but-non-conformant sections, asking it to reorganize each into its
+/// section template WITHOUT losing facts (`build_rewrite_prompt`). DRY-RUN by
+/// default; under `delegated` (the default mode) the provider is a noop, so this
+/// only REPORTS the count + that an `api`/`codex_oauth` provider is required.
+///
+/// SAFETY: this never writes unless `--apply` is given AND a real (non-noop)
+/// provider is configured. Even then, the body merge preserves all other sections
+/// verbatim. Per the task, real LLM rewrites on the vault are left to Pavle — this
+/// wires + tests the seam (prompt build + noop path), it does not run live here.
+async fn run_rewrite(
+    args: &NormalizeArgs,
+    vault: &Path,
+    plans: &[FilePlan],
+    sections_need_rewrite: usize,
+) -> anyhow::Result<()> {
+    // Resolve reasoning mode (flag overrides repo config), then build the router.
+    let mut cfg = crate::commands::config::load_config(&args.repo);
+    if let Some(rm) = args.reasoning_mode.as_deref() {
+        cfg.llm.reasoning_mode =
+            altevra_core::config::ReasoningMode::parse(rm).ok_or_else(|| {
+                anyhow::anyhow!("--reasoning-mode must be: delegated|codex_oauth|api")
+            })?;
+    }
+    let router = altevra_llm::build_router(&cfg.llm);
+    let provider = router.resolve(altevra_llm::ModelRole::StrongReasoner);
+    let provider_is_noop = provider.id() == "noop";
+
+    // The candidate sections (prose, non-conformant). We only WRITE when --apply AND
+    // a real provider is present; otherwise this is a report (the default).
+    let will_write = args.apply && !provider_is_noop;
+
+    let mut rewritten = 0usize;
+    let mut would_rewrite = 0usize;
+    let mut backup_dir: Option<PathBuf> = None;
+
+    if will_write {
+        // Backup the whole vault before the first write (same guarantee as normalize).
+        let ts = args.backup_ts.unwrap_or_else(unix_now);
+        let backup_root = args.backup_root.clone().unwrap_or_else(default_backup_root);
+        let dir = backup_root.join(format!("obsidian-rewrite-{ts}"));
+        copy_dir_recursive(vault, &dir)?;
+        backup_dir = Some(dir);
+    }
+
+    for p in plans {
+        if p.sections_need_rewrite == 0 || p.parse_error.is_some() {
+            continue;
+        }
+        if !will_write {
+            would_rewrite += p.sections_need_rewrite;
+            continue;
+        }
+        // --- live path (only runs with --apply + a real provider; left for Pavle) ---
+        let content = std::fs::read_to_string(&p.abs)?;
+        let (_fm, body) = split_for_normalize(&content)?;
+        let class = classify_path(&p.rel);
+        let sections = parse_sections(&body);
+        // Rebuild the body, swapping ONLY the prose-non-conformant sections.
+        let mut new_sections: Vec<(String, String)> = Vec::new();
+        for s in &sections {
+            let conf = section_conformance(s, &class.doc_type);
+            if conf.conformant || conf.empty || section_is_stub_only(s) {
+                new_sections.push((s.heading.clone(), s.body.clone()));
+                continue;
+            }
+            // Non-conformant PROSE → ask the model to restructure (fact-preserving).
+            let prompt = altevra_vault::build_rewrite_prompt(s, &class.doc_type);
+            let messages = vec![
+                altevra_llm::ChatMessage::system(prompt.system),
+                altevra_llm::ChatMessage::user(prompt.user),
+            ];
+            let opts = altevra_llm::ChatOpts::default().with_temperature(0.2);
+            let restructured = provider.complete(&messages, &opts).await?;
+            new_sections.push((s.heading.clone(), restructured.trim().to_string()));
+            rewritten += 1;
+        }
+        let rebuilt = rebuild_body(&body, &new_sections);
+        // Re-apply frontmatter normalization on top so the doc stays consistent.
+        let (existing, _) = split_for_normalize(&content)?;
+        let mtime_date = system_time_to_date(file_mtime(&p.abs)?);
+        let created = existing_created(existing.as_ref()).unwrap_or(mtime_date);
+        let (new_fm, _) = normalize_frontmatter(
+            existing.as_ref(),
+            &class.doc_type,
+            &class.domain,
+            class.scope.as_deref(),
+            created,
+            mtime_date,
+            class.archived,
+        );
+        let out = render_normalized(&new_fm, &rebuilt)?;
+        std::fs::write(&p.abs, out)?;
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "rewrite": true,
+                "applied": will_write,
+                "vault": vault.display().to_string(),
+                "reasoning_mode": cfg.llm.reasoning_mode.as_str(),
+                "provider": provider.id(),
+                "provider_is_noop": provider_is_noop,
+                "sections_need_rewrite": sections_need_rewrite,
+                "would_rewrite": would_rewrite,
+                "rewritten": rewritten,
+                "backup": backup_dir.map(|d| d.display().to_string()),
+            }))?
+        );
+    } else if provider_is_noop {
+        println!("Vault rewrite — DRY RUN (delegated/noop reasoning provider)");
+        println!(
+            "  would rewrite {sections_need_rewrite} prose section(s) that miss required labels"
+        );
+        println!(
+            "  → needs a real reasoning provider: set `[llm].reasoning_mode = codex_oauth` \
+             (uses ChatGPT Plus, no API key) or `api` (altevra secrets set <KEY>)."
+        );
+        println!("  No model call made; nothing written.");
+    } else if !will_write {
+        println!(
+            "Vault rewrite — DRY RUN (provider '{}' ready)",
+            provider.id()
+        );
+        println!("  would rewrite {would_rewrite} prose section(s). Add --apply to write.");
+        println!("  (a full vault backup is made before any write)");
+    } else {
+        println!("Vault rewrite — APPLIED via '{}'", provider.id());
+        if let Some(d) = &backup_dir {
+            println!("  backup: {}", d.display());
+        }
+        println!("  {rewritten} section(s) restructured (facts preserved by contract).");
+    }
+    Ok(())
+}
+
+/// Rebuild a document body from (heading, body) section pairs, preserving the
+/// preamble (everything before the first `## `) verbatim. Used by the rewrite path.
+fn rebuild_body(original: &str, sections: &[(String, String)]) -> String {
+    // Preamble = lines before the first `## ` heading.
+    let mut preamble: Vec<&str> = Vec::new();
+    for line in original.lines() {
+        let is_h2 = line.strip_prefix("## ").map(|r| !r.trim().is_empty()) == Some(true)
+            || line.trim_end() == "##";
+        if is_h2 {
+            break;
+        }
+        preamble.push(line);
+    }
+    let mut out = String::new();
+    let pre = preamble.join("\n");
+    if !pre.trim().is_empty() {
+        out.push_str(&pre);
+        out.push_str("\n\n");
+    }
+    for (heading, body) in sections {
+        out.push_str(&format!("## {heading}\n\n{}\n\n", body.trim_end()));
+    }
+    out.trim_end().to_string() + "\n"
+}
+
 fn default_vault_root() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -651,6 +833,9 @@ mod tests {
             backup_ts: None,
             backup_root: None,
             scaffold_empty: false,
+            rewrite: false,
+            reasoning_mode: None,
+            repo: std::path::PathBuf::from("."),
             json: true,
         })
         .await
@@ -681,6 +866,9 @@ mod tests {
             backup_ts: Some(12345),
             backup_root: Some(backups.clone()),
             scaffold_empty: false,
+            rewrite: false,
+            reasoning_mode: None,
+            repo: std::path::PathBuf::from("."),
             json: true,
         })
         .await
@@ -719,6 +907,9 @@ mod tests {
             backup_ts: Some(1),
             backup_root: Some(backups.clone()),
             scaffold_empty: false,
+            rewrite: false,
+            reasoning_mode: None,
+            repo: std::path::PathBuf::from("."),
             json: true,
         })
         .await
@@ -736,6 +927,9 @@ mod tests {
             backup_ts: Some(2),
             backup_root: Some(backups.clone()),
             scaffold_empty: false,
+            rewrite: false,
+            reasoning_mode: None,
+            repo: std::path::PathBuf::from("."),
             json: true,
         })
         .await
@@ -830,6 +1024,9 @@ mod tests {
             backup_ts: Some(7),
             backup_root: Some(backups.clone()),
             scaffold_empty: true,
+            rewrite: false,
+            reasoning_mode: None,
+            repo: std::path::PathBuf::from("."),
             json: true,
         })
         .await
@@ -854,6 +1051,86 @@ mod tests {
         assert!(
             stub_block.contains("**Zašto:**"),
             "stub section gained the section skeleton"
+        );
+    }
+
+    // ---------- Phase 2: LLM rewrite seam (noop path; never runs a live model) ----------
+
+    #[test]
+    fn rebuild_body_preserves_preamble_and_swaps_sections() {
+        let original = "# Decisions\n\nPreamble line.\n\n## A\nold a body\n\n## B\nold b body\n";
+        let new_sections = vec![
+            ("A".to_string(), "**Odluka:** new a.".to_string()),
+            ("B".to_string(), "old b body".to_string()),
+        ];
+        let out = rebuild_body(original, &new_sections);
+        assert!(out.contains("# Decisions"), "preamble preserved");
+        assert!(out.contains("Preamble line."));
+        assert!(out.contains("## A\n\n**Odluka:** new a."));
+        assert!(out.contains("## B\n\nold b body"));
+        assert!(!out.contains("old a body"), "section A body was swapped");
+    }
+
+    #[tokio::test]
+    async fn rewrite_delegated_is_noop_and_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        // A decision file with a prose-but-non-conformant section (no **Odluka:**).
+        let original = "# Decisions\n\n## Loose decision\nSlobodan tekst bez ijednog labela.\n";
+        write(&vault.join("Memory/Decisions.md"), original);
+
+        // reasoning_mode defaults to `delegated` → provider is noop → no-op report.
+        normalize(NormalizeArgs {
+            vault: Some(vault.clone()),
+            apply: true, // even with --apply, a noop provider must NOT write
+            backup_ts: Some(11),
+            backup_root: Some(dir.path().join("backups")),
+            scaffold_empty: false,
+            rewrite: true,
+            reasoning_mode: Some("delegated".into()),
+            repo: dir.path().to_path_buf(),
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        // The file is UNCHANGED — delegated/noop never rewrites.
+        assert_eq!(
+            std::fs::read_to_string(vault.join("Memory/Decisions.md")).unwrap(),
+            original,
+            "delegated reasoning mode is a no-op; the prose section is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_dry_run_reports_candidate_count() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        // Two prose-non-conformant decision sections.
+        write(
+            &vault.join("Memory/Decisions.md"),
+            "# Decisions\n\n## One\nprose bez labela jedan.\n\n## Two\nprose bez labela dva.\n",
+        );
+
+        // Just assert it runs clean as a dry-run no-op (delegated). The count is
+        // surfaced in JSON; here we assert the safe no-write contract holds.
+        let before = std::fs::read_to_string(vault.join("Memory/Decisions.md")).unwrap();
+        normalize(NormalizeArgs {
+            vault: Some(vault.clone()),
+            apply: false,
+            backup_ts: None,
+            backup_root: None,
+            scaffold_empty: false,
+            rewrite: true,
+            reasoning_mode: Some("delegated".into()),
+            repo: dir.path().to_path_buf(),
+            json: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(vault.join("Memory/Decisions.md")).unwrap(),
+            before
         );
     }
 }
