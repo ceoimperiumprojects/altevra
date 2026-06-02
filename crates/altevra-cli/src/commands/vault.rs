@@ -575,6 +575,8 @@ async fn run_rewrite(
 
     let mut rewritten = 0usize;
     let mut would_rewrite = 0usize;
+    let mut si7_skipped = 0usize;
+    let provider_is_local = provider.is_local();
     let mut backup_dir: Option<PathBuf> = None;
 
     if will_write {
@@ -590,6 +592,14 @@ async fn run_rewrite(
         if p.sections_need_rewrite == 0 || p.parse_error.is_some() {
             continue;
         }
+        let class = classify_path(&p.rel);
+        // SI-7: high-water content (personal/relationship/health/legal/financial/
+        // client) must NEVER be sent to a cloud reasoning provider. A non-local
+        // provider is skipped for these files entirely — they need a local model.
+        if class.domain.is_high_water() && !provider_is_local {
+            si7_skipped += p.sections_need_rewrite;
+            continue;
+        }
         if !will_write {
             would_rewrite += p.sections_need_rewrite;
             continue;
@@ -597,7 +607,6 @@ async fn run_rewrite(
         // --- live path (only runs with --apply + a real provider; left for Pavle) ---
         let content = std::fs::read_to_string(&p.abs)?;
         let (_fm, body) = split_for_normalize(&content)?;
-        let class = classify_path(&p.rel);
         let sections = parse_sections(&body);
         // Rebuild the body, swapping ONLY the prose-non-conformant sections.
         let mut new_sections: Vec<(String, String)> = Vec::new();
@@ -649,6 +658,8 @@ async fn run_rewrite(
                 "sections_need_rewrite": sections_need_rewrite,
                 "would_rewrite": would_rewrite,
                 "rewritten": rewritten,
+                "si7_skipped_high_water": si7_skipped,
+                "provider_is_local": provider_is_local,
                 "backup": backup_dir.map(|d| d.display().to_string()),
             }))?
         );
@@ -668,6 +679,12 @@ async fn run_rewrite(
             provider.id()
         );
         println!("  would rewrite {would_rewrite} prose section(s). Add --apply to write.");
+        if si7_skipped > 0 {
+            println!(
+                "  SI-7: {si7_skipped} high-water section(s) SKIPPED (won't go to cloud '{}'; need a local model)",
+                provider.id()
+            );
+        }
         println!("  (a full vault backup is made before any write)");
     } else {
         println!("Vault rewrite — APPLIED via '{}'", provider.id());
@@ -675,6 +692,11 @@ async fn run_rewrite(
             println!("  backup: {}", d.display());
         }
         println!("  {rewritten} section(s) restructured (facts preserved by contract).");
+        if si7_skipped > 0 {
+            println!(
+                "  SI-7: {si7_skipped} high-water section(s) left untouched (cloud provider barred)."
+            );
+        }
     }
     Ok(())
 }
