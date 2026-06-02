@@ -2,6 +2,7 @@ use altevra_skills::{
     importer::{group_by_slug, scan_all, scan_external_dir, ExternalSkill, SourceTool},
     parser::parse_skill,
     registry::{SkillRegistry, VersionCheckResult},
+    sync::{apply_plan, build_plan, SyncAction},
 };
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,28 @@ pub enum SkillCommands {
     /// Inventory skills across ALL connected tools (~/.claude, ~/.codex,
     /// ~/.cursor, ~/.hermes, ~/.imperium, and the Altevra vault). Read-only.
     Inventory(SkillInventoryArgs),
+    /// Propagate skills across tools. DRY-RUN by default — pass --apply to write.
+    /// Never overwrites a non-managed (user-authored) file.
+    Sync(SkillSyncArgs),
+}
+
+#[derive(Args)]
+pub struct SkillSyncArgs {
+    /// Write changes to disk. Without --apply this is a dry-run (no writes).
+    #[arg(long)]
+    pub apply: bool,
+    /// Target tools to sync INTO. Default: all detected tools except Altevra
+    /// (Altevra is treated as a source/canonical store).
+    #[arg(long, value_delimiter = ',')]
+    pub to: Vec<String>,
+    /// Only consider skills with slugs matching this filter (substring).
+    #[arg(long)]
+    pub slug: Option<String>,
+    /// Include Altevra vault `06-skills` (relative to --vault) as a source.
+    #[arg(long, default_value = ".")]
+    pub vault: PathBuf,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args)]
@@ -81,7 +104,155 @@ pub async fn run(cmd: SkillCommands) -> anyhow::Result<()> {
         SkillCommands::Check(args) => run_check(args).await,
         SkillCommands::Refresh(args) => run_refresh(args).await,
         SkillCommands::Inventory(args) => run_inventory(args).await,
+        SkillCommands::Sync(args) => run_sync(args).await,
     }
+}
+
+/// Resolve where a tool keeps its skills on disk. Mirrors `default_skill_dirs`
+/// but returns the canonical write location even if the dir doesn't exist yet
+/// (the writer will create it).
+fn skill_dir_for(tool: &SourceTool) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    match tool {
+        SourceTool::Claude => Some(home.join(".claude/skills")),
+        SourceTool::Codex => Some(home.join(".codex/skills")),
+        SourceTool::Cursor => Some(home.join(".cursor/skills")),
+        SourceTool::Hermes => Some(home.join(".hermes/skills")),
+        SourceTool::Imperium => Some(home.join(".imperium/skills")),
+        // Altevra/Other have no canonical external write target.
+        _ => None,
+    }
+}
+
+async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
+    // Inventory the world (all tool dirs + vault).
+    let mut inventory: Vec<ExternalSkill> = scan_all();
+    let vault_dir = args.vault.join("06-skills");
+    if vault_dir.exists() {
+        inventory.extend(scan_external_dir(&vault_dir, SourceTool::Altevra));
+    }
+    if let Some(filter) = args.slug.as_deref() {
+        inventory.retain(|s| s.slug.contains(filter));
+    }
+
+    // Resolve targets: explicit --to, else all writable adapters.
+    let targets: Vec<SourceTool> = if args.to.is_empty() {
+        vec![
+            SourceTool::Claude,
+            SourceTool::Codex,
+            SourceTool::Cursor,
+            SourceTool::Hermes,
+            SourceTool::Imperium,
+        ]
+    } else {
+        let mut ts = Vec::new();
+        for name in &args.to {
+            match name.as_str() {
+                "claude" => ts.push(SourceTool::Claude),
+                "codex" => ts.push(SourceTool::Codex),
+                "cursor" => ts.push(SourceTool::Cursor),
+                "hermes" => ts.push(SourceTool::Hermes),
+                "imperium" => ts.push(SourceTool::Imperium),
+                other => anyhow::bail!(
+                    "unknown --to tool '{other}' (valid: claude, codex, cursor, hermes, imperium)"
+                ),
+            }
+        }
+        ts
+    };
+
+    let plan = build_plan(&inventory, &targets, &skill_dir_for);
+    let result = apply_plan(&plan, args.apply);
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": !args.apply,
+                "targets": targets.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
+                "creates_planned": plan.creates(),
+                "refreshes_planned": plan.refreshes(),
+                "skips_planned": plan.skips(),
+                "applied": args.apply,
+                "created": result.created,
+                "refreshed": result.refreshed,
+                "skipped": result.skipped,
+                "errors": result.errors,
+                "actions": plan.actions,
+            }))?
+        );
+    } else {
+        let mode = if args.apply { "APPLY" } else { "DRY-RUN" };
+        println!(
+            "Skill sync [{mode}] — targets: {}\n",
+            targets
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "  creates:   {}\n  refreshes: {}\n  skips:     {}",
+            plan.creates(),
+            plan.refreshes(),
+            plan.skips()
+        );
+        if !plan.actions.is_empty() {
+            println!("\nFirst few actions:");
+            for a in plan.actions.iter().take(15) {
+                match a {
+                    SyncAction::Create {
+                        slug,
+                        from_tool,
+                        to_tool,
+                        ..
+                    } => println!(
+                        "  + create  {slug:32}  {}→{}",
+                        from_tool.as_str(),
+                        to_tool.as_str()
+                    ),
+                    SyncAction::Refresh {
+                        slug,
+                        from_tool,
+                        to_tool,
+                        ..
+                    } => println!(
+                        "  ↻ refresh {slug:32}  {}→{}",
+                        from_tool.as_str(),
+                        to_tool.as_str()
+                    ),
+                    SyncAction::Skip {
+                        slug,
+                        to_tool,
+                        reason,
+                        ..
+                    } => println!(
+                        "  - skip    {slug:32}  →{}  ({:?})",
+                        to_tool.as_str(),
+                        reason
+                    ),
+                }
+            }
+            if plan.actions.len() > 15 {
+                println!("  …({} more)", plan.actions.len() - 15);
+            }
+        }
+        if args.apply {
+            println!(
+                "\nApplied — created: {}, refreshed: {}, skipped: {}, errors: {}",
+                result.created,
+                result.refreshed,
+                result.skipped,
+                result.errors.len()
+            );
+            for e in &result.errors {
+                eprintln!("  ! {e}");
+            }
+        } else {
+            println!("\n(dry-run — no files written. Re-run with --apply to write.)");
+        }
+    }
+    Ok(())
 }
 
 async fn run_inventory(args: SkillInventoryArgs) -> anyhow::Result<()> {

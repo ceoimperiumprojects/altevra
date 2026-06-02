@@ -23,6 +23,17 @@ Two follow-on features built and live-verified after Pavle's product feedback:
 
 Baseline 685 tests pass / 0 fail; clippy `--workspace -D warnings` clean. 15 commits on `altevra-overnight-p0`.
 
+## 2026-06-02 (session 4 cont'd) — skill sync propagation engine ✅ DRY-RUN PASS
+
+Built the sync engine on top of the inventory; explicitly stopped at apply (Pavle authorization).
+
+- **Sync planner DRY-RUN LIVE ✅** — on real disk (137 unique slugs across 5 tools): `326 creates planned, 359 skips, 0 refreshes` (refreshes = 0 because nothing was ever synced before). Skips correctly classified UserAuthored for every third-party skill in claude/codex/cursor — those NEVER get touched. Filter `--slug altevra --to hermes` correctly isolated 2 propagation candidates (altevra-core + altevra-agent-operations → hermes).
+- **Hard safety invariants enforced**: NEVER overwrites a non-`ALTEVRA_MANAGED` file; atomic write (write-temp + rename) so a crash mid-write leaves no half-file; managed header injected so subsequent syncs are idempotent (`AlreadyInSync` skip when content matches).
+- **3 sync unit tests** cover the full lifecycle: create-vs-skip (UserAuthored), apply-with-header-and-refresh-on-drift, source-preference (user-authored > managed).
+- **APPLY explicitly NOT executed live** — the Claude Code auto-mode classifier (rightly) blocked writing into `~/.hermes/skills/` without Pavle's explicit authorization (Constitutional Contract §7: no silent external side-effects). Engine + DRY-RUN proven; the `--apply` switch awaits Pavle's go.
+
+Baseline 688 tests pass / 0 fail; clippy `--workspace -D warnings` clean.
+
 ## 2026-06-01 — MCP stdio connection (autonomous half) ✅ PASS
 
 **What:** Built the real release binary (`cargo build --release -p altevra-cli`,
