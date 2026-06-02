@@ -2,6 +2,39 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 9) — `recall_about` MCP tool: entity graph over MCP ✅ PASS
+
+Made the mention graph UNIVERSAL — Claude Code / Cursor / Codex (not just the CLI)
+can now ask "what about Đorđe". Baseline 783 → 790 tests, 0 fail; clippy
+`--workspace --all-targets -D warnings` clean; fmt.
+
+- **Loader moved to `altevra-vault::entity_dict`** (the small seam): the
+  serde_yaml dictionary loader (People.md + projects.yaml + Projects/ dirs +
+  mentor seed) + `resolve_entity` now live in `altevra-vault` (already a dep of
+  both the CLI and `altevra-mcp`). The CLI `entity_dict` is a thin re-export — no
+  duplicate logic, no new heavy dep. `add_person` now also tokenizes the name into
+  per-token aliases (so `recall_about {entity:"Dimitrijević"}` resolves to Đorđe).
+- **MCP tool `recall_about { entity, window?, limit?, db_path?, vault? }`** in
+  `tools_sessions.rs` + wired into server.rs list/dispatch (gets `vault_path`).
+  Resolves the name via the shared dictionary (diacritic/case/inflection-
+  insensitive), returns `mentions`-linked objects recency-sorted with breadcrumbs.
+- **Exposure gating (R11 #4) for OBJECTS**: new `object_exposable` builds an
+  Envelope from the learning's real domain+sensitivity+redaction and runs the same
+  `ExposureGate` as the turn reads — a Restricted (relationship/health/personal)
+  note linked to an entity is WITHHELD, never leaked through the graph. Unknown
+  name → clean not-found (nothing sensitive). 7 new tests incl. the high-water
+  gate + clean-miss.
+- **LIVE via the release `altevra serve` MCP server** (vault never written): seeded
+  a temp DB by atomizing copies of real People.md (10 obj / 13 edges) +
+  Decisions.md (31 / 22). `recall_about {entity:"Đorđe"}` → resolved person,
+  **count 1** (the inflection-matched "Đorđetova direktiva" decision, breadcrumb
+  `decision · business · 1w ago`); `{entity:"ReVesta"}` → project, **count 13**;
+  `{entity:"Djordje"}` (ascii) → same entity; unknown name → clean miss. recall_about
+  present in tools/list. Real vault untouched.
+
+This closes the entity arc — the cross-link engine is now reachable by every AI
+tool Pavle uses, with the same safety gate as every other read.
+
 ## 2026-06-02 (session 8) — entity extraction → mention graph ✅ PASS
 
 Keyless (no LLM/NER) cross-link: when captured text mentions a known person/project,

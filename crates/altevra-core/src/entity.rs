@@ -191,6 +191,13 @@ impl EntityDictionary {
         for a in aliases {
             ent = ent.with_alias(a);
         }
+        // Per-token aliases (first name / surname individually), like People.md
+        // parsing — so resolving by surname (`Dimitrijević`) finds the person.
+        for tok in name.split_whitespace() {
+            if tok.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
+                ent = ent.with_alias(tok);
+            }
+        }
         ent = finalize_aliases(ent);
         self.people.push(ent);
     }

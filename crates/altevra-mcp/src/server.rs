@@ -447,6 +447,25 @@ pub fn list_tools() -> Value {
         ),
     ));
     tools.push(tool(
+        "recall_about",
+        "Cross-link recall by ENTITY — \"what did I do with Đorđe / on ReVesta\". \
+         Resolves a known person/project (from People.md + the project registry; \
+         diacritic/case/inflection-insensitive — Đorđe = Djordje = Dimitrijević) and \
+         returns the decisions/notes that MENTION it, recency-sorted with provenance \
+         breadcrumbs. High-water (personal/health/relationship) objects are exposure- \
+         gated, never leaked. Unknown name → a clean not-found, nothing sensitive.",
+        obj_schema(
+            &["entity"],
+            serde_json::json!({
+                "entity": {"type": "string", "description": "Person or project name (e.g. \"Đorđe\", \"ReVesta\")."},
+                "window": {"type": "string", "description": "Optional time cut: preset (last_week|last_month|…) or duration (30d|3mo|…)."},
+                "limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+                "vault": {"type": "string", "description": "Vault root for the entity dictionary (default: server vault)."},
+            }),
+        ),
+    ));
+    tools.push(tool(
         "file_history",
         "Recorded change history for a file path.",
         obj_schema(
@@ -627,6 +646,9 @@ impl McpServer {
             "replay_session" => crate::tools_sessions::handle_replay_session(id, args),
             "search_turns" => crate::tools_sessions::handle_search_turns(id, args),
             "recall_window" => crate::tools_sessions::handle_recall_window(id, args),
+            "recall_about" => {
+                crate::tools_sessions::handle_recall_about(id, args, &self.vault_path)
+            }
             "file_history" => crate::tools_sessions::handle_file_history(id, args),
             // v0.3.7.5: Research v2
             "discover_feed" => crate::tools_discovery::handle_discover_feed(id, args),

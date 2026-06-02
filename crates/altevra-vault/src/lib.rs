@@ -4,6 +4,7 @@
 //! directories (`00-inbox`, `01-projects`, ...) holding markdown files with
 //! optional YAML frontmatter.
 
+pub mod entity_dict;
 pub mod frontmatter;
 pub mod normalize;
 pub mod parser;
@@ -13,6 +14,9 @@ pub mod sections;
 pub mod wiki;
 pub mod writer;
 
+pub use entity_dict::{
+    build_dictionary, build_dictionary_for_vault, resolve_entity, vault_root_for,
+};
 pub use frontmatter::{parse_frontmatter, serialize_frontmatter, Frontmatter, FrontmatterError};
 pub use normalize::{
     classify_path, normalize_frontmatter, render_normalized, split_for_normalize, DocClass,

@@ -303,6 +303,190 @@ pub fn handle_recall_window(id: Value, args: &Value) -> McpResponse {
     }
 }
 
+/// R11 #4 for durable OBJECTS (the mention-graph targets): a learning carrying a
+/// high-water domain (`relationship`/`personal`/`health`/…) is stored Restricted,
+/// so the ExposureGate denies it to an MCP/agent caller — a person/health note
+/// mentioned by an entity must NOT leak just because it was linked. Same gate the
+/// turn reads use, applied with the object's real domain + sensitivity + redaction.
+fn object_exposable(
+    domain: &str,
+    sensitivity: &str,
+    redaction_status: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use altevra_core::envelope::{Envelope, Provenance, ProvenanceOrigin};
+    use altevra_core::safety::{ExposureGate, ExposureRequest};
+    use altevra_core::security::Sensitivity;
+    use altevra_core::status::RedactionStatus;
+
+    let mut env = Envelope::new(
+        "object",
+        "learning",
+        created_at,
+        Provenance::new(ProvenanceOrigin::Imported),
+    );
+    env.sensitivity = sensitivity.parse::<Sensitivity>().unwrap();
+    env.domain = domain.parse::<altevra_core::domain::Domain>().unwrap();
+    let redaction = redaction_status
+        .parse::<RedactionStatus>()
+        .unwrap_or(RedactionStatus::Unscanned);
+    ExposureGate::decide(&env, &redaction, &ExposureRequest::default_work()).is_allowed()
+}
+
+/// `recall_about { entity, window?, limit?, db_path?, vault? }` — the mention graph
+/// over MCP, so Claude Code / Cursor / Codex can ask "what about Đorđe" too (not
+/// just the CLI). Resolves the name via the shared dictionary (diacritic/case/
+/// inflection-insensitive), returns objects linked through `mentions` edges,
+/// recency-sorted with breadcrumbs, EACH passed through the same exposure gate as
+/// `search_turns`/`recall_window`. Unknown name → a clean error (no leak).
+pub fn handle_recall_about(
+    id: Value,
+    args: &Value,
+    default_vault: &std::path::Path,
+) -> McpResponse {
+    let entity_name = args.get("entity").and_then(|v| v.as_str()).unwrap_or("");
+    if entity_name.trim().is_empty() {
+        return McpResponse::error(id, -32602, "entity required");
+    }
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let db_path = db_path_from_args(args);
+    let vault: PathBuf = args
+        .get("vault")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_vault.to_path_buf());
+
+    // Temporal window (optional) — same fail-closed parse as the other tools.
+    let now = chrono::Utc::now();
+    let mut t_since = None;
+    let mut t_until = None;
+    if let Some(w) = args.get("window").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_window(w, now) {
+            Some(r) => {
+                t_since = Some(r.since);
+                t_until = Some(r.until);
+            }
+            None => {
+                return McpResponse::error(
+                    id,
+                    -32602,
+                    format!("unknown window '{w}' (try: 24h, 7d, 30d, 3mo, last_week, last_month)"),
+                );
+            }
+        }
+    }
+
+    // Resolve the entity from the shared vault dictionary.
+    let dict = altevra_vault::build_dictionary_for_vault(&vault);
+    let Some(entity) = altevra_vault::resolve_entity(&dict, entity_name) else {
+        // Clean miss — list nothing sensitive, just the not-found fact.
+        return McpResponse::ok(
+            id,
+            serde_json::json!({
+                "entity": entity_name,
+                "resolved": false,
+                "message": format!("no known person/project matching '{entity_name}'"),
+                "count": 0,
+                "results": [],
+            }),
+        );
+    };
+    let entity_id = entity.id.clone();
+    let entity_display = entity.name.clone();
+    let entity_kind = entity.kind.as_str();
+
+    let result: anyhow::Result<Value> = futures::executor::block_on(async {
+        let pool = open_pool(&db_path).await?;
+        let mentions = altevra_db::MentionsRepository::new(&pool);
+        let learnings = altevra_db::LearningsRepository::new(&pool);
+        // Pull a generous candidate set; gate + window-filter, then truncate.
+        let sources = mentions
+            .objects_mentioning(&entity_id, (limit * 4).max(50))
+            .await?;
+
+        let mut results = Vec::new();
+        for (otype, oid) in &sources {
+            if otype != "learning" {
+                continue; // only atomized learning objects carry edges today
+            }
+            let Some(row) = learnings.get(oid).await? else {
+                continue;
+            };
+            if row.status == "forgotten" {
+                continue;
+            }
+            // Temporal cut on the section's created date (from provenance) if present.
+            let when = provenance_created(&row.provenance).unwrap_or(now);
+            if let Some(s) = t_since {
+                if when < s {
+                    continue;
+                }
+            }
+            if let Some(u) = t_until {
+                if when >= u {
+                    continue;
+                }
+            }
+            // R11 #4: gate the object — a Restricted (high-water) note is withheld.
+            if !object_exposable(&row.domain, &row.sensitivity, &row.redaction_status, when) {
+                continue;
+            }
+            let when_h = altevra_core::time_window::humanize_relative(when, now);
+            results.push((
+                when,
+                serde_json::json!({
+                    "id": row.id,
+                    "title": row.title,
+                    "domain": row.domain,
+                    "when": when,
+                    "when_human": when_h,
+                    "snippet": row.body.chars().take(220).collect::<String>(),
+                    "breadcrumb": format!("{} · {} · {when_h}", object_kind(&row.tags), row.domain),
+                }),
+            ));
+        }
+        results.sort_by_key(|r| std::cmp::Reverse(r.0));
+        results.truncate(limit as usize);
+        let entries: Vec<Value> = results.into_iter().map(|(_, v)| v).collect();
+        Ok(serde_json::json!({
+            "entity": entity_name,
+            "resolved": true,
+            "entity_id": entity_id,
+            "entity_name": entity_display,
+            "kind": entity_kind,
+            "window": t_since.map(|s| serde_json::json!({"since": s, "until": t_until})),
+            "count": entries.len(),
+            "results": entries,
+        }))
+    });
+
+    match result {
+        Ok(v) => McpResponse::ok(id, v),
+        Err(e) => McpResponse::error(id, -32603, e.to_string()),
+    }
+}
+
+/// `kind:<type>` tag → display kind, else `note`.
+fn object_kind(tags_json: &str) -> String {
+    if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json) {
+        for t in tags {
+            if let Some(k) = t.strip_prefix("kind:") {
+                return k.to_string();
+            }
+        }
+    }
+    "note".to_string()
+}
+
+/// Pull a `created` YYYY-MM-DD date from a provenance JSON blob (atomize stores
+/// the section heading's date there).
+fn provenance_created(provenance: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let v: serde_json::Value = serde_json::from_str(provenance).ok()?;
+    let s = v.get("created")?.as_str()?;
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(d.and_hms_opt(12, 0, 0)?.and_utc())
+}
+
 pub fn handle_file_history(id: Value, args: &Value) -> McpResponse {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
@@ -514,5 +698,161 @@ mod tests {
         assert!(!turn_exposable(&base("internal", "unscanned")));
         // unknown sensitivity ranks max → withheld.
         assert!(!turn_exposable(&base("weird-future-value", "clean")));
+    }
+
+    #[test]
+    fn object_exposable_gates_high_water() {
+        let now = Utc::now();
+        // business/internal/clean → exposable.
+        assert!(object_exposable("business", "internal", "clean", now));
+        // relationship/restricted (a person note) → withheld even if clean.
+        assert!(!object_exposable(
+            "relationship",
+            "restricted",
+            "clean",
+            now
+        ));
+        // health/restricted → withheld.
+        assert!(!object_exposable("health", "restricted", "clean", now));
+        // unscanned → fail-closed.
+        assert!(!object_exposable("business", "internal", "unscanned", now));
+    }
+
+    /// Seed a learning + a mention edge to `entity_id`. `learning` is
+    /// `(id, title, body)`, `class` is `(domain, sensitivity)`. The entity kind is
+    /// derived from the `entity_id` prefix (`person:`/`project:`).
+    async fn seed_mention(
+        db: &std::path::Path,
+        learning: (&str, &str, &str),
+        class: (&str, &str),
+        entity_id: &str,
+    ) {
+        let (learning_id, title, body) = learning;
+        let (domain, sensitivity) = class;
+        let entity_kind = entity_id.split(':').next().unwrap_or("person");
+        let pool = altevra_db::create_pool(&db.to_string_lossy())
+            .await
+            .unwrap();
+        altevra_db::run_migrations(&pool).await.unwrap();
+        let mut row = altevra_db::LearningRow::new(learning_id, title, body);
+        row.domain = domain.into();
+        row.sensitivity = sensitivity.into();
+        row.redaction_status = "clean".into();
+        row.categories = "[\"business\"]".into();
+        row.tags = "[\"business\",\"kind:decision\"]".into();
+        altevra_db::LearningsRepository::new(&pool)
+            .insert(&row)
+            .await
+            .unwrap();
+        altevra_db::MentionsRepository::new(&pool)
+            .record("learning", learning_id, entity_kind, entity_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recall_about_returns_linked_objects_and_resolves_diacritic() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        // vault with a People.md so the dictionary resolves; Đorđe comes from the
+        // mentor seed (always present).
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("People.md"), "# People\n\n## Luka — ReVesta\n").unwrap();
+
+        seed_mention(
+            &db,
+            (
+                "capture-decisions-lane-1",
+                "Lane split",
+                "Đorđe je rekao: prodaja pre build-a.",
+            ),
+            ("business", "internal"),
+            "person:djordje",
+        )
+        .await;
+
+        // ascii spelling "Djordje" must resolve to the same entity → 1 hit.
+        let args = serde_json::json!({
+            "entity": "Djordje",
+            "db_path": db.to_string_lossy(),
+            "vault": tmp.path().to_string_lossy(),
+        });
+        let resp = handle_recall_about(serde_json::json!(1), &args, tmp.path());
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let r = resp.result.unwrap();
+        assert_eq!(r["resolved"], true);
+        assert_eq!(r["entity_id"], "person:djordje");
+        assert_eq!(r["count"].as_i64().unwrap(), 1);
+        assert!(r["results"][0]["breadcrumb"]
+            .as_str()
+            .unwrap()
+            .contains("decision"));
+    }
+
+    #[tokio::test]
+    async fn recall_about_gates_high_water_object() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("People.md"), "# People\n").unwrap();
+
+        // A RESTRICTED relationship note that mentions Đorđe must NOT be returned.
+        seed_mention(
+            &db,
+            (
+                "capture-people-secret-1",
+                "Private note",
+                "sensitive personal context about Đorđe",
+            ),
+            ("relationship", "restricted"),
+            "person:djordje",
+        )
+        .await;
+
+        let args = serde_json::json!({
+            "entity": "Đorđe",
+            "db_path": db.to_string_lossy(),
+            "vault": tmp.path().to_string_lossy(),
+        });
+        let resp = handle_recall_about(serde_json::json!(1), &args, tmp.path());
+        let r = resp.result.unwrap();
+        assert_eq!(r["resolved"], true);
+        assert_eq!(
+            r["count"].as_i64().unwrap(),
+            0,
+            "high-water object must be exposure-gated, never leaked via mentions"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_about_unknown_entity_is_clean_miss() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("People.md"), "# People\n").unwrap();
+        let args = serde_json::json!({
+            "entity": "Nobody McNotreal",
+            "db_path": db.to_string_lossy(),
+            "vault": tmp.path().to_string_lossy(),
+        });
+        let resp = handle_recall_about(serde_json::json!(1), &args, tmp.path());
+        assert!(resp.error.is_none());
+        let r = resp.result.unwrap();
+        assert_eq!(r["resolved"], false);
+        assert_eq!(r["count"].as_i64().unwrap(), 0);
+        assert!(r["message"].as_str().unwrap().contains("no known"));
+    }
+
+    #[test]
+    fn recall_about_requires_entity() {
+        let resp = handle_recall_about(
+            serde_json::json!(1),
+            &serde_json::json!({}),
+            std::path::Path::new("."),
+        );
+        assert!(resp.error.is_some());
     }
 }

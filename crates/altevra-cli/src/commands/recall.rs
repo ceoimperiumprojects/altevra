@@ -230,7 +230,7 @@ async fn recall_with_entity(
         .map(|v| v.join("Memory").join("People.md"))
         .unwrap_or_else(default_people_md);
     let dict = crate::commands::entity_dict::build_dictionary(&probe, args.vault.as_deref());
-    let entity = resolve_entity(&dict, name);
+    let entity = altevra_vault::resolve_entity(&dict, name);
     let Some(entity) = entity else {
         if args.json {
             println!(
@@ -328,30 +328,6 @@ async fn recall_with_entity(
         println!("    {}", it.snippet);
     }
     Ok(())
-}
-
-/// Resolve a free-text name to a dictionary entity: exact-id, then any alias match
-/// (ascii-folded, case-insensitive), longest-name first so a full name wins.
-fn resolve_entity<'a>(
-    dict: &'a altevra_core::EntityDictionary,
-    name: &str,
-) -> Option<&'a altevra_core::Entity> {
-    if let Some(e) = dict.get(name) {
-        return Some(e);
-    }
-    let want = altevra_core::ascii_fold(name).to_lowercase();
-    let mut best: Option<&altevra_core::Entity> = None;
-    for e in dict.all() {
-        let hit = e
-            .aliases
-            .iter()
-            .any(|a| altevra_core::ascii_fold(a).to_lowercase() == want)
-            || altevra_core::ascii_fold(&e.name).to_lowercase() == want;
-        if hit && best.map(|b| e.name.len() > b.name.len()).unwrap_or(true) {
-            best = Some(e);
-        }
-    }
-    best
 }
 
 /// `kind:<type>` tag → display kind, else the row's object type.
