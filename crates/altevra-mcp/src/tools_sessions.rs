@@ -120,10 +120,47 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
         return McpResponse::error(id, -32602, "query required");
     }
 
+    // Temporal recall: `since`/`until` accept RFC3339, `YYYY-MM-DD`, or relative
+    // durations (`30d`, `3mo`, …) interpreted as "now - duration". `window` is a
+    // shorthand preset (`last_week`, `last_month`, `30d`, …). A bad value is a
+    // hard parse error — fail-closed so "pre mesec dana" never silently widens.
+    let now = chrono::Utc::now();
+    let mut t_since = None;
+    let mut t_until = None;
+    if let Some(w) = args.get("window").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_window(w, now) {
+            Some(r) => {
+                t_since = Some(r.since);
+                t_until = Some(r.until);
+            }
+            None => {
+                return McpResponse::error(
+                    id,
+                    -32602,
+                    format!("unknown window '{w}' (try: 24h, 7d, 30d, 3mo, last_week, last_month)"),
+                );
+            }
+        }
+    }
+    if let Some(s) = args.get("since").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(s, now) {
+            Some(t) => t_since = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'since' value '{s}'")),
+        }
+    }
+    if let Some(u) = args.get("until").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(u, now) {
+            Some(t) => t_until = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'until' value '{u}'")),
+        }
+    }
+
     let result: anyhow::Result<Value> = futures::executor::block_on(async {
         let pool = open_pool(&db_path).await?;
         let repo = altevra_db::SessionsRepository::new(&pool);
-        let raw_hits = repo.search_turns(query, project, tool, limit).await?;
+        let raw_hits = repo
+            .search_turns_in_window(query, project, tool, t_since, t_until, limit)
+            .await?;
         // R11 #4: gate every hit — never return a turn above the work ceiling or
         // insufficiently redacted, regardless of how well it matched the query.
         let hits: Vec<_> = raw_hits
@@ -133,6 +170,10 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
         Ok(serde_json::json!({
             "query": query,
             "count": hits.len(),
+            "window": t_since.map(|s| serde_json::json!({
+                "since": s,
+                "until": t_until,
+            })),
             "results": hits.iter().map(|(t, score)| serde_json::json!({
                 "session_id": t.session_id,
                 "turn_idx": t.turn_idx,

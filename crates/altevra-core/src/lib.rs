@@ -19,6 +19,7 @@ pub mod security;
 pub mod selfimprove;
 pub mod status;
 pub mod template;
+pub mod time_window;
 pub mod updates;
 
 pub use capability::{Support, TrustLevel};

@@ -477,6 +477,23 @@ impl<'a> SessionsRepository<'a> {
         tool: Option<&str>,
         limit: i64,
     ) -> anyhow::Result<Vec<(TurnRow, f32)>> {
+        self.search_turns_in_window(query, project, tool, None, None, limit)
+            .await
+    }
+
+    /// Temporal-window variant of `search_turns` — answers questions like
+    /// "what were we doing a month ago with the Americans". `since`/`until` are
+    /// inclusive-start, exclusive-end UTC bounds; both `None` collapses to the
+    /// unrestricted `search_turns`.
+    pub async fn search_turns_in_window(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        tool: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<(TurnRow, f32)>> {
         let q_tokens: Vec<String> = query
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
@@ -506,6 +523,12 @@ impl<'a> SessionsRepository<'a> {
         if project.is_some() {
             sql.push_str(" AND s.project_name = ?");
         }
+        if since.is_some() {
+            sql.push_str(" AND t.created_at >= ?");
+        }
+        if until.is_some() {
+            sql.push_str(" AND t.created_at < ?");
+        }
         sql.push_str(" ORDER BY t.created_at DESC LIMIT ?");
 
         let mut q = sqlx::query(&sql);
@@ -517,6 +540,12 @@ impl<'a> SessionsRepository<'a> {
         }
         if let Some(p) = project {
             q = q.bind(p);
+        }
+        if let Some(t) = since {
+            q = q.bind(ts_to_text(&t));
+        }
+        if let Some(t) = until {
+            q = q.bind(ts_to_text(&t));
         }
         // Cap candidate set generously; final ranking is in-process.
         q = q.bind(limit * 4);
@@ -918,5 +947,71 @@ mod tests {
         repo.start_session(&s).await.unwrap();
         let hits = repo.search_turns("", None, None, 10).await.unwrap();
         assert!(hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_turns_in_window_filters_by_time_range() {
+        // Pavle's exact use-case: "what were we doing a month ago with the Americans".
+        // Three turns: one a month ago about Americans, one yesterday about Americans,
+        // one a month ago about something else. Asking for "Americans in the last 40
+        // days but BEFORE 25 days ago" must return ONLY the month-old one.
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        repo.start_session(&s).await.unwrap();
+
+        let now = Utc::now();
+        let month_ago = now - chrono::Duration::days(30);
+        let yesterday = now - chrono::Duration::days(1);
+
+        let mk = |idx: i64, content: &str, ts| TurnRow {
+            id: Uuid::new_v4(),
+            session_id: s.id,
+            turn_idx: idx,
+            role: "user".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: None,
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
+            created_at: ts,
+        };
+        repo.record_turn(&mk(0, "called Americans about the deal", month_ago))
+            .await
+            .unwrap();
+        repo.record_turn(&mk(1, "Americans replied yesterday", yesterday))
+            .await
+            .unwrap();
+        repo.record_turn(&mk(2, "unrelated rust refactor", month_ago))
+            .await
+            .unwrap();
+
+        // Window: 25..40 days ago — captures the month-old American turn only.
+        let since = now - chrono::Duration::days(40);
+        let until = now - chrono::Duration::days(25);
+        let hits = repo
+            .search_turns_in_window("Americans", None, None, Some(since), Some(until), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "only the month-old Americans turn should match"
+        );
+        assert!(hits[0].0.content.contains("called Americans"));
+
+        // Sanity: no window → both Americans turns.
+        let all = repo
+            .search_turns("Americans", None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
     }
 }

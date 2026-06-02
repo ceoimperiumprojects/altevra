@@ -409,7 +409,10 @@ pub fn list_tools() -> Value {
     ));
     tools.push(tool(
         "search_turns",
-        "BM25-style search over recorded turn content.",
+        "BM25-style search over recorded turn content. Supports temporal recall: \
+         pass `window` (e.g. `last_week`, `30d`, `3mo`) or explicit `since`/`until` \
+         (RFC3339, YYYY-MM-DD, or relative `30d`) to narrow to a time range — answers \
+         \"what were we doing a month ago about X\".",
         obj_schema(
             &["query"],
             serde_json::json!({
@@ -418,6 +421,9 @@ pub fn list_tools() -> Value {
                 "tool": {"type": "string"},
                 "limit": {"type": "integer"},
                 "db_path": {"type": "string"},
+                "window": {"type": "string", "description": "Preset (last_24h|last_week|last_month|last_quarter|last_year) or duration (24h|7d|30d|3mo|1y)."},
+                "since": {"type": "string", "description": "RFC3339, YYYY-MM-DD, or duration (e.g. 30d = now-30d)."},
+                "until": {"type": "string", "description": "Same formats as since (default: now)."},
             }),
         ),
     ));
