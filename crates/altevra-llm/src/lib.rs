@@ -1,18 +1,29 @@
 //! altevra-llm — multi-provider LLM abstraction.
 //!
-//! v0.3.8 first cut: Gemini Flash chat provider used by Analyze Everything for
-//! automatic session summaries. v0.3.9 generalizes into full `ChatProvider` and
-//! `EmbeddingProvider` traits with native (Gemini, OpenAI, Anthropic, Voyage)
-//! and OpenAI-compatible (DeepSeek, Qwen, Moonshot, Zhipu, MiniMax, Baichuan,
-//! Yi, Stepfun, Groq, Together, OpenRouter, Mistral, Cohere, Ollama, vLLM,
-//! Custom) adapters.
+//! Routes by ROLE (cheap_worker / strong_reasoner / local_private / …), never by a
+//! concrete model. Real providers:
+//!
+//! - [`gemini::GeminiFlashChat`] — Google Gemini (native).
+//! - [`codex_oauth::CodexOAuthProvider`] — ChatGPT (GPT-5.5) via `~/.codex/auth.json`.
+//! - [`openai_compat::OpenAICompatProvider`] — any OpenAI-compatible endpoint (OpenAI, DeepSeek, Groq, OpenRouter, Ollama, vLLM, …); local when the host is loopback.
+//! - [`anthropic::AnthropicProvider`] — Anthropic Messages API.
+//!
+//! With no keys, every role resolves to [`provider::NoopProvider`] (delegated mode):
+//! the connected tool does the reasoning over MCP. SI-7: `local_private` only ever
+//! resolves to a LOCAL provider — the router enforces it.
 
+pub mod anthropic;
 pub mod chat;
+pub mod codex_oauth;
 pub mod gemini;
+pub mod openai_compat;
 pub mod provider;
 pub mod rate_limit;
 
+pub use anthropic::AnthropicProvider;
 pub use chat::{ChatMessage, ChatOpts, ChatRole};
+pub use codex_oauth::{CodexOAuthProvider, CodexWire};
 pub use gemini::GeminiFlashChat;
+pub use openai_compat::OpenAICompatProvider;
 pub use provider::{ChatProvider, ModelRole, ModelRouter, NoopProvider};
 pub use rate_limit::RateLimiter;

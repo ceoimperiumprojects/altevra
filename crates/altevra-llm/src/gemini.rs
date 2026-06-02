@@ -239,9 +239,34 @@ impl GeminiFlashChat {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::provider::ChatProvider for GeminiFlashChat {
+    fn id(&self) -> &str {
+        "gemini-flash"
+    }
+    fn is_local(&self) -> bool {
+        false
+    }
+    async fn complete(&self, messages: &[ChatMessage], opts: &ChatOpts) -> anyhow::Result<String> {
+        // Delegate to the inherent (by-value-opts) method. Fully-qualified to make
+        // the inherent-vs-trait resolution explicit; the direct call sites in
+        // analyze/orchestrator.rs keep using the inherent method unchanged.
+        GeminiFlashChat::complete(self, messages, opts.clone()).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::ChatProvider;
+    use std::sync::Arc;
+
+    #[test]
+    fn gemini_impls_chat_provider() {
+        let p: Arc<dyn ChatProvider> = Arc::new(GeminiFlashChat::from_key("dummy"));
+        assert_eq!(p.id(), "gemini-flash");
+        assert!(!p.is_local());
+    }
 
     #[test]
     fn endpoint_uses_model_name() {
