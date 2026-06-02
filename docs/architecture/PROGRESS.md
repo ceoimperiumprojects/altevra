@@ -108,12 +108,21 @@ injection-safe MATCH. The primary lexical retrieval substrate.
   chain + /goal loop, non-blocking — NOT Altevra.)
 - Connections: Claude MCP smoke PASS + Cursor connect→mcp.json→serve smoke PASS.
 
-### T-INV14 next exact step
-get_context_packet (altevra-mcp/tools_memory.rs) + CLI `context` still use legacy
-scan_vault. Rewire: read candidates via ObjectIndexRepository::candidates → PacketCompiler
-→ ExposureGate (gated) → return packet. object_index/object_fts now have a maintenance
-primitive (index_object); also route durable writes (LearningsRepository.insert, etc.)
-through it so candidates are populated. Then the live read path is gated + FTS-backed.
+### T-INV14 — DONE (`c8158d1`)
+- Write-side: `LearningsRepository.insert` → `index_object` populates object_index + FTS.
+- Read-side: MCP `get_context_packet` returns a REAL gated packet (candidates →
+  PacketCompiler → ExposureGate work-ceiling → items/excluded/tokens/truncated),
+  additive (vault-stats fields kept), runs on a dedicated thread+runtime (safe from
+  any context), error→empty packet. LIVE-verified through `altevra serve`.
+- Remaining wiring (optional polish): route the OTHER durable writers (decisions,
+  wiki, etc.) through index_object too; wire CLI `context` to the same compiler.
+
+### What's genuinely LEFT (key-dependent OR interactive — the goal's stop condition)
+- LLM-driven loops (resident 7-stage orchestration, skill_factory_proposer detection):
+  scaffolded + noop-ready; doing real work needs a provider key (flip noop→live).
+- Interactive Cursor TUI spawn in a herdr pane (wiring proven; Pavle's hands-on).
+- P0.8 runtime: lifecycle/purge job, export/forget/legal-hold CLI (presence pattern
+  ready), Imperium generated_mirror writer. Buildable keylessly — next session.
 
 ### Baseline + push state
 608 tests pass, 0 failed; clippy --workspace --all-targets -D warnings clean; MCP
