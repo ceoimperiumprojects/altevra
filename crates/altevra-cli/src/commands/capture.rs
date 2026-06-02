@@ -249,6 +249,8 @@ pub(crate) struct AtomizeResult {
     pub conformant: usize,
     pub needs_structure: usize,
     pub forgotten: usize,
+    /// Mention edges (object → person/project) recorded across this file.
+    pub mentions_recorded: usize,
     outcomes: Vec<SectionOutcome>,
 }
 
@@ -265,15 +267,24 @@ pub(crate) async fn atomize_file(
     domain: &Domain,
     declared: &Sensitivity,
     categories: &[String],
+    dict: Option<&altevra_core::EntityDictionary>,
 ) -> anyhow::Result<AtomizeResult> {
     let kind = infer_kind(file);
     let stem = slugify(&file_stem(file));
     let id_prefix = format!("capture-{stem}-");
     let learnings = LearningsRepository::new(pool);
     let idx = altevra_db::ObjectIndexRepository::new(pool);
+    let mentions = altevra_db::MentionsRepository::new(pool);
 
     // Prior objects derived from THIS file (for incremental forget of the stale).
     let prior: Vec<(String, String)> = idx.ids_with_prefix(&id_prefix).await?;
+
+    // Reconcile mention edges too: clear THIS file's prior edges up front, then
+    // re-record from the current section set (so a removed/changed mention drops).
+    if dict.is_some() {
+        mentions.clear_from_prefix(&id_prefix).await?;
+    }
+    let mut mentions_recorded = 0usize;
 
     let mut outcomes: Vec<SectionOutcome> = Vec::new();
     let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -355,6 +366,26 @@ pub(crate) async fn atomize_file(
         };
         learnings.insert(&row).await?;
         captured += 1;
+
+        // ---- mention graph: link this object to known people/projects ----
+        // Scan the GUARDED (redacted) body so we never index around a secret.
+        // Edges are idempotent; high-water domain doesn't change linkage (the
+        // edge is local SQLite — SI-7 unaffected).
+        if let Some(d) = dict {
+            for entity_id in altevra_core::mentioned_entity_ids(&guarded.value, d) {
+                let to_type = d
+                    .get(&entity_id)
+                    .map(|e| e.kind.as_str())
+                    .unwrap_or("person");
+                if mentions
+                    .record("learning", &id, to_type, &entity_id)
+                    .await?
+                {
+                    mentions_recorded += 1;
+                }
+            }
+        }
+
         outcomes.push(SectionOutcome::Captured { kind, id });
     }
 
@@ -377,6 +408,7 @@ pub(crate) async fn atomize_file(
         conformant: conformant_n,
         needs_structure: needs_structure_n,
         forgotten,
+        mentions_recorded,
         outcomes,
     })
 }
@@ -391,7 +423,19 @@ async fn run_atomize(
     domain: Domain,
     declared: Sensitivity,
 ) -> anyhow::Result<()> {
-    let res = atomize_file(pool, file, &sections, &domain, &declared, &args.categories).await?;
+    // Build the known-entity dictionary (People.md + project registry + mentors)
+    // so each atomized section is cross-linked to the people/projects it mentions.
+    let dict = super::entity_dict::build_dictionary(file, None);
+    let res = atomize_file(
+        pool,
+        file,
+        &sections,
+        &domain,
+        &declared,
+        &args.categories,
+        Some(&dict),
+    )
+    .await?;
 
     if args.json {
         let results: Vec<_> = res
@@ -420,6 +464,7 @@ async fn run_atomize(
                 "conformant": res.conformant,
                 "needs_structure": res.needs_structure,
                 "forgotten": res.forgotten,
+                "mentions_recorded": res.mentions_recorded,
                 "results": results,
             }))?
         );
@@ -440,6 +485,12 @@ async fn run_atomize(
             "  conformance: {} conformant, {} need-structure (tagged for cleanup)",
             res.conformant, res.needs_structure
         );
+        if res.mentions_recorded > 0 {
+            println!(
+                "  mention graph: {} edge(s) to known people/projects",
+                res.mentions_recorded
+            );
+        }
         if res.redactions > 0 {
             println!(
                 "  ⚠ {} secret/PII redaction(s) applied before storage",
@@ -942,7 +993,7 @@ mod tests {
                   ## Section three will be removed\nThis section disappears in v2.\n";
         std::fs::write(&file, v1).unwrap();
         let secs1 = parse_sections(&std::fs::read_to_string(&file).unwrap());
-        let r1 = atomize_file(&pool, &file, &secs1, &domain, &declared, &[])
+        let r1 = atomize_file(&pool, &file, &secs1, &domain, &declared, &[], None)
             .await
             .unwrap();
         assert_eq!(r1.captured, 3);
@@ -981,7 +1032,7 @@ mod tests {
                   ## Section four brand new\nA newly added fourth section appears.\n";
         std::fs::write(&file, v2).unwrap();
         let secs2 = parse_sections(&std::fs::read_to_string(&file).unwrap());
-        let r2 = atomize_file(&pool, &file, &secs2, &domain, &declared, &[])
+        let r2 = atomize_file(&pool, &file, &secs2, &domain, &declared, &[], None)
             .await
             .unwrap();
         assert_eq!(r2.captured, 3, "v2 has 3 sections");
@@ -1059,6 +1110,84 @@ mod tests {
                 .len(),
             1,
             "the added section is recallable"
+        );
+    }
+
+    /// Atomizing with a dictionary records mention edges, and re-atomizing an
+    /// edited file reconciles them (a dropped mention loses its edge).
+    #[tokio::test]
+    async fn atomize_records_and_reconciles_mention_edges() {
+        use altevra_core::{EntityDictionary, EntityKind};
+        use altevra_db::MentionsRepository;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("ment.db");
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let file = mem.join("Decisions.md");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let declared: Sensitivity = "internal".parse().unwrap();
+        let domain = infer_domain(&file);
+
+        let mut dict = EntityDictionary::new();
+        dict.add_person("djordje", "Đorđe Dimitrijević", &["Đorđe".into()]);
+        dict.add_project("revesta", "ReVesta", &["Simple Surplus".into()]);
+        assert_eq!(dict.people[0].kind, EntityKind::Person);
+
+        // v1: section mentions BOTH Đorđe and ReVesta.
+        std::fs::write(
+            &file,
+            "# Decisions\n\n## Lane split\nĐorđe je rekao da ReVesta ostaje P0 prioritet.\n",
+        )
+        .unwrap();
+        let secs = parse_sections(&std::fs::read_to_string(&file).unwrap());
+        let r = atomize_file(&pool, &file, &secs, &domain, &declared, &[], Some(&dict))
+            .await
+            .unwrap();
+        assert_eq!(r.mentions_recorded, 2, "Đorđe + ReVesta linked");
+
+        let ment = MentionsRepository::new(&pool);
+        assert_eq!(
+            ment.objects_mentioning("person:djordje", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            ment.objects_mentioning("project:revesta", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // v2: edit the section to DROP Đorđe (only ReVesta now). Re-atomize must
+        // reconcile: the Đorđe edge disappears, ReVesta remains.
+        std::fs::write(
+            &file,
+            "# Decisions\n\n## Lane split\nReVesta ostaje P0 prioritet, fokus na prodaju.\n",
+        )
+        .unwrap();
+        let secs2 = parse_sections(&std::fs::read_to_string(&file).unwrap());
+        atomize_file(&pool, &file, &secs2, &domain, &declared, &[], Some(&dict))
+            .await
+            .unwrap();
+        assert!(
+            ment.objects_mentioning("person:djordje", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dropped mention → edge reconciled away"
+        );
+        assert_eq!(
+            ment.objects_mentioning("project:revesta", 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "still-present mention keeps its edge"
         );
     }
 }

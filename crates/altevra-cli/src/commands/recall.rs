@@ -27,8 +27,18 @@ struct RecallItem {
 
 #[derive(Args)]
 pub struct RecallArgs {
-    /// Free-text recall query — what you're trying to remember.
+    /// Free-text recall query — what you're trying to remember. Optional when
+    /// `--with` is given ("what did I do involving <person/project>").
+    #[arg(default_value = "")]
     pub query: String,
+    /// Cross-link recall: surface objects/turns that MENTION a known person or
+    /// project (resolved from People.md + the project registry + mentors). E.g.
+    /// `altevra recall --with Đorđe` → decisions/notes that mention Đorđe.
+    #[arg(long = "with")]
+    pub with: Option<String>,
+    /// Vault root for the entity dictionary (default: inferred ~/Obsidian/Imperium).
+    #[arg(long)]
+    pub vault: Option<PathBuf>,
     /// Quick window preset (`last_24h` | `last_week` | `last_month` | `last_quarter`
     /// | `last_year`) or a raw duration (`24h`/`7d`/`30d`/`3mo`/`1y`).
     #[arg(long)]
@@ -60,6 +70,10 @@ pub struct RecallArgs {
 pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
     let now = Utc::now();
 
+    if args.query.trim().is_empty() && args.with.is_none() {
+        anyhow::bail!("provide a search query or use --with <person/project>");
+    }
+
     // Resolve temporal range — same fail-closed rules as the MCP tool so users
     // never get a silently-wrong window from a typo.
     let mut t_since = None;
@@ -86,6 +100,11 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
 
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
+
+    // --- `--with <entity>`: cross-link recall (mention graph) ---
+    if let Some(name) = args.with.clone() {
+        return recall_with_entity(&pool, &args, &name, t_since, t_until, now).await;
+    }
 
     // --- Source 1: session turns (the work stream). ---
     let turn_hits: Vec<TurnSearchHit> = SessionsRepository::new(&pool)
@@ -190,6 +209,177 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
         println!("    {}", it.snippet);
     }
     Ok(())
+}
+
+/// Cross-link recall: list objects (and their breadcrumbs) that MENTION a known
+/// person/project, resolved from the entity dictionary. Answers "what did I do
+/// with Đorđe this month" — combine with `--window`/`--since` for the temporal cut.
+async fn recall_with_entity(
+    pool: &sqlx::SqlitePool,
+    args: &RecallArgs,
+    name: &str,
+    t_since: Option<DateTime<Utc>>,
+    t_until: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    // Build the dictionary and resolve the name (diacritic/case-insensitive) to an
+    // entity id. The dictionary read is the same one capture uses.
+    let probe = args
+        .vault
+        .clone()
+        .map(|v| v.join("Memory").join("People.md"))
+        .unwrap_or_else(default_people_md);
+    let dict = crate::commands::entity_dict::build_dictionary(&probe, args.vault.as_deref());
+    let entity = resolve_entity(&dict, name);
+    let Some(entity) = entity else {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "with": name, "resolved": false, "count": 0, "results": [],
+                }))?
+            );
+        } else {
+            println!(
+                "No known person/project matches '{name}'. \
+                 (known: {} people, {} projects)",
+                dict.people.len(),
+                dict.projects.len()
+            );
+        }
+        return Ok(());
+    };
+
+    let mentions = altevra_db::MentionsRepository::new(pool);
+    let learnings = altevra_db::LearningsRepository::new(pool);
+    let sources = mentions
+        .objects_mentioning(&entity.id, args.limit.max(50))
+        .await?;
+
+    let mut items: Vec<RecallItem> = Vec::new();
+    for (otype, oid) in &sources {
+        // Currently every atomized object is a `learning` row; resolve its body.
+        if otype != "learning" {
+            continue;
+        }
+        let Some(row) = learnings.get(oid).await? else {
+            continue;
+        };
+        if row.status == "forgotten" {
+            continue;
+        }
+        // Temporal cut: use the section's created date from provenance if present,
+        // else fall through to "now" (always within an open window).
+        let when = provenance_date(&row.provenance).unwrap_or(now);
+        if !in_window(when, t_since, t_until) {
+            continue;
+        }
+        items.push(RecallItem {
+            when,
+            when_human: humanize_relative(when, now),
+            source: format!("{} · {}", row_kind(&row.tags, otype), row.domain),
+            snippet: snippet_with_title(&row.title, &row.body, "", 200),
+        });
+    }
+    items.sort_by_key(|it| std::cmp::Reverse(it.when));
+    items.truncate(args.limit as usize);
+
+    if args.json {
+        let entries: Vec<_> = items
+            .iter()
+            .map(|it| {
+                serde_json::json!({
+                    "when": it.when,
+                    "when_human": it.when_human,
+                    "source": it.source,
+                    "snippet": it.snippet,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "with": name,
+                "resolved": true,
+                "entity": { "id": entity.id, "name": entity.name, "kind": entity.kind.as_str() },
+                "count": entries.len(),
+                "results": entries,
+            }))?
+        );
+        return Ok(());
+    }
+
+    if items.is_empty() {
+        println!(
+            "No memory mentioning {} ({}) in that window.",
+            entity.name,
+            entity.kind.as_str()
+        );
+        return Ok(());
+    }
+    println!(
+        "Involving {} ({}) — {} item(s):\n",
+        entity.name,
+        entity.kind.as_str(),
+        items.len()
+    );
+    for it in &items {
+        println!("  • {} — {}", it.when_human, it.source);
+        println!("    {}", it.snippet);
+    }
+    Ok(())
+}
+
+/// Resolve a free-text name to a dictionary entity: exact-id, then any alias match
+/// (ascii-folded, case-insensitive), longest-name first so a full name wins.
+fn resolve_entity<'a>(
+    dict: &'a altevra_core::EntityDictionary,
+    name: &str,
+) -> Option<&'a altevra_core::Entity> {
+    if let Some(e) = dict.get(name) {
+        return Some(e);
+    }
+    let want = altevra_core::ascii_fold(name).to_lowercase();
+    let mut best: Option<&altevra_core::Entity> = None;
+    for e in dict.all() {
+        let hit = e
+            .aliases
+            .iter()
+            .any(|a| altevra_core::ascii_fold(a).to_lowercase() == want)
+            || altevra_core::ascii_fold(&e.name).to_lowercase() == want;
+        if hit && best.map(|b| e.name.len() > b.name.len()).unwrap_or(true) {
+            best = Some(e);
+        }
+    }
+    best
+}
+
+/// `kind:<type>` tag → display kind, else the row's object type.
+fn row_kind(tags_json: &str, fallback: &str) -> String {
+    if let Ok(tags) = serde_json::from_str::<Vec<String>>(tags_json) {
+        for t in tags {
+            if let Some(k) = t.strip_prefix("kind:") {
+                return k.to_string();
+            }
+        }
+    }
+    fallback.to_string()
+}
+
+/// Pull a `created` date out of a provenance JSON blob (atomize stores the section
+/// heading's YYYY-MM-DD there).
+fn provenance_date(provenance: &str) -> Option<DateTime<Utc>> {
+    let v: serde_json::Value = serde_json::from_str(provenance).ok()?;
+    let s = v.get("created")?.as_str()?;
+    let d = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?;
+    Some(d.and_hms_opt(12, 0, 0)?.and_utc())
+}
+
+fn default_people_md() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("Obsidian/Imperium/Memory/People.md")
 }
 
 /// Half-open window membership; `None` bounds are unbounded.
@@ -358,6 +548,8 @@ mod tests {
         // via the repo directly below.
         run(RecallArgs {
             query: "Americans".into(),
+            with: None,
+            vault: None,
             window: Some("last_month".into()),
             since: None,
             until: None,
@@ -390,6 +582,8 @@ mod tests {
         seed_three_sessions(&db).await;
         let r = run(RecallArgs {
             query: "anything".into(),
+            with: None,
+            vault: None,
             window: Some("garbage".into()),
             since: None,
             until: None,
@@ -401,5 +595,65 @@ mod tests {
         })
         .await;
         assert!(r.is_err(), "garbage window must fail-closed");
+    }
+
+    #[tokio::test]
+    async fn recall_with_entity_returns_objects_that_mention_it() {
+        use altevra_core::{Domain, EntityDictionary, Sensitivity};
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("altevra.db");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        // Atomize a Decisions file that mentions Đorđe, with a dictionary so edges
+        // are recorded.
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let file = mem.join("Decisions.md");
+        std::fs::write(
+            &file,
+            "# Decisions\n\n## ReVesta directive\nĐorđe je rekao: prodaja pre build-a.\n",
+        )
+        .unwrap();
+        let mut dict = EntityDictionary::new();
+        dict.add_person("djordje", "Đorđe Dimitrijević", &["Đorđe".into()]);
+        let secs = altevra_vault::parse_sections(&std::fs::read_to_string(&file).unwrap());
+        let domain: Domain = "business".parse().unwrap();
+        let declared: Sensitivity = "internal".parse().unwrap();
+        crate::commands::capture::atomize_file(
+            &pool,
+            &file,
+            &secs,
+            &domain,
+            &declared,
+            &[],
+            Some(&dict),
+        )
+        .await
+        .unwrap();
+
+        // recall --with Djordje (ascii spelling) → finds the decision mentioning him.
+        // Use the temp vault so the dictionary resolves the same entity.
+        run(RecallArgs {
+            query: String::new(),
+            with: Some("Djordje".into()),
+            vault: Some(tmp.path().to_path_buf()),
+            window: None,
+            since: None,
+            until: None,
+            tool: None,
+            project: None,
+            limit: 10,
+            db: db.clone(),
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        // Assert via the repo directly that the edge resolves to one object.
+        let ment = altevra_db::MentionsRepository::new(&pool);
+        let hits = ment.objects_mentioning("person:djordje", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "the decision mentioning Đorđe is linked");
     }
 }

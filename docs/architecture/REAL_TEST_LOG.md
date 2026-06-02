@@ -2,6 +2,43 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 8) — entity extraction → mention graph ✅ PASS
+
+Keyless (no LLM/NER) cross-link: when captured text mentions a known person/project,
+link it. Answers "šta sam radio sa Đorđem" (vision §4.1) + seeds the "haven't talked
+to X in N weeks" proactive query (§3.6). Baseline 764 → 783 tests, 0 fail; clippy
+`--workspace --all-targets -D warnings` clean; fmt.
+
+- **`altevra-core::entity` (pure, 11 tests)** — `EntityDictionary` built FROM the
+  vault (People.md `##` headings → people, projects.yaml + Projects/ dirs →
+  projects, + a mentor seed for Đorđe/Srđan/Saša who live in body text only).
+  `detect_mentions` is word-boundary + ascii-fold (Đorđe = Djordje = Dimitrijević
+  all hit one entity), longest-alias-wins, no substring false positives (`ss`
+  never matches inside "assistant"). **Serbian inflection-tolerant** for person
+  names (Đorđe→`Đorđetova`, Srđan→`Srđanu`, Đorđe→`Đorđem`) via a short-suffix
+  whitelist — guarded so `Lukavac` never matches `Luka`. `last_contact` helper.
+- **`altevra-db::MentionsRepository` (4 tests)** over the existing `relations`
+  table (rel=`mentions`); idempotent edges (empty-string `to_ref` sentinel defeats
+  SQLite's NULL-distinct), `clear_from_prefix` for re-atomize reconcile.
+- **Wired into `capture --atomize`** (+`entity_dict` loader): each section links to
+  the people/projects it mentions; re-atomize reconciles edges (dropped mention →
+  edge removed). SI-7 unaffected (edges are local SQLite).
+- **CLI `altevra recall --with <name>`** — resolves the name (diacritic/case/
+  inflection-insensitive) and lists objects that mention it, recency-sorted with
+  breadcrumbs.
+- **LIVE on a READ-ONLY copy of real Memory/** (vault never written): atomized
+  People.md (10) + Decisions.md (31) → **33 mention edges**. Graph summary:
+  `project:revesta`=19 objects, imperium-crawl=3, hyper-pipeline=3, claw-network=2,
+  + people luka/kim-eshan/stefan/ivan-kadic. `recall --with ReVesta` → 10 items;
+  `recall --with Luka` → 2 items with breadcrumbs; **`recall --with Đorđe` → the
+  decision mentioning "Đorđetova direktiva"** (inflection match — found a real
+  cross-link a naive matcher would miss). `Djordje` (ascii) resolves to the same
+  entity.
+
+Left for Pavle / next: MCP `recall_about {entity}` tool (CLI `recall --with` covers
+the use case now; the dictionary loader uses serde_yaml which lives in the CLI, so
+exposing it via MCP needs a small loader move — deferred to keep scope tight).
+
 ## 2026-06-02 (session 7b) — `recall_window` MCP tool: recent memory by time, no query ✅ PASS
 
 Small follow-on: a dedicated MCP tool to ask "what happened in the last week"

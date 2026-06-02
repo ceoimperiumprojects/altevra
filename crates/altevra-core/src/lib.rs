@@ -2,6 +2,7 @@ pub mod capability;
 pub mod classifier;
 pub mod config;
 pub mod domain;
+pub mod entity;
 pub mod envelope;
 pub mod errors;
 pub mod events;
@@ -24,6 +25,10 @@ pub mod updates;
 
 pub use capability::{Support, TrustLevel};
 pub use domain::{Domain, RiskTag};
+pub use entity::{
+    ascii_fold, detect_mentions, last_contact, mentioned_entity_ids, Entity, EntityDictionary,
+    EntityKind, EntityRef,
+};
 pub use envelope::{Confidence, Envelope, HasEnvelope, Provenance, ProvenanceOrigin};
 pub use errors::AltevraError;
 pub use lifecycle::derive_lifecycle_state;

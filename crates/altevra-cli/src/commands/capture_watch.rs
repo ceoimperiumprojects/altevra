@@ -95,6 +95,8 @@ pub async fn atomize_one(
         return Ok(None);
     }
     let domain: Domain = crate::commands::capture::infer_domain(file);
+    // Cross-link to known people/projects (People.md + registry + mentors).
+    let dict = crate::commands::entity_dict::build_dictionary(file, None);
     let res = atomize_file(
         pool,
         file,
@@ -102,15 +104,17 @@ pub async fn atomize_one(
         &domain,
         &cfg.declared,
         &cfg.categories,
+        Some(&dict),
     )
     .await?;
     Ok(Some(format!(
-        "{}: {} {}(s) captured, {} forgotten (stale), {} need-structure",
+        "{}: {} {}(s) captured, {} forgotten (stale), {} need-structure, {} mention edge(s)",
         file.display(),
         res.captured,
         res.kind,
         res.forgotten,
-        res.needs_structure
+        res.needs_structure,
+        res.mentions_recorded
     )))
 }
 

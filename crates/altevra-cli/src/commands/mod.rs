@@ -10,6 +10,7 @@ pub mod context;
 pub mod control;
 pub mod doctor;
 pub mod embed;
+pub mod entity_dict;
 pub mod files;
 pub mod hook;
 pub mod hook_handle;
