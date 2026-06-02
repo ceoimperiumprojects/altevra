@@ -79,6 +79,28 @@ impl<'a> LearningsRepository<'a> {
         .bind(&now)
         .execute(self.pool)
         .await?;
+
+        // T-INV14: a written learning immediately becomes a packet candidate +
+        // full-text searchable. The single index maintenance point keeps
+        // object_index + object_fts in sync with the durable write.
+        ObjectIndexRepository::new(self.pool)
+            .index_object(
+                &ObjectIndexRow {
+                    object_type: "learning".into(),
+                    id: row.id.clone(),
+                    status: row.status.clone(),
+                    sensitivity: row.sensitivity.clone(),
+                    domain: row.domain.clone(),
+                    scope: row.scope.clone(),
+                    title: Some(row.title.clone()),
+                    categories: row.categories.clone(),
+                    tags: row.tags.clone(),
+                    redaction_status: row.redaction_status.clone(),
+                    updated_at: Utc::now(),
+                },
+                &row.body,
+            )
+            .await?;
         Ok(())
     }
 
@@ -271,6 +293,18 @@ mod tests {
         assert_eq!(got.sensitivity, "restricted");
         assert_eq!(got.categories, "[\"health\"]");
         assert_eq!(repo.list_active("health").await.unwrap().len(), 1);
+
+        // T-INV14: the write populated the retrieval substrate automatically —
+        // a packet candidate (structured) + full-text searchable (bm25).
+        let idx = ObjectIndexRepository::new(&p);
+        assert_eq!(idx.candidates(Some("health")).await.unwrap().len(), 1);
+        let fts = crate::repositories::fts::FtsRepository::new(&p);
+        assert!(fts
+            .search("Late nights focus", 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|h| h.object_id == "l1"));
     }
 
     #[tokio::test]

@@ -1,3 +1,10 @@
+use altevra_core::envelope::{Envelope, Provenance, ProvenanceOrigin};
+use altevra_core::packet::{PacketCandidate, PacketCompiler, PacketRequest};
+use altevra_core::safety::ExposureRequest;
+use altevra_core::security::Sensitivity;
+use altevra_core::status::{ObjectStatus, RedactionStatus};
+use altevra_core::Domain;
+use altevra_db::ObjectIndexRepository;
 use altevra_memory::{ingest_file, SearchIndex};
 use altevra_vault::scan_vault;
 use serde_json::Value;
@@ -77,6 +84,20 @@ pub fn handle_get_context_packet(id: Value, args: &Value) -> McpResponse {
     let sections: std::collections::BTreeSet<_> =
         files.iter().filter_map(|f| f.section.clone()).collect();
 
+    // T-INV14: a REAL gated packet over object_index via PacketCompiler +
+    // ExposureGate (R12 tag/FTS/graph, NO vectors). An MCP/agent caller gets a
+    // work ceiling, so restricted (health/personal) objects are excluded.
+    // Fault-tolerant: any error → empty packet, never fails the MCP response, so
+    // the existing vault-stats fields are always returned (no regression).
+    let db_path = args["db_path"]
+        .as_str()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(altevra_core::default_db_path);
+    let query_terms: Vec<String> = args["query"]
+        .as_str()
+        .map(|q| q.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+
     McpResponse::ok(
         id,
         serde_json::json!({
@@ -84,8 +105,88 @@ pub fn handle_get_context_packet(id: Value, args: &Value) -> McpResponse {
             "vault_root": vault,
             "file_count": files.len(),
             "sections": sections,
+            "packet": gated_packet(&db_path, &query_terms),
         }),
     )
+}
+
+fn empty_packet() -> Value {
+    serde_json::json!({"items": [], "excluded": 0, "tokens_used": 0, "truncated": false})
+}
+
+/// Compile a gated context packet from `object_index` candidates (T-INV14). The
+/// ExposureGate filters by ceiling/scope/redaction before ranking; restricted and
+/// unscanned objects never appear. Any error yields an empty packet.
+///
+/// Runs on a dedicated thread with its own current-thread Tokio runtime so it is
+/// safe to call from any context (a parent runtime, a sync handler, or a test) —
+/// `block_on` on a borrowed worker thread would deadlock sqlx's background tasks.
+fn gated_packet(db_path: &std::path::Path, query_terms: &[String]) -> Value {
+    let db = db_path.to_path_buf();
+    let terms = query_terms.to_vec();
+    let joined = std::thread::spawn(move || -> anyhow::Result<Value> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let pool = altevra_db::create_pool(&db.to_string_lossy()).await?;
+            altevra_db::run_migrations(&pool).await?;
+            let rows = ObjectIndexRepository::new(&pool).candidates(None).await?;
+            if rows.is_empty() {
+                return Ok(empty_packet());
+            }
+            let now = rows.iter().map(|r| r.updated_at).max().unwrap();
+            let candidates: Vec<PacketCandidate> = rows.iter().map(row_to_candidate).collect();
+            let req = PacketRequest {
+                intent: "context".into(),
+                project: None,
+                query_terms: terms,
+                exposure: ExposureRequest::default_work(),
+                token_budget: 8000,
+            };
+            let pkt = PacketCompiler::compile(&candidates, &req, now);
+            Ok(serde_json::json!({
+                "items": pkt.items.iter().map(|i| serde_json::json!({
+                    "type": i.object_type,
+                    "id": i.object_id,
+                    "title": i.title,
+                    "rank": i.rank,
+                    "sensitivity": i.sensitivity.to_string(),
+                    "why": i.why.rule,
+                })).collect::<Vec<_>>(),
+                "excluded": pkt.excluded.len(),
+                "tokens_used": pkt.tokens_used,
+                "truncated": pkt.truncated,
+            }))
+        })
+    })
+    .join();
+    joined
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_else(empty_packet)
+}
+
+fn row_to_candidate(r: &altevra_db::ObjectIndexRow) -> PacketCandidate {
+    let mut e = Envelope::new(
+        &r.id,
+        &r.object_type,
+        r.updated_at,
+        Provenance::new(ProvenanceOrigin::Imported),
+    );
+    e.domain = r.domain.parse::<Domain>().unwrap();
+    e.sensitivity = r.sensitivity.parse::<Sensitivity>().unwrap();
+    e.status = r.status.parse::<ObjectStatus>().unwrap();
+    let categories: Vec<String> = serde_json::from_str(&r.categories).unwrap_or_default();
+    PacketCandidate {
+        envelope: e,
+        title: r.title.clone().unwrap_or_default(),
+        categories,
+        redaction_status: r
+            .redaction_status
+            .parse::<RedactionStatus>()
+            .unwrap_or(RedactionStatus::Unscanned),
+    }
 }
 
 pub fn handle_get_source_of_truth(id: Value, args: &Value) -> McpResponse {
