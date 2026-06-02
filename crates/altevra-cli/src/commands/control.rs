@@ -16,6 +16,10 @@ pub enum ControlCommands {
     Redact(RedactArgs),
     /// Query the append-only exposure-decision audit.
     Audit(AuditArgs),
+    /// Export a sovereignty manifest of everything Altevra holds (metadata only).
+    Export(ExportArgs),
+    /// Forget an object (RTBF, soft). --execute requires human presence.
+    Forget(ForgetArgs),
 }
 
 pub async fn run(cmd: ControlCommands) -> anyhow::Result<()> {
@@ -23,7 +27,95 @@ pub async fn run(cmd: ControlCommands) -> anyhow::Result<()> {
         ControlCommands::Review(a) => run_review(a).await,
         ControlCommands::Redact(a) => run_redact(a).await,
         ControlCommands::Audit(a) => run_audit(a).await,
+        ControlCommands::Export(a) => run_export(a).await,
+        ControlCommands::Forget(a) => run_forget(a).await,
     }
+}
+
+// ---- export (sovereignty) ---------------------------------------------------
+
+#[derive(Args)]
+pub struct ExportArgs {
+    /// Write the manifest here (default: stdout).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+}
+
+async fn run_export(args: ExportArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let rows = altevra_db::ObjectIndexRepository::new(&pool)
+        .candidates(None)
+        .await?;
+    // Metadata manifest only (type/id/domain/sensitivity/status) — never bodies,
+    // so an export is safe by default; raw content export is a separate gated path.
+    let manifest: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "type": r.object_type,
+                "id": r.id,
+                "domain": r.domain,
+                "sensitivity": r.sensitivity,
+                "status": r.status,
+            })
+        })
+        .collect();
+    let doc = serde_json::to_string_pretty(&serde_json::json!({
+        "altevra_export": "manifest",
+        "count": manifest.len(),
+        "objects": manifest,
+    }))?;
+    match args.out {
+        Some(p) => {
+            std::fs::write(&p, doc)?;
+            println!("exported {} objects → {}", rows.len(), p.display());
+        }
+        None => println!("{doc}"),
+    }
+    Ok(())
+}
+
+// ---- forget (RTBF) ----------------------------------------------------------
+
+#[derive(Args)]
+pub struct ForgetArgs {
+    /// Object type (e.g. learning, decision).
+    #[arg(long = "type")]
+    pub object_type: String,
+    /// Object id.
+    pub id: String,
+    /// Actually forget (requires human presence). Without it, dry-run only.
+    #[arg(long)]
+    pub execute: bool,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+}
+
+async fn run_forget(args: ForgetArgs) -> anyhow::Result<()> {
+    if !args.execute {
+        println!(
+            "[dry-run] would forget {}:{} (soft — status→forgotten, dropped from search). \
+             Re-run with --execute (needs TTY or ALTEVRA_UNLOCK).",
+            args.object_type, args.id
+        );
+        return Ok(());
+    }
+    // RTBF execute is destructive → human presence required (R4).
+    require_human_presence().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let changed = altevra_db::ObjectIndexRepository::new(&pool)
+        .forget(&args.object_type, &args.id)
+        .await?;
+    if changed {
+        println!("forgotten {}:{} (soft)", args.object_type, args.id);
+    } else {
+        anyhow::bail!("no indexed object {}:{}", args.object_type, args.id);
+    }
+    Ok(())
 }
 
 // ---- review -----------------------------------------------------------------

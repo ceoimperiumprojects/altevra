@@ -229,6 +229,26 @@ impl<'a> ObjectIndexRepository<'a> {
         Ok(())
     }
 
+    /// RTBF soft-forget (P0.8 T8.6): mark the object `forgotten` in the index and
+    /// drop it from the FTS substrate so it is no longer retrievable/searchable.
+    /// Soft (status flip), not a hard wipe — the caller is human-presence gated.
+    /// Returns true if a row was affected.
+    pub async fn forget(&self, object_type: &str, id: &str) -> anyhow::Result<bool> {
+        let res =
+            sqlx::query("UPDATE object_index SET status = 'forgotten' WHERE type = ? AND id = ?")
+                .bind(object_type)
+                .bind(id)
+                .execute(self.pool)
+                .await?;
+        // Remove from full-text so a forgotten object can't surface via search.
+        sqlx::query("DELETE FROM object_fts WHERE object_type = ? AND object_id = ?")
+            .bind(object_type)
+            .bind(id)
+            .execute(self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Candidate rows for packet compilation, optionally filtered by domain.
     /// (The ExposureGate does the actual ceiling/scope filtering downstream.)
     pub async fn candidates(&self, domain: Option<&str>) -> anyhow::Result<Vec<ObjectIndexRow>> {
@@ -363,5 +383,43 @@ mod tests {
             hits.iter().any(|h| h.object_id == "d9"),
             "FTS must find indexed object"
         );
+    }
+
+    #[tokio::test]
+    async fn forget_soft_marks_and_drops_from_fts() {
+        let p = pool().await;
+        let idx = ObjectIndexRepository::new(&p);
+        idx.index_object(
+            &ObjectIndexRow {
+                object_type: "learning".into(),
+                id: "f1".into(),
+                status: "active".into(),
+                sensitivity: "internal".into(),
+                domain: "business".into(),
+                scope: None,
+                title: Some("forget me".into()),
+                categories: "[]".into(),
+                tags: "[]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "secret-ish body to forget",
+        )
+        .await
+        .unwrap();
+        let fts = crate::repositories::fts::FtsRepository::new(&p);
+        assert_eq!(fts.search("forget", 10).await.unwrap().len(), 1);
+
+        assert!(idx.forget("learning", "f1").await.unwrap());
+        // dropped from search...
+        assert!(fts.search("forget", 10).await.unwrap().is_empty());
+        // ...and the index row is now status=forgotten (soft, not wiped).
+        let row = sqlx::query("SELECT status FROM object_index WHERE id = 'f1'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("status"), "forgotten");
+        // forgetting an unknown object is a no-op.
+        assert!(!idx.forget("learning", "nope").await.unwrap());
     }
 }
