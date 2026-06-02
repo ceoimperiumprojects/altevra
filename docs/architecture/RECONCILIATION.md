@@ -266,13 +266,32 @@ Leak suites that must be **0** are all in the P0.1 set (G03/G09) — security ne
 
 ---
 
+## R15 — Opt-in hybrid semantic layer ABOVE the deterministic core (Pavle directive 2026-06-02)
+
+**Directive:** after researching retrieval, Pavle chose a BGE-M3 hybrid (dense + lexical, RRF-fused). This refines — does NOT revoke — R12.
+
+**DECISION:**
+1. **Core retrieval stays exactly as R12 mandates:** tag/structured + FTS5 BM25 + graph, vector-free. Packet compiler, safety gates, leak-eval, packet determinism are unchanged. `R12-INV` still holds for the core path.
+2. **A semantic layer is permitted as an OPT-IN ADDITION on top:** local **BGE-M3 dense** embeddings (`fastembed`, on-device) stored in **sqlite-vec** (single-binary; no separate service — Qdrant rejected to preserve local-first/single-binary), fused with existing FTS5 lexical results by **RRF** (`hybrid_rrf`, k=60). Dense + BM25 hybrid; BGE-M3 learned-sparse skipped (FTS5 covers lexical).
+3. **Off by default:** `[llm] embedding_mode = "off"` (default) keeps the system identical to today. `"local"` activates it. The dense lane lives behind the `embedding` cargo feature (onnxruntime + sqlite-vec), so the default build/tests are byte-unchanged.
+4. **SI-7 preserved for embeddings:** personal/high-water domains MUST embed locally. `DomainPolicyRepository::embedding_role_for` resolves the per-object role (R3 most-restrictive); `EmbeddingRouter` makes the cloud embedder structurally unreachable for `local_private`.
+
+**WHY:** semantic recall compounds Altevra's value over years (CLAUDE.md §3.4) without sacrificing the deterministic, leak-safe core R12 bought. Gates/eval stay vector-free; relevance gets a dense boost when Pavle opts in.
+
+**CODE IMPACT:** `altevra-memory`: `hybrid_rrf`, `embedding_router` (dep-free, always compiled); `bge`, `vec_store_sqlite` (feature `embedding`). `altevra-db`: `EmbeddingModelRole` + `embedding_role_for`. `[llm].embedding_mode` config. NO change to packet compiler / gated_packet / golden_eval.
+
+**P0 phase:** opt-in add-on; default-off preserves all P0 exit criteria.
+
+---
+
 ## Invariant addendum (new, from this reconciliation)
 
 - **HP-1:** No MCP/agent caller has any approve/apply/grant/forget-execute/policy-set path. Enforced by absence in code.
 - **HP-2:** `"approved"` is never an accepted input field; approval is core-recorded after a presence check.
 - **R1-INV:** ceiling comparisons touch only `sensitivity_level` (6-ladder total order); domain and risk_tag are separate gate conditions.
 - **R5-INV:** purging a `context_packet` body never touches its `exposure_decision` audit row.
-- **R12-INV:** no code path uses vector/embedding similarity for P0 retrieval; retrieval = tag/structured + FTS5 + graph only.
+- **R12-INV:** no code path uses vector/embedding similarity for P0 *core* retrieval; the core retrieval = tag/structured + FTS5 + graph only.
+- **R15-INV:** the hybrid dense layer is opt-in (`embedding_mode=local`, feature `embedding`) and lives ABOVE the core; it never enters the packet compiler, gated_packet, or golden_eval. `local_private` content embeds locally only (cloud embedder structurally unreachable).
 - **TAG-1:** no durable object persists without a resolved `domain` + ≥1 governed `category`; untagged → quarantine.
 - **TEMPLATE-1:** a write to a templated type must satisfy its `Template` (required fields/sections/tags) or it is quarantined; renderers render *from* the template.
 - **MOD-1:** new integrations are adapters/modules; core crates are not edited to add a tool/connector.

@@ -225,3 +225,32 @@ detector test fixtures use concat!() so no contiguous secret literal lives in so
 - **T1.15** ✅ `9a92015` Context Packet Compiler module (gates≠weights, tag+recency, no vectors, deterministic, budget packing).
 - **Baseline re-verified:** fmt+clippy(--all-targets -D warnings)+tests all green.
 - _NEXT: T1.13 wire ingest_guard into all repo writes · T1.14 vault mirror renderer · T1.17 review CLI + presence wiring · then live test (build+symlink+herdr spawn) · P0.2._
+
+## LLM Provider Modes + Local Hybrid Search (2026-06-02, Pavle directive)
+
+Goal: make the "just add keys" moment have three explicit reasoning modes, and let Altevra
+run with NO LLM API using a local embedder while the connected tool reasons over MCP. Plan:
+`~/.claude/plans/giggly-humming-ullman.md`. Reconciliation: **R15** (opt-in hybrid above the
+R12 core). Baseline 640→**665** tests, then +embedding tests; clippy -D clean throughout.
+
+- **reasoning (`[llm].reasoning_mode`):** `delegated` (default, keyless — connected tool thinks),
+  `codex_oauth` (ChatGPT GPT-5.5 via `~/.codex/auth.json`, like Hermes), `api` (OpenAI-compat/
+  Anthropic/Gemini). SI-7: cloud never backs `local_private` (3-layer guard).
+- **embedding (`[llm].embedding_mode`):** `off` (default — core stays R12 vector-free) / `local`
+  (BGE-M3 dense via fastembed + sqlite-vec + RRF over FTS5). Behind `embedding` cargo feature.
+
+Commits (branch altevra-overnight-p0):
+- **config** ✅ `00ef2f1` — `[llm]` section (reasoning/embedding mode + provider settings), legacy-safe.
+- **llm providers** ✅ `c088844` — CodexOAuth (Responses API direct), OpenAICompat (loopback=local),
+  Anthropic, Gemini-as-ChatProvider. 11 net-free tests; token never logged.
+- **factory** ✅ `812df05` — `build_router(&LlmConfig)`; SI-7 factory guard. Headline test: codex backs
+  reasoning, LocalPrivate stays noop.
+- **cli** ✅ `c29f5d7` — `config set/get llm.*`; resident run → build_router; `--reasoning-mode` override.
+- **brain** ✅ `113b849` — router in JobContext/scheduler; insight_synthesizer goes live on real provider.
+- **db** ✅ `4da3f55` — `EmbeddingModelRole` + `embedding_role_for` (R3, SI-7 fail-closed).
+- **rrf+router** ✅ `5e79295` — RRF fusion + EmbeddingRouter (dep-free, SI-7 hard guard). 8 tests.
+- **bge+sqlite-vec** ✅ `ddb9046` — BGE-M3 (fastembed) + SqliteVecStore. VERIFIED: clippy --features
+  embedding clean; **sqlite-vec live KNN test passes**; onnxruntime compiles. BGE inference #[ignore] (2GB model).
+
+Live-verified: sqlite-vec upsert→KNN works (single-binary, local). Codex/api/BGE go live when
+Pavle adds keys / runs the model. Default build byte-unchanged — "just add keys" holds.
