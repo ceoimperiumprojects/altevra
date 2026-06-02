@@ -53,6 +53,39 @@ impl CloudSync {
     }
 }
 
+/// Which embedding model a domain's content may use. `local_private` = embedding
+/// MUST run on-device (personal/health/relationship/…); `cloud_ok` = a cloud
+/// embedder is permitted (business/project/public). SI-7 enforces local for the
+/// former. Fail-closed: anything unknown is treated as `local_private`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingModelRole {
+    LocalPrivate,
+    CloudOk,
+}
+
+impl EmbeddingModelRole {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "cloud_ok" => EmbeddingModelRole::CloudOk,
+            // unknown / "local_private" / anything → fail-closed local.
+            _ => EmbeddingModelRole::LocalPrivate,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EmbeddingModelRole::LocalPrivate => "local_private",
+            EmbeddingModelRole::CloudOk => "cloud_ok",
+        }
+    }
+    /// Most-restrictive of two (local_private wins). R3 across multi-domain objects.
+    pub fn most_restrictive(a: EmbeddingModelRole, b: EmbeddingModelRole) -> EmbeddingModelRole {
+        match (a, b) {
+            (EmbeddingModelRole::CloudOk, EmbeddingModelRole::CloudOk) => EmbeddingModelRole::CloudOk,
+            _ => EmbeddingModelRole::LocalPrivate,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DomainPolicyRow {
     pub domain_key: String,
@@ -121,6 +154,27 @@ impl<'a> DomainPolicyRepository<'a> {
     /// across domains is not `disabled`). Restricted domains are excluded.
     pub async fn sync_eligible(&self, domains: &[String]) -> anyhow::Result<bool> {
         Ok(self.cloud_sync_for(domains).await?.eligible_for_sync())
+    }
+
+    /// Most-restrictive embedding role across an object's domains (R3). Empty or any
+    /// unknown domain → `local_private` (fail-closed, SI-7): if we're unsure, embed
+    /// locally. If ANY domain is `local_private`, the whole object is `local_private`.
+    pub async fn embedding_role_for(
+        &self,
+        domains: &[String],
+    ) -> anyhow::Result<EmbeddingModelRole> {
+        if domains.is_empty() {
+            return Ok(EmbeddingModelRole::LocalPrivate);
+        }
+        let mut acc = EmbeddingModelRole::CloudOk;
+        for d in domains {
+            let role = match self.get(d).await? {
+                Some(p) => EmbeddingModelRole::parse(&p.embedding_model_role),
+                None => EmbeddingModelRole::LocalPrivate, // unknown domain → fail-closed
+            };
+            acc = EmbeddingModelRole::most_restrictive(acc, role);
+        }
+        Ok(acc)
     }
 }
 
@@ -201,6 +255,37 @@ mod tests {
                 .await
                 .unwrap(),
             CloudSync::EncryptedOnly
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_role_is_local_for_high_water_and_most_restrictive() {
+        let p = pool().await;
+        let repo = DomainPolicyRepository::new(&p);
+        // high-water domain → local; business/public → cloud_ok.
+        assert_eq!(
+            repo.embedding_role_for(&["health".into()]).await.unwrap(),
+            EmbeddingModelRole::LocalPrivate
+        );
+        assert_eq!(
+            repo.embedding_role_for(&["business".into()]).await.unwrap(),
+            EmbeddingModelRole::CloudOk
+        );
+        // multi-domain object touching health → local (R3 most-restrictive).
+        assert_eq!(
+            repo.embedding_role_for(&["business".into(), "health".into()])
+                .await
+                .unwrap(),
+            EmbeddingModelRole::LocalPrivate
+        );
+        // empty + unknown → fail-closed local (SI-7).
+        assert_eq!(
+            repo.embedding_role_for(&[]).await.unwrap(),
+            EmbeddingModelRole::LocalPrivate
+        );
+        assert_eq!(
+            repo.embedding_role_for(&["mystery".into()]).await.unwrap(),
+            EmbeddingModelRole::LocalPrivate
         );
     }
 }

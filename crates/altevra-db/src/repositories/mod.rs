@@ -14,7 +14,7 @@ pub mod updates;
 pub mod wiki;
 
 pub use capability::{CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository};
-pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow};
+pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
 pub use fts::{FtsHit, FtsRepository};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
