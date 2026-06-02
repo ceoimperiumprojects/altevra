@@ -254,3 +254,20 @@ Commits (branch altevra-overnight-p0):
 
 Live-verified: sqlite-vec upsert→KNN works (single-binary, local). Codex/api/BGE go live when
 Pavle adds keys / runs the model. Default build byte-unchanged — "just add keys" holds.
+
+## Second-Brain product layer (2026-06-02 sessions 4-5, Pavle live-driving)
+
+Built on top of the P0 safety/retrieval core, driven by Pavle's real use-cases.
+All live-verified on real data; baseline 697 → **783 tests / 0 fail**; clippy
+`--workspace --all-targets -D warnings` clean throughout. Branch altevra-overnight-p0.
+
+- **Temporal recall** (`time_window` + `search_turns_in_window` + MCP `search_turns` window/since/until) — "šta smo radili pre mesec dana sa Amerikancima". Fail-closed window parse.
+- **Source tracing** (`TurnSearchHit` + `humanize_relative`) — every hit carries `tool · project · when` breadcrumb.
+- **Skill cross-tool sync** (`altevra-skills::{importer,sync,watcher}`) — inventory 137 slugs/5 tools; `skill sync --apply` propagated 324 files; `--watch` real-time; UserAuthored never overwritten.
+- **`altevra capture`** — markdown → guard_text (secret/PII redaction, credential refuse) → learning (auto-indexed). `--atomize`: each `## section` = its own typed object. `--watch`: incremental idempotent re-atomize on save (forget+reinsert).
+- **`altevra recall`** — UNIFIED over turns + durable objects (`FtsRepository::search_objects`), recency-sorted breadcrumbs; `--window/--since/--until`, `--with <entity>`. MCP: `recall_window`.
+- **`altevra vault normalize`** — universal frontmatter on 513 real vault files (backup-first, body verbatim, idempotent — `updated` seeded-once). `VAULT_DOCUMENT_TEMPLATE.md` spec.
+- **Section templates** (`section_template`) — per-type label contracts calibrated to Pavle's real style (synonym sets, list-item labels, freeform learnings). `--scaffold-empty` (empty only). `--rewrite` via Codex GPT-5.5: **21 Decisions sections restructured into template, facts preserved**; SI-7 guard skips 6 high-water People sections from cloud.
+- **Entity mention graph** (`altevra-core::entity` + `MentionsRepository` over `relations`) — diacritic/inflection-tolerant ("Đorđetova direktiva" links to Đorđe); `recall --with <name>` cross-links decisions/notes by person/project.
+
+Hard blocker for Pavle: **People.md (high-water) reformat needs a LOCAL model** (Ollama/vLLM) — SI-7 bars cloud Codex for personal contacts. Everything else is live.
