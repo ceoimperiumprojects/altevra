@@ -113,7 +113,9 @@ async fn run_start(args: BrainStartArgs) -> anyhow::Result<()> {
         std::process::id(),
         cfg.tick_interval_secs
     );
-    let scheduler = BrainScheduler::new(cfg, pool);
+    let app_cfg = crate::commands::config::load_config(std::path::Path::new("."));
+    let router = std::sync::Arc::new(altevra_llm::build_router(&app_cfg.llm));
+    let scheduler = BrainScheduler::new(cfg, pool).with_router(router);
     scheduler.run(shutdown_rx).await?;
     let _ = std::fs::remove_file(&args.pid_file);
     Ok(())
@@ -166,7 +168,9 @@ async fn run_tick(args: BrainTickArgs) -> anyhow::Result<()> {
         disabled: parse_disabled(&args.disabled),
         ..BrainConfig::default()
     };
-    let mut scheduler = BrainScheduler::new(cfg, pool);
+    let app_cfg = crate::commands::config::load_config(std::path::Path::new("."));
+    let router = std::sync::Arc::new(altevra_llm::build_router(&app_cfg.llm));
+    let mut scheduler = BrainScheduler::new(cfg, pool).with_router(router);
     let ran = scheduler.tick().await?;
     if args.json {
         println!(

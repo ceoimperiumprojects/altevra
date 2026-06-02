@@ -50,6 +50,8 @@ pub struct BrainScheduler {
     last_runs: HashMap<JobKind, Instant>,
     /// Last LOCAL date on which DailySummary fired (to avoid firing twice).
     last_daily_date: Option<chrono::NaiveDate>,
+    /// Model router (from `[llm]` config). Defaults to noop; set via `with_router`.
+    router: std::sync::Arc<altevra_llm::ModelRouter>,
 }
 
 impl BrainScheduler {
@@ -59,7 +61,15 @@ impl BrainScheduler {
             pool,
             last_runs: HashMap::new(),
             last_daily_date: None,
+            router: std::sync::Arc::new(altevra_llm::ModelRouter::noop()),
         }
+    }
+
+    /// Attach a configured model router (e.g. built from `[llm]` config). Without
+    /// this the scheduler runs all jobs against the noop router.
+    pub fn with_router(mut self, router: std::sync::Arc<altevra_llm::ModelRouter>) -> Self {
+        self.router = router;
+        self
     }
 
     /// One tick: check each job, run those whose periods elapsed.
@@ -68,6 +78,7 @@ impl BrainScheduler {
         let ctx = JobContext {
             vault_path: self.config.vault_path.clone(),
             now: Utc::now(),
+            router: self.router.clone(),
         };
         let now = Instant::now();
 

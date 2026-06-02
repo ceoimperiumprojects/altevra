@@ -81,6 +81,9 @@ pub struct JobResult {
 pub struct JobContext {
     pub vault_path: std::path::PathBuf,
     pub now: DateTime<Utc>,
+    /// Model router resolved from `[llm]` config. With `delegated` (default) every
+    /// role resolves to noop, so LLM-backed jobs skip cleanly until keys are added.
+    pub router: std::sync::Arc<altevra_llm::ModelRouter>,
 }
 
 // ---- Job implementations ----------------------------------------------------
@@ -202,17 +205,45 @@ pub async fn run_vault_indexer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
     })
 }
 
-/// Placeholder for LLM-powered synthesis. With a Gemini key configured this
-/// would call gemini-flash to summarise the last hour. Without a key we just
-/// emit a structural summary.
+/// LLM-powered synthesis. Resolves the `strong_reasoner` role from the router:
+/// with `delegated` mode (noop) it skips cleanly (connected tool synthesizes over
+/// MCP instead); with a real provider (codex_oauth / api) it produces an insight.
 pub async fn run_insight_synthesizer(
     _pool: &SqlitePool,
-    _ctx: &JobContext,
+    ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
-    Ok(JobResult {
-        summary: "insight synthesis skipped (no LLM configured)".into(),
-        items_processed: 0,
-    })
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+    if provider.id() == "noop" {
+        return Ok(JobResult {
+            summary: "insight synthesis skipped (no LLM configured)".into(),
+            items_processed: 0,
+        });
+    }
+    let messages = vec![
+        ChatMessage::system(
+            "You are Altevra's insight synthesizer. Distill recent activity into ONE \
+             concise, sourced sentence. No preamble.",
+        ),
+        ChatMessage::user("Summarize the most salient pattern in the last hour of activity."),
+    ];
+    match provider
+        .complete(&messages, &ChatOpts::default().with_max_tokens(120))
+        .await
+    {
+        Ok(text) => {
+            let one: String = text.trim().chars().take(240).collect();
+            Ok(JobResult {
+                summary: format!("insight ({}): {one}", provider.id()),
+                items_processed: 1,
+            })
+        }
+        Err(e) => Ok(JobResult {
+            summary: format!("insight synthesis failed: {e}"),
+            items_processed: 0,
+        }),
+    }
 }
 
 /// Pull RSS/Atom feeds, dedupe via SQLite, score against project keywords,
@@ -746,6 +777,11 @@ pub async fn dispatch(
 mod tests {
     use super::*;
 
+    /// All job tests run against the noop router (no keys); matches production default.
+    fn noop_router() -> std::sync::Arc<altevra_llm::ModelRouter> {
+        std::sync::Arc::new(altevra_llm::ModelRouter::noop())
+    }
+
     async fn setup_research_schema() -> SqlitePool {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect("sqlite::memory:")
@@ -815,6 +851,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
             now: Utc::now(),
+            router: noop_router(),
         };
         let r = run_project_research_sweep(&pool, &ctx).await.unwrap();
         assert!(r.summary.to_lowercase().contains("no"));
@@ -834,6 +871,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: std::path::PathBuf::from("/nonexistent"),
             now: Utc::now(),
+            router: noop_router(),
         };
         let r = run_observer_scan(&pool, &ctx).await.unwrap();
         assert_eq!(r.items_processed, 0);
@@ -849,6 +887,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
             now: Utc::now(),
+            router: noop_router(),
         };
         let r = run_daily_summary(&pool, &ctx).await.unwrap();
         assert_eq!(r.items_processed, 1);
@@ -905,6 +944,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
             now: Utc::now(),
+            router: noop_router(),
         };
         let r = run_feed_discovery(&pool, &ctx).await.unwrap();
         // Empty DB -> "no research items to mine for discovery"
@@ -928,6 +968,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
             now: Utc::now(),
+            router: noop_router(),
         };
         // We expect this to attempt 3 langs; either they succeed (network OK)
         // or all fail and total_new == 0. Either way: no panic.
@@ -945,6 +986,7 @@ mod tests {
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
             now: Utc::now(),
+            router: noop_router(),
         };
         // Override feeds.yaml to a single bad URL so the loop runs and records a failure
         // instead of trying to hit real RSS endpoints.
