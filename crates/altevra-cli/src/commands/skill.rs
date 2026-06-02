@@ -3,6 +3,7 @@ use altevra_skills::{
     parser::parse_skill,
     registry::{SkillRegistry, VersionCheckResult},
     sync::{apply_plan, build_plan, SyncAction},
+    watcher::{watch_loop, WatchConfig},
 };
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,14 @@ pub struct SkillSyncArgs {
     /// Include Altevra vault `06-skills` (relative to --vault) as a source.
     #[arg(long, default_value = ".")]
     pub vault: PathBuf,
+    /// Stay running. After the initial sync, watch every known skill directory
+    /// (`~/.{claude,codex,cursor,hermes,imperium}/skills/`) for changes and
+    /// re-sync within --debounce-ms of every settled burst. Ctrl+C to stop.
+    #[arg(long)]
+    pub watch: bool,
+    /// Coalesce window in milliseconds for watch mode (default 2000).
+    #[arg(long, default_value_t = 2000)]
+    pub debounce_ms: u64,
     #[arg(long)]
     pub json: bool,
 }
@@ -251,6 +260,64 @@ async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
         } else {
             println!("\n(dry-run — no files written. Re-run with --apply to write.)");
         }
+    }
+
+    // --watch: block on the long-running watcher AFTER the initial sync.
+    if args.watch {
+        let cfg = WatchConfig {
+            targets,
+            vault_skills_dir: Some(args.vault.join("06-skills")).filter(|p| p.exists()),
+            apply: args.apply,
+            debounce_ms: args.debounce_ms,
+        };
+        let mode = if cfg.apply { "APPLY" } else { "DRY-RUN" };
+        eprintln!(
+            "\n📡 Watching {} dir(s) for skill changes [{mode}, debounce {}ms]. Ctrl+C to stop.",
+            altevra_skills::importer::default_skill_dirs().len()
+                + cfg.vault_skills_dir.as_ref().map_or(0, |_| 1),
+            cfg.debounce_ms
+        );
+        // Spawn the blocking watcher on a dedicated thread so we can listen for
+        // Ctrl+C in the async runtime in parallel.
+        let cfg_clone = cfg.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            watch_loop(cfg_clone, |report| {
+                let trig = report
+                    .triggering_paths
+                    .iter()
+                    .take(3)
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let more = if report.triggering_paths.len() > 3 {
+                    format!(" (+{} more)", report.triggering_paths.len() - 3)
+                } else {
+                    String::new()
+                };
+                let mode = if cfg.apply { "applied" } else { "planned" };
+                eprintln!(
+                    "↻ cycle: triggers={trig}{more} | {mode} creates={} refreshes={} skips={}{}",
+                    report.plan_creates,
+                    report.plan_refreshes,
+                    report.plan_skips,
+                    if !report.result.errors.is_empty() {
+                        format!(" errors={}", report.result.errors.len())
+                    } else {
+                        String::new()
+                    }
+                );
+                // Non-blocking check: did anyone signal stop?
+                stop_rx.try_recv().is_err()
+            })
+        });
+
+        // Wait for Ctrl+C or the watcher thread exiting.
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\nstopping watcher…");
+        let _ = stop_tx.send(());
+        // The watcher checks `stop_rx` on the NEXT event/timeout (≤500ms).
+        let _ = handle.join();
     }
     Ok(())
 }

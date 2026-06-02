@@ -36,6 +36,19 @@ Built the sync engine on top of the inventory; explicitly stopped at apply (Pavl
 
 Baseline 688 tests pass / 0 fail; clippy `--workspace -D warnings` clean.
 
+## 2026-06-02 (session 4 cont'd) — real-time skill watcher ✅ END-TO-END PASS
+
+Final piece of "AUTOMATSKI da se prebacuje" — the watcher daemon. Started after Pavle's "ajde nastavi" follow-up.
+
+- **`altevra-skills::watcher`** module on top of `notify` (already used by `altevra-watcher`). `watch_loop` runs a long-running mpsc loop over CREATE/MODIFY/REMOVE events; debounces 2s; per-cycle re-plan + (optional) re-apply. Filters out our own `.altevra-tmp` write-temps and editor `.swp` to prevent re-trigger loops.
+- **`altevra skill sync --watch [--apply]`** CLI flag — initial sync, then blocks watching. Ctrl+C is observed via tokio signal + std::mpsc stop channel.
+- **LIVE END-TO-END VERIFIED** in two runs:
+  1. **DRY-RUN watch**: created `~/.hermes/skills/altevra-watch-test/SKILL.md` at runtime → cycle log "↻ cycle: triggers=…altevra-watch-test/SKILL.md | planned creates=4 refreshes=0 skips=686". Zero writes (dry-run).
+  2. **APPLY watch (Pavle's explicit go from previous step)**: same injection → all 4 other tools (`claude`, `codex`, `cursor`, `imperium`) received the skill with managed header within debounce window. Each file's first line: `<!-- ALTEVRA_MANAGED: true -->`. Cycle log: `applied creates=4 refreshes=0 skips=686`. **Direct system-level confirmation** — the injected test skill briefly appeared in Claude Code's SessionStart skill listing during the run.
+- Test artifacts cleaned up after each run (no test skill left in tool dirs).
+
+Baseline 690 tests pass / 0 fail; clippy `--workspace -D warnings` clean. Pavle's "AUTOMATSKI da se prebacuje, brate" — now real.
+
 ## 2026-06-01 — MCP stdio connection (autonomous half) ✅ PASS
 
 **What:** Built the real release binary (`cargo build --release -p altevra-cli`,
