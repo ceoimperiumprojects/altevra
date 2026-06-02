@@ -2,6 +2,23 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 7b) — `recall_window` MCP tool: recent memory by time, no query ✅ PASS
+
+Small follow-on: a dedicated MCP tool to ask "what happened in the last week"
+without a search term. Baseline 761 → 764 tests, 0 fail; clippy clean; fmt.
+
+- `SessionsRepository::recent_turns_with_provenance(project, tool, since, until,
+  limit)` — query-LESS recency listing (newest first) with the same provenance
+  LEFT JOIN as the search variants. 1 unit test.
+- `recall_window {window?, since?, until?, project?, tool?, limit?}` MCP tool —
+  defaults to `last_week`, fail-closed on a bad window, same R11 #4 exposure gate
+  as `search_turns` (recency never bypasses the ceiling). Wired into server.rs
+  tool list + dispatch. 2 unit tests (lists-without-query, rejects-bad-window).
+- **LIVE via the real release `altevra serve` MCP server**: `recall_window` present
+  in tools/list; called with a seeded DB (2 turns) → `window: last_week, count: 2`,
+  both turns newest-first with breadcrumbs `claude-code · altevra · just now`.
+  isError:false. Exactly the "what happened lately" use case, no query needed.
+
 ## 2026-06-02 (session 7) — `capture --watch`: auto-atomize living docs on save ✅ PASS
 
 Closed the atomization loop — no more manual `altevra capture <file>`. A watcher

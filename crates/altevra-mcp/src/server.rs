@@ -428,6 +428,25 @@ pub fn list_tools() -> Value {
         ),
     ));
     tools.push(tool(
+        "recall_window",
+        "Recent memory by TIME, with NO search query — \"what happened in the last \
+         week\". Lists the most recent recorded turns within a window, newest first, \
+         each with a provenance breadcrumb. Pass `window` (last_week|30d|3mo|…) or \
+         explicit `since`/`until`; optional `project`/`tool` filter.",
+        obj_schema(
+            &[],
+            serde_json::json!({
+                "window": {"type": "string", "description": "Preset (last_24h|last_week|last_month|last_quarter|last_year) or duration (24h|7d|30d|3mo|1y). Default: last_week."},
+                "since": {"type": "string", "description": "RFC3339, YYYY-MM-DD, or duration (e.g. 30d = now-30d)."},
+                "until": {"type": "string", "description": "Same formats as since (default: now)."},
+                "project": {"type": "string"},
+                "tool": {"type": "string"},
+                "limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
+    tools.push(tool(
         "file_history",
         "Recorded change history for a file path.",
         obj_schema(
@@ -607,6 +626,7 @@ impl McpServer {
             // v0.3.7: Replay & Query
             "replay_session" => crate::tools_sessions::handle_replay_session(id, args),
             "search_turns" => crate::tools_sessions::handle_search_turns(id, args),
+            "recall_window" => crate::tools_sessions::handle_recall_window(id, args),
             "file_history" => crate::tools_sessions::handle_file_history(id, args),
             // v0.3.7.5: Research v2
             "discover_feed" => crate::tools_discovery::handle_discover_feed(id, args),

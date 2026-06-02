@@ -641,6 +641,89 @@ impl<'a> SessionsRepository<'a> {
         Ok(scored)
     }
 
+    /// Query-LESS recency listing within a temporal window — "what happened in
+    /// `last_week`" with no search term. Powers the `recall_window` MCP tool. Same
+    /// provenance LEFT JOIN + optional project/tool filters as the search variants,
+    /// but ordered purely by recency (score is uniformly 0.0). `since`/`until` are
+    /// inclusive-start / exclusive-end; both `None` lists the most recent overall.
+    pub async fn recent_turns_with_provenance(
+        &self,
+        project: Option<&str>,
+        tool: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<TurnSearchHit>> {
+        let mut sql = String::from(
+            "SELECT t.*, s.tool AS s_tool, s.project_name AS s_project
+             FROM turns t LEFT JOIN sessions s ON t.session_id = s.id WHERE 1=1",
+        );
+        if tool.is_some() {
+            sql.push_str(" AND s.tool = ?");
+        }
+        if project.is_some() {
+            sql.push_str(" AND s.project_name = ?");
+        }
+        if since.is_some() {
+            sql.push_str(" AND t.created_at >= ?");
+        }
+        if until.is_some() {
+            sql.push_str(" AND t.created_at < ?");
+        }
+        sql.push_str(" ORDER BY t.created_at DESC LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(t) = tool {
+            q = q.bind(t);
+        }
+        if let Some(p) = project {
+            q = q.bind(p);
+        }
+        if let Some(t) = since {
+            q = q.bind(ts_to_text(&t));
+        }
+        if let Some(t) = until {
+            q = q.bind(ts_to_text(&t));
+        }
+        q = q.bind(limit);
+
+        let rows = q.fetch_all(self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let row = TurnRow {
+                    id: uuid_from_text(r.get::<String, _>("id")),
+                    session_id: uuid_from_text(r.get::<String, _>("session_id")),
+                    turn_idx: r.get("turn_idx"),
+                    role: r.get("role"),
+                    content: r.get("content"),
+                    tool_calls: r
+                        .get::<Option<String>, _>("tool_calls")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    tool_name: r.get("tool_name"),
+                    model: r.get("model"),
+                    tokens_in: r.get("tokens_in"),
+                    tokens_out: r.get("tokens_out"),
+                    latency_ms: r.get("latency_ms"),
+                    file_changes: r
+                        .get::<Option<String>, _>("file_changes")
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    redacted_count: r.get("redacted_count"),
+                    source_tool: r.get("source_tool"),
+                    sensitivity: r.get("sensitivity"),
+                    redaction_status: r.get("redaction_status"),
+                    created_at: ts_from_text(r.get::<String, _>("created_at")),
+                };
+                TurnSearchHit {
+                    row,
+                    score: 0.0,
+                    session_tool: r.get::<Option<String>, _>("s_tool"),
+                    session_project: r.get::<Option<String>, _>("s_project"),
+                }
+            })
+            .collect())
+    }
+
     pub async fn file_history(&self, path: &str, limit: i64) -> anyhow::Result<Vec<FileChangeRow>> {
         let rows = sqlx::query(
             r#"SELECT * FROM file_changes WHERE path = ?
@@ -1058,5 +1141,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recent_turns_window_lists_without_a_query() {
+        // "what happened in the last week" — NO search term, just recency.
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+        let s = sample_session();
+        repo.start_session(&s).await.unwrap();
+
+        let now = Utc::now();
+        let mk = |idx: i64, content: &str, ts| TurnRow {
+            id: Uuid::new_v4(),
+            session_id: s.id,
+            turn_idx: idx,
+            role: "user".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: None,
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
+            created_at: ts,
+        };
+        repo.record_turn(&mk(0, "old thing", now - chrono::Duration::days(30)))
+            .await
+            .unwrap();
+        repo.record_turn(&mk(1, "recent thing one", now - chrono::Duration::days(2)))
+            .await
+            .unwrap();
+        repo.record_turn(&mk(2, "recent thing two", now - chrono::Duration::hours(3)))
+            .await
+            .unwrap();
+
+        // last 7 days → the two recent turns only, newest first, no query needed.
+        let since = now - chrono::Duration::days(7);
+        let hits = repo
+            .recent_turns_with_provenance(None, None, Some(since), Some(now), 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 2, "only the two within-window turns");
+        assert_eq!(hits[0].row.content, "recent thing two", "newest first");
+        assert_eq!(hits[1].row.content, "recent thing one");
+        // provenance is carried (tool from the session).
+        assert!(hits[0].session_tool.is_some());
+
+        // no window → most recent overall (all three), still recency-ordered.
+        let all = repo
+            .recent_turns_with_provenance(None, None, None, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].row.content, "recent thing two");
     }
 }

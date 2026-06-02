@@ -206,6 +206,103 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
     }
 }
 
+/// `recall_window` — recent memory by TIME with NO search query. Lists the most
+/// recent recorded turns within a window (newest first), each gated + breadcrumbed.
+/// Defaults to `last_week` when no `window`/`since`/`until` is given. Same R11 #4
+/// exposure gate as `search_turns` (never returns above-ceiling/unredacted turns).
+pub fn handle_recall_window(id: Value, args: &Value) -> McpResponse {
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(20);
+    let project = args.get("project").and_then(|v| v.as_str());
+    let tool = args.get("tool").and_then(|v| v.as_str());
+    let db_path = db_path_from_args(args);
+
+    let now = chrono::Utc::now();
+    let mut t_since = None;
+    let mut t_until = None;
+    let mut window_label: Option<String> = None;
+    if let Some(w) = args.get("window").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_window(w, now) {
+            Some(r) => {
+                t_since = Some(r.since);
+                t_until = Some(r.until);
+                window_label = Some(w.to_string());
+            }
+            None => {
+                return McpResponse::error(
+                    id,
+                    -32602,
+                    format!("unknown window '{w}' (try: 24h, 7d, 30d, 3mo, last_week, last_month)"),
+                );
+            }
+        }
+    }
+    if let Some(s) = args.get("since").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(s, now) {
+            Some(t) => t_since = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'since' value '{s}'")),
+        }
+    }
+    if let Some(u) = args.get("until").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(u, now) {
+            Some(t) => t_until = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'until' value '{u}'")),
+        }
+    }
+    // No explicit window → default to last_week (the common "what happened lately").
+    if t_since.is_none() && t_until.is_none() {
+        if let Some(r) = altevra_core::time_window::parse_window("last_week", now) {
+            t_since = Some(r.since);
+            t_until = Some(r.until);
+            window_label = Some("last_week".to_string());
+        }
+    }
+
+    let result: anyhow::Result<Value> = futures::executor::block_on(async {
+        let pool = open_pool(&db_path).await?;
+        let repo = altevra_db::SessionsRepository::new(&pool);
+        let raw_hits = repo
+            .recent_turns_with_provenance(project, tool, t_since, t_until, limit)
+            .await?;
+        // R11 #4: gate every hit (same as search_turns) — recency never bypasses
+        // the exposure ceiling / redaction requirement.
+        let hits: Vec<_> = raw_hits
+            .into_iter()
+            .filter(|h| turn_exposable(&h.row))
+            .collect();
+        let now = chrono::Utc::now();
+        Ok(serde_json::json!({
+            "window": window_label,
+            "since": t_since,
+            "until": t_until,
+            "count": hits.len(),
+            "results": hits.iter().map(|h| {
+                let tool_s = h.session_tool.as_deref().unwrap_or("?");
+                let proj_s = h.session_project.as_deref().unwrap_or("?");
+                let when_h = altevra_core::time_window::humanize_relative(h.row.created_at, now);
+                let breadcrumb = format!("{tool_s} · {proj_s} · {when_h}");
+                serde_json::json!({
+                    "session_id": h.row.session_id,
+                    "turn_idx": h.row.turn_idx,
+                    "role": h.row.role,
+                    "snippet": h.row.content.chars().take(220).collect::<String>(),
+                    "created_at": h.row.created_at,
+                    "provenance": {
+                        "tool": h.session_tool,
+                        "project": h.session_project,
+                        "when_human": when_h,
+                        "breadcrumb": breadcrumb,
+                    },
+                })
+            }).collect::<Vec<_>>(),
+        }))
+    });
+
+    match result {
+        Ok(v) => McpResponse::ok(id, v),
+        Err(e) => McpResponse::error(id, -32603, e.to_string()),
+    }
+}
+
 pub fn handle_file_history(id: Value, args: &Value) -> McpResponse {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
@@ -339,6 +436,37 @@ mod tests {
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
         assert!(result["count"].as_i64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn recall_window_lists_recent_without_query() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        seed(&db).await; // seeds turns at Utc::now() → within last_week
+                         // No query, no window → defaults to last_week.
+        let args = serde_json::json!({ "db_path": db.to_string_lossy() });
+        let resp = handle_recall_window(serde_json::json!(1), &args);
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["window"], "last_week", "defaults to last_week");
+        assert!(
+            result["count"].as_i64().unwrap() >= 1,
+            "recent turns listed without a query"
+        );
+        // every hit carries a provenance breadcrumb.
+        let first = &result["results"][0];
+        assert!(first["provenance"]["breadcrumb"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_window_rejects_bad_window() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        seed(&db).await;
+        let args = serde_json::json!({ "window": "garbage", "db_path": db.to_string_lossy() });
+        let resp = handle_recall_window(serde_json::json!(1), &args);
+        // fail-closed: a bad window is an error, never a silently-wide listing.
+        assert!(resp.error.is_some());
     }
 
     #[tokio::test]
