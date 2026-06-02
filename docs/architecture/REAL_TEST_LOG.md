@@ -2,6 +2,37 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 7) — `capture --watch`: auto-atomize living docs on save ✅ PASS
+
+Closed the atomization loop — no more manual `altevra capture <file>`. A watcher
+auto-atomizes living docs whenever they're saved, incrementally + idempotently.
+Baseline 755 → 761 tests, 0 fail; clippy `--workspace --all-targets -D warnings`
+clean; fmt.
+
+- **Incremental re-atomize (`atomize_file`)** — reconciles each file's prior objects
+  (same `capture-<filestem>-` id prefix). Edit a section → new content hash → new id
+  + stale id `forget`-ten; delete a section → forgotten; add a section → new object;
+  unchanged section → same id (idempotent). `LearningsRepository::insert` is now
+  `INSERT OR REPLACE` so re-writing an unchanged id never UNIQUE-violates;
+  `ObjectIndexRepository::ids_with_prefix` finds the file's prior objects (LIKE-escaped).
+- **`altevra capture --watch [--path …] [--debounce-ms N]`** — async watcher mirroring
+  `WatcherDaemon` (notify → tokio mpsc → `Debouncer` → `tokio::select!`, Ctrl+C
+  shutdown). Initial atomize pass, then blocks watching. One-shot `capture <file>`
+  unchanged (`file` now Optional, required unless `--watch`).
+- **SI-7 held** — watcher writes SQLite ONLY; never the vault. `atomize_file` still
+  infers domain + escalates high-water (People→relationship→Restricted).
+- **Headline unit test** `incremental_reatomize_reflects_exactly_v2`: v1 (3 objects)
+  → v2 = exactly {1 unchanged-by-id, 1 updated, 1 removed→forgotten, 1 new}; 3 live
+  objects, no dupes; recall finds new text, not old. Plus a LIVE `watch_until_shutdown`
+  loop test (create file while watching → object lands → recall confirms).
+- **LIVE on a READ-ONLY COPY of real `~/Obsidian/Imperium/Memory/`** (vault never
+  written): initial pass atomized **41 objects** (31 Decisions + 10 People). Appended
+  a section live → watcher → **42 objects**, recall found it. Edited that section's
+  text → still **42** (updated, NOT duplicated), **1 forgotten** (stale), recall:
+  NEW text = 1 hit, OLD text = "No memory of…". Watcher log shows
+  `↻ Decisions.md: 32 captured, 1 forgotten`. Real vault untouched; temp DB + copy
+  deleted after.
+
 ## 2026-06-02 (session 6) — Section templates: per-`##`-section conformance + LLM rewrite seam ✅ PASS
 
 Pavle's follow-up: *"svaki dokument prati šablon ČAK I DELOVE u dokumentu … sve

@@ -28,6 +28,7 @@ altevra-llm = { workspace = true }
 sqlx = { workspace = true }
 indicatif = { workspace = true }
 rusqlite = { workspace = true }
+notify = { workspace = true }
 walkdir = { workspace = true }
 serde_yaml = { workspace = true }
 async-trait = { workspace = true }

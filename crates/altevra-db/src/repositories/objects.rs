@@ -53,12 +53,17 @@ impl<'a> LearningsRepository<'a> {
         Self { pool }
     }
 
-    /// Insert a learning. Caller is responsible for having run `ingest_guard`
-    /// first (TAG-1 / redaction enforced upstream).
+    /// Insert (or replace) a learning. Caller is responsible for having run
+    /// `ingest_guard` first (TAG-1 / redaction enforced upstream).
+    ///
+    /// `INSERT OR REPLACE` (not plain INSERT) so re-capturing the same content-id is
+    /// idempotent — the incremental re-atomize path (`capture --watch`) re-writes an
+    /// unchanged section's id without a UNIQUE violation; a changed section gets a
+    /// new id and the stale one is `forget`-ten by the caller.
     pub async fn insert(&self, row: &LearningRow) -> anyhow::Result<()> {
         let now = ts_to_text(&Utc::now());
         sqlx::query(
-            "INSERT INTO learnings \
+            "INSERT OR REPLACE INTO learnings \
              (id, type, title, body, status, domain, scope, sensitivity, provenance, \
               redaction_status, categories, tags, confidence, created_at, updated_at) \
              VALUES (?, 'learning', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -249,6 +254,30 @@ impl<'a> ObjectIndexRepository<'a> {
         Ok(res.rows_affected() > 0)
     }
 
+    /// IDs of non-forgotten index rows whose id begins with `prefix`. Used by the
+    /// incremental re-atomize path (`capture --watch`) to find the prior objects
+    /// derived from one file (all share the `capture-<filestem>-` id prefix) so the
+    /// stale ones can be `forget`-ten when a living doc is edited. `%`/`_` in the
+    /// prefix are escaped so a filestem with those chars can't widen the match.
+    pub async fn ids_with_prefix(&self, prefix: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let escaped = prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let like = format!("{escaped}%");
+        let rows = sqlx::query(
+            "SELECT type, id FROM object_index \
+             WHERE id LIKE ? ESCAPE '\\' AND status != 'forgotten'",
+        )
+        .bind(like)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("type"), r.get::<String, _>("id")))
+            .collect())
+    }
+
     /// Candidate rows for packet compilation, optionally filtered by domain.
     /// (The ExposureGate does the actual ceiling/scope filtering downstream.)
     pub async fn candidates(&self, domain: Option<&str>) -> anyhow::Result<Vec<ObjectIndexRow>> {
@@ -421,5 +450,74 @@ mod tests {
         assert_eq!(row.get::<String, _>("status"), "forgotten");
         // forgetting an unknown object is a no-op.
         assert!(!idx.forget("learning", "nope").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ids_with_prefix_finds_file_objects_excludes_forgotten() {
+        let p = pool().await;
+        let idx = ObjectIndexRepository::new(&p);
+        for id in ["capture-decisions-a-1111", "capture-decisions-b-2222"] {
+            idx.index_object(
+                &ObjectIndexRow {
+                    object_type: "learning".into(),
+                    id: id.into(),
+                    status: "active".into(),
+                    sensitivity: "internal".into(),
+                    domain: "business".into(),
+                    scope: None,
+                    title: Some(id.into()),
+                    categories: "[]".into(),
+                    tags: "[]".into(),
+                    redaction_status: "clean".into(),
+                    updated_at: Utc::now(),
+                },
+                "body",
+            )
+            .await
+            .unwrap();
+        }
+        // a different file's object must NOT match.
+        idx.index_object(
+            &ObjectIndexRow {
+                object_type: "learning".into(),
+                id: "capture-people-x-3333".into(),
+                status: "active".into(),
+                sensitivity: "internal".into(),
+                domain: "relationship".into(),
+                scope: None,
+                title: Some("other".into()),
+                categories: "[]".into(),
+                tags: "[]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "body",
+        )
+        .await
+        .unwrap();
+
+        let mut got = idx.ids_with_prefix("capture-decisions-").await.unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "learning".to_string(),
+                    "capture-decisions-a-1111".to_string()
+                ),
+                (
+                    "learning".to_string(),
+                    "capture-decisions-b-2222".to_string()
+                ),
+            ]
+        );
+
+        // forgotten rows are excluded.
+        idx.forget("learning", "capture-decisions-a-1111")
+            .await
+            .unwrap();
+        let after = idx.ids_with_prefix("capture-decisions-").await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].1, "capture-decisions-b-2222");
     }
 }

@@ -3,6 +3,7 @@ pub mod analyze;
 pub mod banner;
 pub mod brain;
 pub mod capture;
+pub mod capture_watch;
 pub mod config;
 pub mod connect;
 pub mod context;

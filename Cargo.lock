@@ -153,6 +153,7 @@ dependencies = [
  "clap",
  "indicatif 0.17.11",
  "libc",
+ "notify",
  "predicates",
  "rpassword",
  "rusqlite",

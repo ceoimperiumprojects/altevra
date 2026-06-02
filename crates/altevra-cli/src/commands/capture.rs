@@ -25,7 +25,19 @@ use std::path::{Path, PathBuf};
 #[derive(Args)]
 pub struct CaptureArgs {
     /// Markdown file to capture (e.g. a note from ~/Obsidian/Imperium/).
-    pub file: PathBuf,
+    /// Optional only with `--watch` (which captures watched dirs continuously).
+    pub file: Option<PathBuf>,
+    /// WATCH: continuously auto-atomize living docs on save. Watches `--path`
+    /// dirs (default ~/Obsidian/Imperium/Memory + Daily). Runs an initial atomize
+    /// pass, then blocks until Ctrl+C. SQLite-only; never writes the vault.
+    #[arg(long)]
+    pub watch: bool,
+    /// Directories to watch (repeatable). Defaults to Memory/ + Daily/ when omitted.
+    #[arg(long = "path")]
+    pub paths: Vec<PathBuf>,
+    /// Debounce window (ms) to coalesce editor save bursts in `--watch`.
+    #[arg(long, default_value_t = 2_000)]
+    pub debounce_ms: u64,
     /// Domain override. If omitted, inferred from the file path (Memory/People →
     /// relationship, health → health, …) else `business`.
     #[arg(long)]
@@ -57,10 +69,24 @@ pub struct CaptureArgs {
 }
 
 pub async fn run(args: CaptureArgs) -> anyhow::Result<()> {
-    let raw = std::fs::read_to_string(&args.file)
-        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", args.file.display()))?;
+    let declared: Sensitivity = args
+        .sensitivity
+        .parse()
+        .map_err(|_| anyhow::anyhow!("unknown --sensitivity '{}'", args.sensitivity))?;
+
+    // --- watch mode: continuous auto-atomize of living docs (SQLite-only) ---
+    if args.watch {
+        return run_capture_watch(&args, declared).await;
+    }
+
+    let file = args
+        .file
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("a <file> is required (or use --watch)"))?;
+    let raw = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", file.display()))?;
     if raw.trim().is_empty() {
-        anyhow::bail!("{} is empty — nothing to capture", args.file.display());
+        anyhow::bail!("{} is empty — nothing to capture", file.display());
     }
 
     // Domain: explicit flag wins; else infer from the path.
@@ -68,12 +94,8 @@ pub async fn run(args: CaptureArgs) -> anyhow::Result<()> {
         Some(d) => d
             .parse()
             .map_err(|_| anyhow::anyhow!("unknown --domain '{d}'"))?,
-        None => infer_domain(&args.file),
+        None => infer_domain(&file),
     };
-    let declared: Sensitivity = args
-        .sensitivity
-        .parse()
-        .map_err(|_| anyhow::anyhow!("unknown --sensitivity '{}'", args.sensitivity))?;
 
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
@@ -82,19 +104,47 @@ pub async fn run(args: CaptureArgs) -> anyhow::Result<()> {
     // aggregate (Memory/Decisions|Learnings|People|…) with ≥2 `## ` sections.
     // --no-atomize always forces the legacy whole-file path (back-compat).
     let sections = parse_sections(&raw);
-    let want_atomize = !args.no_atomize
-        && (args.atomize || (should_auto_atomize(&args.file) && sections.len() >= 2));
+    let want_atomize =
+        !args.no_atomize && (args.atomize || (should_auto_atomize(&file) && sections.len() >= 2));
 
     if want_atomize {
-        return run_atomize(&pool, &args, &raw, sections, domain, declared).await;
+        return run_atomize(&pool, &args, &file, &raw, sections, domain, declared).await;
     }
-    run_whole_file(&pool, &args, &raw, domain, declared).await
+    run_whole_file(&pool, &args, &file, &raw, domain, declared).await
+}
+
+/// `--watch` driver: build the watcher config + block on the watch loop, printing
+/// each cycle's atomize summary to stderr (Ctrl+C to stop).
+async fn run_capture_watch(args: &CaptureArgs, declared: Sensitivity) -> anyhow::Result<()> {
+    let paths = if args.paths.is_empty() {
+        super::capture_watch::default_watch_dirs()
+    } else {
+        args.paths.clone()
+    };
+    let cfg = super::capture_watch::CaptureWatchConfig {
+        paths: paths.clone(),
+        debounce_ms: args.debounce_ms,
+        declared,
+        categories: args.categories.clone(),
+        db: args.db.clone(),
+    };
+    eprintln!(
+        "📡 Auto-atomize watching {} dir(s) [debounce {}ms] → {}. Ctrl+C to stop.",
+        paths.len(),
+        args.debounce_ms,
+        args.db.display()
+    );
+    for p in &paths {
+        eprintln!("   • {}", p.display());
+    }
+    super::capture_watch::run_watch(cfg, |line| eprintln!("{line}")).await
 }
 
 /// Legacy whole-file capture: one note → one `learning` (unchanged behaviour).
 async fn run_whole_file(
     pool: &SqlitePool,
     args: &CaptureArgs,
+    file: &Path,
     raw: &str,
     domain: Domain,
     declared: Sensitivity,
@@ -107,7 +157,7 @@ async fn run_whole_file(
         anyhow::bail!(
             "refusing to capture {}: a credential-class secret was detected. \
              Remove it (or store it via `altevra secrets set`) and retry.",
-            args.file.display()
+            file.display()
         );
     }
 
@@ -122,7 +172,7 @@ async fn run_whole_file(
         .title
         .clone()
         .or_else(|| first_heading(raw))
-        .unwrap_or_else(|| file_stem(&args.file));
+        .unwrap_or_else(|| file_stem(file));
 
     // Tags: always include the domain so TAG-1 holds; merge any --categories.
     let cats = build_categories(&domain, &args.categories, None);
@@ -130,11 +180,7 @@ async fn run_whole_file(
 
     // Deterministic-ish id: capture-<stem>-<8-char content hash> so re-capturing
     // an edited note makes a new row, but the same note twice collides predictably.
-    let id = format!(
-        "capture-{}-{}",
-        slugify(&file_stem(&args.file)),
-        short_hash(raw)
-    );
+    let id = format!("capture-{}-{}", slugify(&file_stem(file)), short_hash(raw));
 
     let row = LearningRow {
         id: id.clone(),
@@ -144,7 +190,7 @@ async fn run_whole_file(
         domain: domain.to_string(),
         scope: None,
         sensitivity: sensitivity.to_string(),
-        provenance: provenance_json(&args.file, None)?,
+        provenance: provenance_json(file, None)?,
         redaction_status: guarded.redaction_status.to_string(),
         categories: categories_json,
         tags: serde_json::to_string(&cats)?,
@@ -190,30 +236,54 @@ enum SectionOutcome {
     Skipped { reason: &'static str },
 }
 
-/// Atomizing capture: each `## ` section → its own object, type inferred from the
-/// filename (Decisions→decision, Learnings→learning, People→person, else note).
-/// A section whose guard yields a `rejected` (credential-class) sighting is SKIPPED
-/// with a warning; all other sections still get captured.
-async fn run_atomize(
+/// Result of atomizing one file — the counts + outcomes used for the CLI report
+/// AND by the `--watch` cycle log. `forgotten` is the count of prior objects from
+/// this file that no longer correspond to a current section (incremental cleanup).
+pub(crate) struct AtomizeResult {
+    pub kind: &'static str,
+    pub domain: String,
+    pub sections_found: usize,
+    pub captured: usize,
+    pub skipped_credential: usize,
+    pub redactions: usize,
+    pub conformant: usize,
+    pub needs_structure: usize,
+    pub forgotten: usize,
+    outcomes: Vec<SectionOutcome>,
+}
+
+/// Atomize one file into the DB: each `## ` section → its own object (type from
+/// filename), credential-class sections skipped, then INCREMENTALLY reconcile —
+/// any prior object from this file (same `capture-<stem>-` id prefix) whose section
+/// no longer exists or whose content hash changed is `forget`-ten. Idempotent:
+/// re-running on unchanged content re-writes identical ids (INSERT OR REPLACE) and
+/// forgets nothing. SQLite-only; never touches the vault.
+pub(crate) async fn atomize_file(
     pool: &SqlitePool,
-    args: &CaptureArgs,
-    _raw: &str,
-    sections: Vec<altevra_vault::Section>,
-    domain: Domain,
-    declared: Sensitivity,
-) -> anyhow::Result<()> {
-    let kind = infer_kind(&args.file);
-    let stem = slugify(&file_stem(&args.file));
+    file: &Path,
+    sections: &[altevra_vault::Section],
+    domain: &Domain,
+    declared: &Sensitivity,
+    categories: &[String],
+) -> anyhow::Result<AtomizeResult> {
+    let kind = infer_kind(file);
+    let stem = slugify(&file_stem(file));
+    let id_prefix = format!("capture-{stem}-");
     let learnings = LearningsRepository::new(pool);
+    let idx = altevra_db::ObjectIndexRepository::new(pool);
+
+    // Prior objects derived from THIS file (for incremental forget of the stale).
+    let prior: Vec<(String, String)> = idx.ids_with_prefix(&id_prefix).await?;
 
     let mut outcomes: Vec<SectionOutcome> = Vec::new();
+    let mut current_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut captured = 0usize;
     let mut skipped_secret = 0usize;
     let mut total_redactions = 0usize;
     let mut conformant_n = 0usize;
     let mut needs_structure_n = 0usize;
 
-    for sec in &sections {
+    for sec in sections {
         // ---- per-section safety gate ----
         let guarded = guard_text(&sec.body, declared.clone());
 
@@ -239,7 +309,7 @@ async fn run_atomize(
         // Tags/categories: domain + a `kind:<type>` tag so atomized objects are
         // filterable by their inferred type (TAG-1 already satisfied by domain).
         let kind_tag = format!("kind:{kind}");
-        let mut cats = build_categories(&domain, &args.categories, Some(&kind_tag));
+        let mut cats = build_categories(domain, categories, Some(&kind_tag));
 
         // Section-template conformance (Phase 1): tag the object so recall can
         // surface "this note needs cleanup". `conformant` vs `needs-structure`.
@@ -259,12 +329,15 @@ async fn run_atomize(
         }
 
         // Stable id: capture-<stem>-<section-slug>-<8charhash-of-section-body>.
+        // The content hash makes the id change iff the section text changes — the
+        // basis of incremental re-atomize.
         let id = format!(
             "capture-{}-{}-{}",
             stem,
             short_section_slug(&sec.heading),
             short_hash(&sec.body)
         );
+        current_ids.insert(id.clone());
 
         let row = LearningRow {
             id: id.clone(),
@@ -274,7 +347,7 @@ async fn run_atomize(
             domain: domain.to_string(),
             scope: None,
             sensitivity: sensitivity.to_string(),
-            provenance: provenance_json(&args.file, sec.date.map(|d| d.to_string()))?,
+            provenance: provenance_json(file, sec.date.map(|d| d.to_string()))?,
             redaction_status: guarded.redaction_status.to_string(),
             categories: serde_json::to_string(&cats)?,
             tags: serde_json::to_string(&cats)?,
@@ -285,8 +358,44 @@ async fn run_atomize(
         outcomes.push(SectionOutcome::Captured { kind, id });
     }
 
+    // ---- incremental reconcile: forget prior objects no longer present ----
+    // (section deleted, or its text changed → new hash → new id → old id stale).
+    let mut forgotten = 0usize;
+    for (otype, oid) in &prior {
+        if !current_ids.contains(oid) && idx.forget(otype, oid).await? {
+            forgotten += 1;
+        }
+    }
+
+    Ok(AtomizeResult {
+        kind,
+        domain: domain.to_string(),
+        sections_found: sections.len(),
+        captured,
+        skipped_credential: skipped_secret,
+        redactions: total_redactions,
+        conformant: conformant_n,
+        needs_structure: needs_structure_n,
+        forgotten,
+        outcomes,
+    })
+}
+
+/// One-shot atomizing capture (the CLI report layer over `atomize_file`).
+async fn run_atomize(
+    pool: &SqlitePool,
+    args: &CaptureArgs,
+    file: &Path,
+    _raw: &str,
+    sections: Vec<altevra_vault::Section>,
+    domain: Domain,
+    declared: Sensitivity,
+) -> anyhow::Result<()> {
+    let res = atomize_file(pool, file, &sections, &domain, &declared, &args.categories).await?;
+
     if args.json {
-        let results: Vec<_> = outcomes
+        let results: Vec<_> = res
+            .outcomes
             .iter()
             .map(|o| match o {
                 SectionOutcome::Captured { kind, id } => {
@@ -300,31 +409,42 @@ async fn run_atomize(
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "file": args.file.display().to_string(),
+                "file": file.display().to_string(),
                 "atomized": true,
-                "kind": kind,
-                "domain": domain.to_string(),
-                "sections_found": sections.len(),
-                "captured": captured,
-                "skipped_credential": skipped_secret,
-                "redactions": total_redactions,
-                "conformant": conformant_n,
-                "needs_structure": needs_structure_n,
+                "kind": res.kind,
+                "domain": res.domain,
+                "sections_found": res.sections_found,
+                "captured": res.captured,
+                "skipped_credential": res.skipped_credential,
+                "redactions": res.redactions,
+                "conformant": res.conformant,
+                "needs_structure": res.needs_structure,
+                "forgotten": res.forgotten,
                 "results": results,
             }))?
         );
     } else {
         println!(
-            "Atomized {} → {captured} {kind}(s) captured, {skipped_secret} skipped (credential)",
-            args.file.display()
+            "Atomized {} → {} {}(s) captured, {} skipped (credential), {} forgotten (stale)",
+            file.display(),
+            res.captured,
+            res.kind,
+            res.skipped_credential,
+            res.forgotten
         );
-        println!("  domain={domain}  sections_found={}", sections.len());
         println!(
-            "  conformance: {conformant_n} conformant, {needs_structure_n} need-structure \
-             (tagged for cleanup)"
+            "  domain={}  sections_found={}",
+            res.domain, res.sections_found
         );
-        if total_redactions > 0 {
-            println!("  ⚠ {total_redactions} secret/PII redaction(s) applied before storage");
+        println!(
+            "  conformance: {} conformant, {} need-structure (tagged for cleanup)",
+            res.conformant, res.needs_structure
+        );
+        if res.redactions > 0 {
+            println!(
+                "  ⚠ {} secret/PII redaction(s) applied before storage",
+                res.redactions
+            );
         }
         println!("  → searchable now: altevra recall \"<term>\"");
     }
@@ -526,7 +646,10 @@ mod tests {
         .unwrap();
 
         run(CaptureArgs {
-            file: note,
+            file: Some(note),
+            watch: false,
+            paths: vec![],
+            debounce_ms: 2000,
             domain: Some("business".into()),
             sensitivity: "internal".into(),
             title: None,
@@ -622,7 +745,10 @@ mod tests {
         // No --atomize flag: it auto-atomizes because the file is Memory/Decisions.md
         // with ≥2 sections.
         run(CaptureArgs {
-            file: file.clone(),
+            file: Some(file.clone()),
+            watch: false,
+            paths: vec![],
+            debounce_ms: 2000,
             domain: None, // inferred: Memory/Decisions.md → business
             sensitivity: "internal".into(),
             title: None,
@@ -695,7 +821,10 @@ mod tests {
         .unwrap();
 
         run(CaptureArgs {
-            file: file.clone(),
+            file: Some(file.clone()),
+            watch: false,
+            paths: vec![],
+            debounce_ms: 2000,
             domain: None,
             sensitivity: "internal".into(),
             title: None,
@@ -741,7 +870,10 @@ mod tests {
         .unwrap();
 
         run(CaptureArgs {
-            file: file.clone(),
+            file: Some(file.clone()),
+            watch: false,
+            paths: vec![],
+            debounce_ms: 2000,
             domain: None,
             sensitivity: "internal".into(),
             title: None,
@@ -781,6 +913,152 @@ mod tests {
         assert!(
             saw_conformant && saw_needs,
             "both conformance states present"
+        );
+    }
+
+    /// The headline incremental-idempotency contract: re-atomizing an EDITED living
+    /// doc reflects EXACTLY the new section set — unchanged sections keep their id,
+    /// a changed section updates, a removed section is forgotten, a new section is
+    /// added. No duplicates.
+    #[tokio::test]
+    async fn incremental_reatomize_reflects_exactly_v2() {
+        use altevra_db::ObjectIndexRepository;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("inc.db");
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let file = mem.join("Decisions.md");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let declared: Sensitivity = "internal".parse().unwrap();
+        let domain = infer_domain(&file);
+
+        // --- v1: 3 sections ---
+        let v1 = "# Decisions\n\n\
+                  ## Section one stable\nThe first decision body stays the same.\n\n\
+                  ## Section two will change\nOriginal text for section two.\n\n\
+                  ## Section three will be removed\nThis section disappears in v2.\n";
+        std::fs::write(&file, v1).unwrap();
+        let secs1 = parse_sections(&std::fs::read_to_string(&file).unwrap());
+        let r1 = atomize_file(&pool, &file, &secs1, &domain, &declared, &[])
+            .await
+            .unwrap();
+        assert_eq!(r1.captured, 3);
+        assert_eq!(r1.forgotten, 0);
+
+        // Helper: live (non-forgotten) object ids currently in the index.
+        async fn live_ids(pool: &SqlitePool) -> std::collections::HashSet<String> {
+            ObjectIndexRepository::new(pool)
+                .candidates(None)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.status != "forgotten")
+                .map(|c| c.id)
+                .collect()
+        }
+        let v1_ids = live_ids(&pool).await;
+        assert_eq!(v1_ids.len(), 3, "v1 → 3 live objects");
+
+        // Capture the id of the stable section (its hash must NOT change in v2).
+        let stable_id = format!(
+            "capture-decisions-{}-{}",
+            short_section_slug("Section one stable"),
+            short_hash("The first decision body stays the same.")
+        );
+        assert!(
+            v1_ids.contains(&stable_id),
+            "stable section id present in v1"
+        );
+
+        // --- v2: section 1 unchanged, section 2 text changed, section 3 removed,
+        //         section 4 added ---
+        let v2 = "# Decisions\n\n\
+                  ## Section one stable\nThe first decision body stays the same.\n\n\
+                  ## Section two will change\nCOMPLETELY rewritten text for section two now.\n\n\
+                  ## Section four brand new\nA newly added fourth section appears.\n";
+        std::fs::write(&file, v2).unwrap();
+        let secs2 = parse_sections(&std::fs::read_to_string(&file).unwrap());
+        let r2 = atomize_file(&pool, &file, &secs2, &domain, &declared, &[])
+            .await
+            .unwrap();
+        assert_eq!(r2.captured, 3, "v2 has 3 sections");
+        // Forgotten: section-two-OLD-hash + section-three (removed) = 2.
+        assert_eq!(
+            r2.forgotten, 2,
+            "old section-two + removed section-three forgotten"
+        );
+
+        let v2_ids = live_ids(&pool).await;
+        assert_eq!(
+            v2_ids.len(),
+            3,
+            "exactly 3 live objects after v2 (no duplicates)"
+        );
+
+        // The stable section kept its id (unchanged hash) → still live.
+        assert!(
+            v2_ids.contains(&stable_id),
+            "unchanged section keeps its id"
+        );
+
+        // The removed section is gone.
+        let removed_id = format!(
+            "capture-decisions-{}-{}",
+            short_section_slug("Section three will be removed"),
+            short_hash("This section disappears in v2.")
+        );
+        assert!(
+            !v2_ids.contains(&removed_id),
+            "removed section's object is forgotten"
+        );
+
+        // The changed section's OLD id is gone, NEW id is present.
+        let s2_old = format!(
+            "capture-decisions-{}-{}",
+            short_section_slug("Section two will change"),
+            short_hash("Original text for section two.")
+        );
+        let s2_new = format!(
+            "capture-decisions-{}-{}",
+            short_section_slug("Section two will change"),
+            short_hash("COMPLETELY rewritten text for section two now.")
+        );
+        assert!(
+            !v2_ids.contains(&s2_old),
+            "stale changed-section id forgotten"
+        );
+        assert!(
+            v2_ids.contains(&s2_new),
+            "updated changed-section id present"
+        );
+
+        // recall reflects the change: the NEW text is findable, the OLD is not.
+        let fts = altevra_db::FtsRepository::new(&pool);
+        assert_eq!(
+            fts.search_objects("COMPLETELY rewritten", 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "new section two text is recallable"
+        );
+        assert!(
+            fts.search_objects("disappears in v2", 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "removed section is no longer recallable"
+        );
+        assert_eq!(
+            fts.search_objects("newly added fourth", 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "the added section is recallable"
         );
     }
 }
