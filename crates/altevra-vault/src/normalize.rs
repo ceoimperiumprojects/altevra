@@ -228,11 +228,14 @@ pub fn normalize_frontmatter(
         "created",
         Value::String(created.format("%Y-%m-%d").to_string()),
     );
-    // `updated` is always set to `now` (the file's current mtime) — but only counts
-    // as a change if it wasn't already that value (handled by the diff below).
-    let updated_key = Value::String("updated".to_string());
-    map.insert(
-        updated_key,
+    // `updated` is seeded ONLY when absent — never bumped on a re-run. Bumping it to
+    // the file's mtime each pass is non-idempotent: the act of writing changes the
+    // mtime, so the next run would see a new `updated` and rewrite forever. It marks
+    // when the doc was first normalized; a genuine future content-versioning bump is
+    // a separate concern.
+    set_if_absent(
+        &mut map,
+        "updated",
         Value::String(now.format("%Y-%m-%d").to_string()),
     );
 
@@ -462,7 +465,11 @@ mod tests {
     }
 
     #[test]
-    fn updated_bump_when_mtime_advances_is_a_change() {
+    fn updated_is_stable_across_mtime_advances_idempotent() {
+        // `updated` is seeded once and NOT bumped on re-runs — otherwise the write
+        // itself moves the mtime and every pass would rewrite (non-idempotent on a
+        // real vault, which is exactly the bug this guards). A newer mtime on an
+        // already-normalized file is therefore a no-op.
         let (v1, _) = normalize_frontmatter(
             None,
             "note",
@@ -473,17 +480,28 @@ mod tests {
             false,
         );
         let fm1 = Frontmatter::new(v1);
-        // mtime moved forward → `updated` changes → changed=true (file was edited).
-        let (_v2, c2) = normalize_frontmatter(
+        let (v2, c2) = normalize_frontmatter(
             Some(&fm1),
             "note",
             &Domain::Business,
             None,
             d(2026, 1, 1),
-            d(2026, 6, 10),
+            d(2026, 6, 10), // mtime advanced — but updated must stay put
             false,
         );
-        assert!(c2, "a newer mtime bumps `updated` → counts as a change");
+        assert!(
+            !c2,
+            "already-normalized file is a no-op even if mtime advanced"
+        );
+        if let Value::Mapping(m) = v2 {
+            assert_eq!(
+                m["updated"],
+                Value::String("2026-06-02".into()),
+                "updated stays at first-normalized date, not bumped"
+            );
+        } else {
+            panic!("expected mapping");
+        }
     }
 
     #[test]
