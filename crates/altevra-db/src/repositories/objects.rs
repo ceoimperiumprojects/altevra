@@ -188,6 +188,25 @@ impl<'a> ObjectIndexRepository<'a> {
         Ok(())
     }
 
+    /// The SINGLE write-time maintenance point: keep BOTH the structured index
+    /// (`object_index` — the packet compiler's candidate source) AND the FTS
+    /// substrate (`object_fts` — the bm25 signal, R12) in sync (T1.13 + T1.14b).
+    /// Durable writers call this so retrieval candidates and full-text stay
+    /// consistent; the ExposureGate still gates exposure downstream.
+    pub async fn index_object(&self, row: &ObjectIndexRow, body: &str) -> anyhow::Result<()> {
+        self.upsert(row).await?;
+        crate::repositories::fts::FtsRepository::new(self.pool)
+            .index(
+                &row.object_type,
+                &row.id,
+                row.title.as_deref().unwrap_or(""),
+                body,
+                &row.tags,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Candidate rows for packet compilation, optionally filtered by domain.
     /// (The ExposureGate does the actual ceiling/scope filtering downstream.)
     pub async fn candidates(&self, domain: Option<&str>) -> anyhow::Result<Vec<ObjectIndexRow>> {
@@ -277,5 +296,38 @@ mod tests {
         assert_eq!(idx.candidates(None).await.unwrap().len(), 1);
         assert_eq!(idx.candidates(Some("business")).await.unwrap().len(), 1);
         assert!(idx.candidates(Some("health")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn index_object_maintains_both_index_and_fts() {
+        let p = pool().await;
+        let idx = ObjectIndexRepository::new(&p);
+        idx.index_object(
+            &ObjectIndexRow {
+                object_type: "decision".into(),
+                id: "d9".into(),
+                status: "active".into(),
+                sensitivity: "internal".into(),
+                domain: "project".into(),
+                scope: None,
+                title: Some("Adopt SQLite for local-first storage".into()),
+                categories: "[\"storage\"]".into(),
+                tags: "[\"storage\",\"db\"]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "We adopt SQLite as the canonical local-first store; embeddings stay optional.",
+        )
+        .await
+        .unwrap();
+        // structured index sees it (packet candidate source)...
+        assert_eq!(idx.candidates(Some("project")).await.unwrap().len(), 1);
+        // ...and the FTS substrate finds it by a body term (bm25 signal).
+        let fts = crate::repositories::fts::FtsRepository::new(&p);
+        let hits = fts.search("SQLite local-first", 10).await.unwrap();
+        assert!(
+            hits.iter().any(|h| h.object_id == "d9"),
+            "FTS must find indexed object"
+        );
     }
 }
