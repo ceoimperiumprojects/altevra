@@ -7,6 +7,7 @@ description = "Altevra LLM provider abstraction — chat + embedding traits with
 repository = "https://github.com/ceoimperiumprojects/altevra"
 
 [dependencies]
+altevra-core = { workspace = true }
 altevra-secrets = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

@@ -15,6 +15,7 @@
 pub mod anthropic;
 pub mod chat;
 pub mod codex_oauth;
+pub mod factory;
 pub mod gemini;
 pub mod openai_compat;
 pub mod provider;
@@ -23,6 +24,7 @@ pub mod rate_limit;
 pub use anthropic::AnthropicProvider;
 pub use chat::{ChatMessage, ChatOpts, ChatRole};
 pub use codex_oauth::{CodexOAuthProvider, CodexWire};
+pub use factory::build_router;
 pub use gemini::GeminiFlashChat;
 pub use openai_compat::OpenAICompatProvider;
 pub use provider::{ChatProvider, ModelRole, ModelRouter, NoopProvider};

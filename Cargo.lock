@@ -197,6 +197,7 @@ dependencies = [
 name = "altevra-llm"
 version = "0.3.0"
 dependencies = [
+ "altevra-core",
  "altevra-secrets",
  "anyhow",
  "async-trait",
