@@ -2,6 +2,18 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 3) — LLM provider modes + hybrid lane, live-verified ✅ PASS
+
+LLM provider work (plan `giggly-humming-ullman.md`, R15). All live, real-world:
+
+- **codex_oauth reasoning → GPT-5.5 LIVE ✅** — `CodexOAuthProvider::from_default_auth()` against the REAL `~/.codex/auth.json`; minimal request returned `"PONG"`. Reverse-engineered the ChatGPT codex Responses contract through its 400s: instructions required, `store:false`, `stream:true`+SSE, no max_output_tokens. Auth accepted (not 401) → token valid. **This mode works today with NO API key**, on the existing ChatGPT Plus seat. (test `live_codex_completes`, `#[ignore]`.)
+- **sqlite-vec dense store LIVE ✅** — `--features embedding`: `SqliteVecStore::open_in_memory` (statically-linked extension) → upsert 3 vecs → KNN returns nearest in correct order. Single-binary, local (SI-7). (tests `upsert_then_knn_roundtrip`, `dim_mismatch_errors`.)
+- **config CLI flow ✅** — real debug binary: `config set/get/show llm.{reasoning_mode,embedding_mode,codex_model}` round-trips; `[llm]` persists to `.altevra/config.toml` (correct TOML table ordering); invalid mode rejected with clear message.
+- **MCP connection re-smoke (post-changes) ✅** — `scripts/p0_mcp_smoke.sh` (debug bin): initialize → tools/list (delegation tools present: get_resident_prompt, get_context_packet, build_system_prompt, list_resident_modes) → get_capabilities (isError:false). Provider/embedding changes did NOT break the connection. Confirms `delegated` mode: a connected Claude/Cursor pulls prompt+packet and writes back via save_*.
+- **Baseline ✅** — 674 workspace tests pass / 0 fail; `cargo clippy --workspace -D warnings` clean; `--features embedding` clippy clean; onnxruntime/fastembed compile.
+
+Awaits Pavle (honest): `api` mode keys (`altevra secrets set <KEY>`); BGE-M3 real inference (first run downloads ~2GB model — `bge_embeds_with_correct_dim` `#[ignore]` ready); interactive Cursor TUI spawn in a herdr pane (his hands-on; CLI+config verified ready).
+
 ## 2026-06-01 — MCP stdio connection (autonomous half) ✅ PASS
 
 **What:** Built the real release binary (`cargo build --release -p altevra-cli`,
