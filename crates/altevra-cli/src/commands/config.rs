@@ -1,4 +1,4 @@
-use altevra_core::config::AltevraConfig;
+use altevra_core::config::{AltevraConfig, EmbeddingMode, ReasoningMode};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -82,6 +82,12 @@ async fn run_show(args: ConfigShowArgs) -> anyhow::Result<()> {
             "database.max_connections = {}",
             cfg.database.max_connections
         );
+        println!("llm.reasoning_mode       = {}", cfg.llm.reasoning_mode.as_str());
+        println!("llm.embedding_mode       = {}", cfg.llm.embedding_mode.as_str());
+        println!(
+            "llm.codex_model          = {}",
+            cfg.llm.codex_model.as_deref().unwrap_or("(default)")
+        );
     }
     Ok(())
 }
@@ -99,8 +105,12 @@ fn get_key(cfg: &AltevraConfig, key: &str) -> anyhow::Result<String> {
         "version" => Ok(cfg.version.clone()),
         "database.url" => Ok(cfg.database.url.clone()),
         "database.max_connections" => Ok(cfg.database.max_connections.to_string()),
+        "llm.reasoning_mode" => Ok(cfg.llm.reasoning_mode.as_str().to_string()),
+        "llm.embedding_mode" => Ok(cfg.llm.embedding_mode.as_str().to_string()),
+        "llm.codex_model" => Ok(cfg.llm.codex_model.clone().unwrap_or_default()),
         other => anyhow::bail!(
-            "Unknown config key: {other}\nValid keys: vault_path, version, database.url, database.max_connections"
+            "Unknown config key: {other}\nValid keys: vault_path, version, database.url, \
+             database.max_connections, llm.reasoning_mode, llm.embedding_mode, llm.codex_model"
         ),
     }
 }
@@ -116,8 +126,20 @@ async fn run_set(args: ConfigSetArgs) -> anyhow::Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("database.max_connections must be a number"))?;
         }
+        "llm.reasoning_mode" => {
+            cfg.llm.reasoning_mode = ReasoningMode::parse(&args.value).ok_or_else(|| {
+                anyhow::anyhow!("llm.reasoning_mode must be one of: delegated | codex_oauth | api")
+            })?;
+        }
+        "llm.embedding_mode" => {
+            cfg.llm.embedding_mode = EmbeddingMode::parse(&args.value).ok_or_else(|| {
+                anyhow::anyhow!("llm.embedding_mode must be one of: off | local")
+            })?;
+        }
+        "llm.codex_model" => cfg.llm.codex_model = Some(args.value.clone()),
         other => anyhow::bail!(
-            "Unknown config key: {other}\nSettable keys: vault_path, database.url, database.max_connections"
+            "Unknown config key: {other}\nSettable keys: vault_path, database.url, \
+             database.max_connections, llm.reasoning_mode, llm.embedding_mode, llm.codex_model"
         ),
     }
     save_config(&args.repo, &cfg)?;
@@ -174,5 +196,34 @@ mod tests {
             repo: tmp.path().to_path_buf(),
         };
         assert!(run_get(args).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_set_get_llm_reasoning_mode() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".altevra")).unwrap();
+        run_set(ConfigSetArgs {
+            key: "llm.reasoning_mode".into(),
+            value: "codex_oauth".into(),
+            repo: tmp.path().to_path_buf(),
+        })
+        .await
+        .unwrap();
+        let cfg = load_config(tmp.path());
+        assert_eq!(cfg.llm.reasoning_mode, ReasoningMode::CodexOauth);
+        // round-trips back through get_key
+        assert_eq!(get_key(&cfg, "llm.reasoning_mode").unwrap(), "codex_oauth");
+    }
+
+    #[tokio::test]
+    async fn test_set_invalid_reasoning_mode_errors() {
+        let tmp = TempDir::new().unwrap();
+        let r = run_set(ConfigSetArgs {
+            key: "llm.reasoning_mode".into(),
+            value: "bogus".into(),
+            repo: tmp.path().to_path_buf(),
+        })
+        .await;
+        assert!(r.is_err());
     }
 }

@@ -27,6 +27,12 @@ pub struct ResidentRunArgs {
     /// SQLite database path.
     #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
+    /// Repo/config dir to load `[llm]` settings from (for the model router).
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+    /// Override the configured reasoning mode for this run (delegated|codex_oauth|api).
+    #[arg(long)]
+    pub reasoning_mode: Option<String>,
     #[arg(long)]
     pub json: bool,
 }
@@ -68,7 +74,6 @@ pub async fn run(cmd: ResidentCommands) -> anyhow::Result<()> {
 /// as a `resident_run`. Adding API keys flips the same path live.
 async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
     use altevra_brain::ResidentRunner;
-    use altevra_llm::ModelRouter;
 
     let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
     altevra_db::run_migrations(&pool).await?;
@@ -81,7 +86,15 @@ async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    let router = ModelRouter::noop(); // P0.5: no keys → noop; add keys to go live.
+    // Router from config (delegated/codex_oauth/api). With `delegated` (default) every
+    // role resolves to noop — identical to the old hardcoded behavior. SI-7 enforced
+    // inside build_router + ModelRouter::resolve.
+    let mut cfg = crate::commands::config::load_config(&args.repo);
+    if let Some(rm) = args.reasoning_mode.as_deref() {
+        cfg.llm.reasoning_mode = altevra_core::config::ReasoningMode::parse(rm)
+            .ok_or_else(|| anyhow::anyhow!("--reasoning-mode must be: delegated|codex_oauth|api"))?;
+    }
+    let router = altevra_llm::build_router(&cfg.llm);
     let runner = ResidentRunner::new(&router);
     let packet_text = args
         .input
