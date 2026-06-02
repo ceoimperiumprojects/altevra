@@ -98,6 +98,48 @@ pub fn parse_since_until(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     parse_duration(s).map(|d| now - d)
 }
 
+/// Human-friendly relative timestamp for source-tracing breadcrumbs:
+/// `"just now"`, `"42m ago"`, `"5h ago"`, `"yesterday 14:32"`, `"3d ago 09:15"`,
+/// `"3w ago"`, `"4mo ago"`, `"2y ago"`. Always paired with the absolute RFC3339
+/// in the same response (this is the *summary*, not the source of truth).
+pub fn humanize_relative(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let dur = now.signed_duration_since(t);
+    let secs = dur.num_seconds();
+    if secs < 0 {
+        // Future timestamp — return ISO-style; no creative tense.
+        return t.format("%Y-%m-%d %H:%M").to_string();
+    }
+    let minutes = dur.num_minutes();
+    let hours = dur.num_hours();
+    let days = dur.num_days();
+    let weeks = days / 7;
+    let months = days / 30;
+    let years = days / 365;
+
+    if secs < 60 {
+        return "just now".to_string();
+    }
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+    if days == 1 {
+        return format!("yesterday {}", t.format("%H:%M"));
+    }
+    if days < 7 {
+        return format!("{days}d ago {}", t.format("%H:%M"));
+    }
+    if weeks < 5 {
+        return format!("{weeks}w ago");
+    }
+    if months < 12 {
+        return format!("{months}mo ago");
+    }
+    format!("{years}y ago")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +206,38 @@ mod tests {
         assert_eq!(t3, now - Duration::days(30));
         // Garbage → None (no silent default).
         assert_eq!(parse_since_until("notatimestamp", now), None);
+    }
+
+    #[test]
+    fn humanize_relative_covers_buckets() {
+        let now = epoch();
+        // <1m → "just now"
+        assert_eq!(
+            humanize_relative(now - Duration::seconds(10), now),
+            "just now"
+        );
+        // minutes
+        assert_eq!(
+            humanize_relative(now - Duration::minutes(42), now),
+            "42m ago"
+        );
+        // hours
+        assert_eq!(humanize_relative(now - Duration::hours(5), now), "5h ago");
+        // yesterday with HH:MM
+        let yesterday_at = now - Duration::hours(30);
+        assert!(humanize_relative(yesterday_at, now).starts_with("yesterday "));
+        // d ago with HH:MM
+        assert!(humanize_relative(now - Duration::days(3), now).starts_with("3d ago "));
+        // weeks
+        assert_eq!(humanize_relative(now - Duration::days(14), now), "2w ago");
+        // months
+        assert_eq!(humanize_relative(now - Duration::days(75), now), "2mo ago");
+        // years (≥ 365d)
+        assert_eq!(humanize_relative(now - Duration::days(800), now), "2y ago");
+        // future → ISO (no fictional tense)
+        let future = now + Duration::hours(1);
+        let out = humanize_relative(future, now);
+        assert!(out.starts_with("2026-06-02"), "future is ISO, got {out}");
     }
 
     #[test]

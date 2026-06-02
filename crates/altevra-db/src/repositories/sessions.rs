@@ -59,6 +59,17 @@ pub struct TurnRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// A turn returned by full-text search with the parent session's provenance
+/// already joined — `session_tool` (claude/codex/cursor/hermes/…) and
+/// `session_project` for cross-tool source-tracing breadcrumbs.
+#[derive(Debug, Clone)]
+pub struct TurnSearchHit {
+    pub row: TurnRow,
+    pub score: f32,
+    pub session_tool: Option<String>,
+    pub session_project: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FileChangeRow {
     pub id: Uuid,
@@ -494,6 +505,29 @@ impl<'a> SessionsRepository<'a> {
         until: Option<DateTime<Utc>>,
         limit: i64,
     ) -> anyhow::Result<Vec<(TurnRow, f32)>> {
+        Ok(self
+            .search_turns_with_provenance(query, project, tool, since, until, limit)
+            .await?
+            .into_iter()
+            .map(|h| (h.row, h.score))
+            .collect())
+    }
+
+    /// Provenance-rich search — same scoring as `search_turns_in_window` but also
+    /// returns the session's tool (claude/codex/cursor/hermes/…) and project name
+    /// for every hit. This is what powers MCP source-tracing breadcrumbs
+    /// ("seen this in Claude on project X, 3 weeks ago"). Provenance is read
+    /// from the LEFT JOIN with `sessions` that the search already performs — so
+    /// no additional SQL round-trips per hit.
+    pub async fn search_turns_with_provenance(
+        &self,
+        query: &str,
+        project: Option<&str>,
+        tool: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<TurnSearchHit>> {
         let q_tokens: Vec<String> = query
             .to_lowercase()
             .split(|c: char| !c.is_alphanumeric())
@@ -552,7 +586,7 @@ impl<'a> SessionsRepository<'a> {
 
         let rows = q.fetch_all(self.pool).await?;
 
-        let mut scored: Vec<(TurnRow, f32)> = rows
+        let mut scored: Vec<TurnSearchHit> = rows
             .into_iter()
             .map(|r| {
                 let content: String = r.get("content");
@@ -587,11 +621,22 @@ impl<'a> SessionsRepository<'a> {
                     redaction_status: r.get("redaction_status"),
                     created_at: ts_from_text(r.get::<String, _>("created_at")),
                 };
-                (row, score)
+                TurnSearchHit {
+                    row,
+                    score,
+                    // Provenance from the LEFT JOIN with sessions — already in the
+                    // result set, just lifted out into named fields.
+                    session_tool: r.get::<Option<String>, _>("s_tool"),
+                    session_project: r.get::<Option<String>, _>("s_project"),
+                }
             })
             .collect();
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit as usize);
         Ok(scored)
     }

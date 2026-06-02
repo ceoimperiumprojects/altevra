@@ -22,7 +22,7 @@ pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInst
 pub use objects::{LearningRow, LearningsRepository, ObjectIndexRepository, ObjectIndexRow};
 pub use read_state::{ReadStateRepository, UpdateReadState};
 pub use resident::ResidentRepository;
-pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow};
+pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow, TurnSearchHit};
 pub use skills::{SkillRow, SkillsRepository};
 pub use tasks::{DecisionRow, GoalRow, ReviewItemRow, TaskRow, TasksRepository};
 pub use updates::UpdatesRepository;

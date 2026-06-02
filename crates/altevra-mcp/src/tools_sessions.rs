@@ -159,14 +159,15 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
         let pool = open_pool(&db_path).await?;
         let repo = altevra_db::SessionsRepository::new(&pool);
         let raw_hits = repo
-            .search_turns_in_window(query, project, tool, t_since, t_until, limit)
+            .search_turns_with_provenance(query, project, tool, t_since, t_until, limit)
             .await?;
         // R11 #4: gate every hit — never return a turn above the work ceiling or
         // insufficiently redacted, regardless of how well it matched the query.
         let hits: Vec<_> = raw_hits
             .into_iter()
-            .filter(|(t, _)| turn_exposable(t))
+            .filter(|h| turn_exposable(&h.row))
             .collect();
+        let now = chrono::Utc::now();
         Ok(serde_json::json!({
             "query": query,
             "count": hits.len(),
@@ -174,14 +175,28 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
                 "since": s,
                 "until": t_until,
             })),
-            "results": hits.iter().map(|(t, score)| serde_json::json!({
-                "session_id": t.session_id,
-                "turn_idx": t.turn_idx,
-                "role": t.role,
-                "score": score,
-                "snippet": t.content.chars().take(220).collect::<String>(),
-                "created_at": t.created_at,
-            })).collect::<Vec<_>>(),
+            "results": hits.iter().map(|h| {
+                // Source-tracing breadcrumb: "claude · altevra · 3w ago" so the
+                // caller can show provenance inline without parsing fields.
+                let tool_s = h.session_tool.as_deref().unwrap_or("?");
+                let proj_s = h.session_project.as_deref().unwrap_or("?");
+                let when_h = altevra_core::time_window::humanize_relative(h.row.created_at, now);
+                let breadcrumb = format!("{tool_s} · {proj_s} · {when_h}");
+                serde_json::json!({
+                    "session_id": h.row.session_id,
+                    "turn_idx": h.row.turn_idx,
+                    "role": h.row.role,
+                    "score": h.score,
+                    "snippet": h.row.content.chars().take(220).collect::<String>(),
+                    "created_at": h.row.created_at,
+                    "provenance": {
+                        "tool": h.session_tool,
+                        "project": h.session_project,
+                        "when_human": when_h,
+                        "breadcrumb": breadcrumb,
+                    },
+                })
+            }).collect::<Vec<_>>(),
         }))
     });
 
