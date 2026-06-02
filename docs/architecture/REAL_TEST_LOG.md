@@ -2,6 +2,41 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-02 (session 5) — Atomizacija: section atomize + vault normalize, live on REAL vault ✅ PASS
+
+Pavle's "Atomizacija" directive — the human writes few files, the machine sees
+many atomic objects. Built on the existing capture/recall + frontmatter/template
+substrate; baseline stayed green (697 → 728 tests, 0 fail; clippy
+`--workspace --all-targets -D warnings` clean, incl. `--features embedding`).
+
+- **`altevra-vault::sections` (pure parser) ✅** — `parse_sections` splits a living
+  aggregate into its `## ` sections (preamble dropped, `###` stays nested,
+  empty-body skipped, `YYYY-MM-DD` heading → date). 13 unit tests.
+- **`altevra capture --atomize` LIVE on REAL data ✅** — read-only copy of the real
+  `~/Obsidian/Imperium/Memory/Decisions.md` atomized into a temp DB:
+  `kind=decision domain=business sections_found=31 captured=31 skipped_credential=0`.
+  `altevra recall "direct-call hypothesis validated"` → **exactly 1 hit** (the one
+  section), `recall "ICP weighting attorneys"` → **exactly 1 hit** — individual
+  sections recallable, not the whole file. Real `People.md` → 10 `person`-kind
+  objects, domain auto-inferred `relationship`, sensitivity escalated `restricted`
+  (high-water). Integration test proves a fake `sk-live…` (concat!) key is redacted
+  in every stored section body; a credential-class (`rejected`) section is skipped,
+  others still captured.
+- **`altevra vault normalize` DRY-RUN on REAL `~/Obsidian/Imperium` ✅** — read-only:
+  **512 md scanned, all 512 would get/merge frontmatter, 0 already normalized, 9
+  excluded (Templates/), 2 skipped (invalid-UTF-8 hook dumps — never corrupted)**.
+  by_type: note 243, daily_brief 86, content 76, idea 65, reference 21, wiki_page
+  17, decision/learning/person/research 1 each. Vault UNCHANGED (pre-existing
+  frontmatter count 23 → still 23). 3 before/after sample diffs printed (Archive/
+  Daily → `type: daily_brief, status: archived`).
+- **`--apply` proven on a COPY of the real vault ✅** (real vault untouched): backup
+  written to `obsidian-normalize-<ts>/` holding the ORIGINAL content FIRST, then
+  512 files merged (frontmatter prepended, body verbatim incl. `##` markers),
+  idempotent re-apply wrote 0. The real `--apply` against `~/Obsidian` is left to
+  Pavle (DRY-RUN only here per the safety rule).
+- **Spec:** `docs/architecture/VAULT_DOCUMENT_TEMPLATE.md` (frontmatter contract +
+  folder map + atomization rule, refs R13/R12/R3/R1).
+
 ## 2026-06-02 (session 3) — LLM provider modes + hybrid lane, live-verified ✅ PASS
 
 LLM provider work (plan `giggly-humming-ullman.md`, R15). All live, real-world:
