@@ -93,6 +93,28 @@ injection-safe MATCH. The primary lexical retrieval substrate.
 - **Cursor live spawn** in herdr (Claude side live-tested; MCP smoke PASS after all
   changes; Cursor interactive spawn pending).
 
+### Session 2b additions (golden eval + retrieval maintenance)
+- **Golden eval harness DONE** (`9240809`): `crates/altevra-core/tests/golden_eval.rs`
+  — R12 non-embedding subset; LEAK SUITES = 0 locked as tests (G03 personal/health
+  never in work packet + no id-leak; G09 unscanned/quarantined/rejected never exposed)
+  + G01/G02/G05/G07/G08/G10/G14. 9/9 green.
+- **Index maintenance primitive DONE** (`8f85f2d`): `ObjectIndexRepository::index_object`
+  upserts object_index + object_fts in ONE call (T1.13+T1.14b) — unblocks T-INV14.
+- **Hooks RE-VERIFIED live** after all schema changes: full hook-handle chain (session_
+  start/user_prompt/post_tool_use/session_end) exit 0, secret+PII redacted, tool_input
+  scrubbed, migrations→30. Fixed a STALE release binary (symlink pointed to a pre-P0.8
+  build); rebuilt + re-symlinked. NOTE: rebuild+re-symlink after every code phase or the
+  live hooks lag the repo. (The "Stop hook error" in herdr is the ~/.claude stop-hook
+  chain + /goal loop, non-blocking — NOT Altevra.)
+- Connections: Claude MCP smoke PASS + Cursor connect→mcp.json→serve smoke PASS.
+
+### T-INV14 next exact step
+get_context_packet (altevra-mcp/tools_memory.rs) + CLI `context` still use legacy
+scan_vault. Rewire: read candidates via ObjectIndexRepository::candidates → PacketCompiler
+→ ExposureGate (gated) → return packet. object_index/object_fts now have a maintenance
+primitive (index_object); also route durable writes (LearningsRepository.insert, etc.)
+through it so candidates are populated. Then the live read path is gated + FTS-backed.
+
 ### Baseline + push state
 608 tests pass, 0 failed; clippy --workspace --all-targets -D warnings clean; MCP
 live smoke PASS. All work pushed to origin/altevra-overnight-p0. Secret-scanning note:
