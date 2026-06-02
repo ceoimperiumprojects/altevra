@@ -17,7 +17,7 @@ use altevra_core::domain::Domain;
 use altevra_core::security::Sensitivity;
 use altevra_db::{create_pool, run_migrations, LearningRow, LearningsRepository};
 use altevra_secrets::guard_text;
-use altevra_vault::parse_sections;
+use altevra_vault::{parse_sections, section_conformance};
 use clap::Args;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -210,6 +210,8 @@ async fn run_atomize(
     let mut captured = 0usize;
     let mut skipped_secret = 0usize;
     let mut total_redactions = 0usize;
+    let mut conformant_n = 0usize;
+    let mut needs_structure_n = 0usize;
 
     for sec in &sections {
         // ---- per-section safety gate ----
@@ -237,7 +239,24 @@ async fn run_atomize(
         // Tags/categories: domain + a `kind:<type>` tag so atomized objects are
         // filterable by their inferred type (TAG-1 already satisfied by domain).
         let kind_tag = format!("kind:{kind}");
-        let cats = build_categories(&domain, &args.categories, Some(&kind_tag));
+        let mut cats = build_categories(&domain, &args.categories, Some(&kind_tag));
+
+        // Section-template conformance (Phase 1): tag the object so recall can
+        // surface "this note needs cleanup". `conformant` vs `needs-structure`.
+        let conf = section_conformance(sec, kind);
+        let conf_tag = if conf.conformant {
+            "conformant"
+        } else {
+            "needs-structure"
+        };
+        if !cats.iter().any(|c| c == conf_tag) {
+            cats.push(conf_tag.to_string());
+        }
+        if conf.conformant {
+            conformant_n += 1;
+        } else {
+            needs_structure_n += 1;
+        }
 
         // Stable id: capture-<stem>-<section-slug>-<8charhash-of-section-body>.
         let id = format!(
@@ -289,6 +308,8 @@ async fn run_atomize(
                 "captured": captured,
                 "skipped_credential": skipped_secret,
                 "redactions": total_redactions,
+                "conformant": conformant_n,
+                "needs_structure": needs_structure_n,
                 "results": results,
             }))?
         );
@@ -298,6 +319,10 @@ async fn run_atomize(
             args.file.display()
         );
         println!("  domain={domain}  sections_found={}", sections.len());
+        println!(
+            "  conformance: {conformant_n} conformant, {needs_structure_n} need-structure \
+             (tagged for cleanup)"
+        );
         if total_redactions > 0 {
             println!("  ⚠ {total_redactions} secret/PII redaction(s) applied before storage");
         }
@@ -628,6 +653,13 @@ mod tests {
                 "atomized object carries its inferred type tag: {}",
                 got.tags
             );
+            // Phase 1: every atomized object carries a conformance tag. These three
+            // fixture sections are free prose (no **Odluka:**) → needs-structure.
+            assert!(
+                got.tags.contains("needs-structure"),
+                "free-prose decision sections are tagged for cleanup: {}",
+                got.tags
+            );
             assert!(
                 !got.body.contains("sk-live"),
                 "the credential must be redacted in EVERY stored section body"
@@ -685,6 +717,70 @@ mod tests {
             cands.len(),
             1,
             "--no-atomize stores the whole file as one object"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomize_tags_conformant_section_as_conformant() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("conf.db");
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let file = mem.join("Decisions.md");
+        // One section in Pavle's real decision shape (Odluka + Zašto) → conformant;
+        // one free-prose section → needs-structure.
+        std::fs::write(
+            &file,
+            "# Decisions\n\n\
+             ## Conformant lane split\n\
+             **Odluka:** Razdvojiti build i gtm agente.\n\n\
+             **Zašto:** Sprečava context mixing.\n\n\
+             ## Loose note about something\n\
+             Samo slobodan tekst bez ijednog labela ovde.\n",
+        )
+        .unwrap();
+
+        run(CaptureArgs {
+            file: file.clone(),
+            domain: None,
+            sensitivity: "internal".into(),
+            title: None,
+            categories: vec![],
+            atomize: true,
+            no_atomize: false,
+            db: db.clone(),
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        let learnings = altevra_db::LearningsRepository::new(&pool);
+        let cands = altevra_db::ObjectIndexRepository::new(&pool)
+            .candidates(None)
+            .await
+            .unwrap();
+        assert_eq!(cands.len(), 2);
+        let mut saw_conformant = false;
+        let mut saw_needs = false;
+        for c in &cands {
+            let got = learnings.get(&c.id).await.unwrap().unwrap();
+            if got.title.contains("Conformant lane split") {
+                assert!(
+                    got.tags.contains("conformant") && !got.tags.contains("needs-structure"),
+                    "Odluka+Zašto section is conformant: {}",
+                    got.tags
+                );
+                saw_conformant = true;
+            }
+            if got.title.contains("Loose note") {
+                assert!(got.tags.contains("needs-structure"), "{}", got.tags);
+                saw_needs = true;
+            }
+        }
+        assert!(
+            saw_conformant && saw_needs,
+            "both conformance states present"
         );
     }
 }

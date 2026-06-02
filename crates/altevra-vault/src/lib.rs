@@ -8,6 +8,7 @@ pub mod frontmatter;
 pub mod normalize;
 pub mod parser;
 pub mod scanner;
+pub mod section_template;
 pub mod sections;
 pub mod wiki;
 pub mod writer;
@@ -19,6 +20,10 @@ pub use normalize::{
 };
 pub use parser::{parse_document, parse_document_from_str, ParsedDocument, ParserError};
 pub use scanner::{list_sections, scan_vault, ScannedFile, ScannerError, VaultSection};
+pub use section_template::{
+    contract_for, scaffold_section, section_conformance, LabelSlot, SectionConformance,
+    SectionContract,
+};
 pub use sections::{parse_sections, Section};
 pub use wiki::{
     extract_wiki_links, list_wiki_pages, parse_wiki_page, WikiConfidence, WikiError, WikiPage,

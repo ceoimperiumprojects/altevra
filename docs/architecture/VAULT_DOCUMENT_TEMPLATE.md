@@ -126,7 +126,55 @@ forces it on; `--no-atomize` forces the legacy whole-file path (back-compat).
 
 ---
 
-## 5. Why this is the search substrate (R12 / R13)
+## 5. Section-level template (per-type) — "ČAK I DELOVE u dokumentu"
+
+Beyond the document frontmatter, each `## ` SECTION must follow a per-type
+contract of **bold-label fields**. `altevra-vault::section_template` defines these,
+**calibrated against the real `Memory/*.md`** (not invented). A label may be
+block-level (`**Odluka:** …`) or a list item (`- **Odluka:** …`); a slot is
+satisfied by ANY of its synonyms followed by a non-empty value. A slot is empty if
+the label is a bare stub (`**Odluka:**` with nothing after it).
+
+| Type | Required slots (synonyms) | Optional slots | Style |
+|------|---------------------------|----------------|-------|
+| **decision** | `Odluka`/`Decision` · `Zašto`/`Šta znači`/`Razlog`/`Why`/`Šta to znači u praksi`/`Filozofija` | `Pravilo za primenu`/`Pravilo`/`Sledeći korak`/`Next action`/`Operating model`/`How to apply` | strict |
+| **person** | `Kontekst`/`Context` · `Uloga`/`Status`/`Commitment`/`Obećanje` | `Relevance`/`Relevantnost`/`Fokus`/`Tema` | strict |
+| **learning** | *(none — freeform)* | `Lekcija`/`Learning`/`Insight` · `Primena`/`Fix`/`Preporuka`/`Preventivno` | freeform (non-empty) |
+| **daily_brief / note** | *(none)* | — | freeform (non-empty) |
+
+Calibration basis: `**Odluka:**` appears in 24/31 real decision sections; the
+"why" slot is a synonym set because Pavle uses several; `Learnings.md` sections are
+mostly plain prose (only 4/16 carry a label) → learning is **freeform**, never
+forced into labels it doesn't use.
+
+### Conformance + scaffolding flow
+
+- `section_conformance(section, type) → { conformant, missing_labels, present_optional, empty }`.
+- `altevra vault normalize` (DRY-RUN) reports per file: how many sections are
+  non-conformant, which required labels are missing, and splits them into:
+  - **scaffoldable** — empty/bare-stub sections (safe to fill with the skeleton now);
+  - **need_rewrite** — sections with PROSE but missing labels (the LLM `--rewrite`
+    job; never auto-edited in Phase 1).
+- `altevra vault normalize --scaffold-empty` (apply) fills ONLY scaffoldable
+  sections with `scaffold_section(type)` (canonical labels, blank values). It
+  **never** rewrites a prose section — zero content loss. Backup-first + idempotent,
+  same as frontmatter normalization.
+- `altevra capture --atomize` tags each atomized object `conformant` or
+  `needs-structure`, so recall can surface "this note needs cleanup."
+
+### Phase 2 — LLM restructure seam (gated, not auto-run)
+
+`altevra vault normalize --rewrite` is the path for **need_rewrite** sections:
+it asks the configured reasoning provider (`altevra_llm::build_router`; live
+`codex_oauth` GPT-5.5 / `api` mode) to RESTRUCTURE existing free prose into the
+section template **without losing any fact** (output must contain every input
+fact). Under the default `reasoning_mode = "delegated"` it is a **no-op that only
+reports** "would rewrite N sections (needs codex_oauth/api)". Real LLM rewrites on
+the vault are left to Pavle (DRY-RUN/report only by default).
+
+---
+
+## 6. Why this is the search substrate (R12 / R13)
 
 Core retrieval is vector-free: tag/structured filters + FTS5 BM25 + graph (R12).
 That makes the frontmatter envelope (type/domain/status/sensitivity/tags) and the

@@ -12,8 +12,8 @@
 //!   * Idempotent — a file already fully normalized is skipped.
 
 use altevra_vault::{
-    classify_path, normalize_frontmatter, render_normalized, scan_vault, split_for_normalize,
-    Frontmatter,
+    classify_path, normalize_frontmatter, parse_sections, render_normalized, scaffold_section,
+    scan_vault, section_conformance, split_for_normalize, Frontmatter, Section,
 };
 use chrono::{DateTime, Local, NaiveDate};
 use clap::{Args, Subcommand};
@@ -43,6 +43,11 @@ pub struct NormalizeArgs {
     /// Override the backup root (default `~/.imperium/backups`).
     #[arg(long)]
     pub backup_root: Option<PathBuf>,
+    /// Fill ONLY empty / stub `## ` sections with the per-type section skeleton
+    /// (apply-mode). NEVER rewrites a section that already has prose — those are
+    /// the LLM `--rewrite` job (Phase 2). Implies an apply; still backs up first.
+    #[arg(long)]
+    pub scaffold_empty: bool,
     /// Emit JSON instead of human-readable.
     #[arg(long)]
     pub json: bool,
@@ -70,6 +75,83 @@ struct FilePlan {
     changed: bool,
     /// A frontmatter that couldn't be parsed (malformed) — skipped, reported.
     parse_error: Option<String>,
+    /// Per-section conformance against the type's section template (Phase 1).
+    sections_total: usize,
+    sections_nonconformant: usize,
+    /// Sections that are EMPTY/stub (safe to scaffold). Subset of nonconformant.
+    sections_scaffoldable: usize,
+    /// Sections that have prose but miss labels (LLM `--rewrite` territory).
+    sections_need_rewrite: usize,
+    /// Canonical missing labels across this file (for the report), deduped.
+    missing_labels: Vec<String>,
+}
+
+/// Analyze a file's `## ` sections against its type section template. Returns
+/// (total, nonconformant, scaffoldable, need_rewrite, missing_labels).
+fn analyze_sections(body: &str, doc_type: &str) -> (usize, usize, usize, usize, Vec<String>) {
+    let sections = parse_sections(body);
+    let mut nonconformant = 0;
+    let mut scaffoldable = 0;
+    let mut need_rewrite = 0;
+    let mut missing: Vec<String> = Vec::new();
+    for s in &sections {
+        let c = section_conformance(s, doc_type);
+        if c.conformant {
+            continue;
+        }
+        nonconformant += 1;
+        // Scaffoldable = effectively empty (no prose at all). A non-empty section
+        // missing labels is prose that must be RESTRUCTURED (LLM), never wiped.
+        if c.empty || section_is_stub_only(s) {
+            scaffoldable += 1;
+        } else {
+            need_rewrite += 1;
+        }
+        for m in c.missing_labels {
+            if !missing.contains(&m) {
+                missing.push(m);
+            }
+        }
+    }
+    (
+        sections.len(),
+        nonconformant,
+        scaffoldable,
+        need_rewrite,
+        missing,
+    )
+}
+
+/// `true` if a section body is only bare label stubs / whitespace (no real prose)
+/// — safe to (re)scaffold. A section with ANY non-label prose line is NOT a stub.
+fn section_is_stub_only(s: &Section) -> bool {
+    for line in s.body.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Strip one list marker, then check if it's a bold-label line.
+        let after_marker = t
+            .strip_prefix("- ")
+            .or_else(|| t.strip_prefix("* "))
+            .or_else(|| t.strip_prefix("+ "))
+            .unwrap_or(t)
+            .trim_start();
+        let is_label = after_marker.starts_with("**") && after_marker.contains(":**");
+        // a label line counts as a stub ONLY if it has no value after `:**`
+        if is_label {
+            if let Some(rest) = after_marker.strip_prefix("**") {
+                if let Some(idx) = rest.find(":**") {
+                    if rest[idx + 3..].trim().is_empty() {
+                        continue; // bare stub label → still a stub
+                    }
+                }
+            }
+        }
+        // any non-empty, non-bare-label line = real prose
+        return false;
+    }
+    true
 }
 
 pub async fn run(cmd: VaultCommands) -> anyhow::Result<()> {
@@ -112,7 +194,7 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
         let mtime_date = system_time_to_date(f.modified.into());
 
         match split_for_normalize(&content) {
-            Ok((existing, _body)) => {
+            Ok((existing, body)) => {
                 let created = existing_created(existing.as_ref()).unwrap_or(mtime_date);
                 let (new_fm, changed) = normalize_frontmatter(
                     existing.as_ref(),
@@ -123,6 +205,8 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                     mtime_date,
                     class.archived,
                 );
+                let (s_total, s_non, s_scaf, s_rew, missing) =
+                    analyze_sections(&body, &class.doc_type);
                 plans.push(FilePlan {
                     rel,
                     abs: f.path.clone(),
@@ -131,6 +215,11 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                     after: pretty_value(&new_fm),
                     changed,
                     parse_error: None,
+                    sections_total: s_total,
+                    sections_nonconformant: s_non,
+                    sections_scaffoldable: s_scaf,
+                    sections_need_rewrite: s_rew,
+                    missing_labels: missing,
                 });
             }
             Err(e) => {
@@ -143,6 +232,11 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                     after: String::new(),
                     changed: false,
                     parse_error: Some(e.to_string()),
+                    sections_total: 0,
+                    sections_nonconformant: 0,
+                    sections_scaffoldable: 0,
+                    sections_need_rewrite: 0,
+                    missing_labels: Vec::new(),
                 });
             }
         }
@@ -152,7 +246,19 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
     let need_change = plans.iter().filter(|p| p.changed).count();
     let by_type = count_by_type(&plans);
 
-    if args.apply {
+    // Section-template conformance aggregates (Phase 1).
+    let sections_total: usize = plans.iter().map(|p| p.sections_total).sum();
+    let sections_nonconformant: usize = plans.iter().map(|p| p.sections_nonconformant).sum();
+    let sections_scaffoldable: usize = plans.iter().map(|p| p.sections_scaffoldable).sum();
+    let sections_need_rewrite: usize = plans.iter().map(|p| p.sections_need_rewrite).sum();
+    let files_with_nonconformant = plans
+        .iter()
+        .filter(|p| p.sections_nonconformant > 0)
+        .count();
+
+    let want_apply = args.apply || args.scaffold_empty;
+
+    if want_apply {
         // ---- BACKUP THE ENTIRE VAULT FIRST ----
         let ts = args.backup_ts.unwrap_or_else(unix_now);
         let backup_root = args.backup_root.clone().unwrap_or_else(default_backup_root);
@@ -160,8 +266,9 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
         copy_dir_recursive(&vault, &backup_dir)?;
 
         let mut written = 0usize;
+        let mut scaffolded_sections = 0usize;
         for p in &plans {
-            if !p.changed || p.parse_error.is_some() {
+            if p.parse_error.is_some() {
                 continue;
             }
             // Re-read + re-split so we write fresh content (and preserve the body
@@ -171,7 +278,7 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
             let class = classify_path(&p.rel);
             let mtime_date = system_time_to_date(file_mtime(&p.abs)?);
             let created = existing_created(existing.as_ref()).unwrap_or(mtime_date);
-            let (new_fm, changed) = normalize_frontmatter(
+            let (new_fm, fm_changed) = normalize_frontmatter(
                 existing.as_ref(),
                 &class.doc_type,
                 &class.domain,
@@ -180,10 +287,20 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                 mtime_date,
                 class.archived,
             );
-            if !changed {
+
+            // Optionally scaffold EMPTY/stub sections (never prose sections).
+            let (new_body, n_scaffolded) = if args.scaffold_empty {
+                scaffold_empty_sections(&body, &class.doc_type)
+            } else {
+                (body.clone(), 0)
+            };
+            scaffolded_sections += n_scaffolded;
+
+            // Nothing to do if neither the frontmatter nor the body changed.
+            if !fm_changed && n_scaffolded == 0 {
                 continue;
             }
-            let out = render_normalized(&new_fm, &body)?;
+            let out = render_normalized(&new_fm, &new_body)?;
             std::fs::write(&p.abs, out)?;
             written += 1;
         }
@@ -197,21 +314,38 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                     "backup": backup_dir.display().to_string(),
                     "total": total,
                     "written": written,
+                    "scaffold_empty": args.scaffold_empty,
+                    "scaffolded_sections": scaffolded_sections,
                     "excluded": excluded,
                     "errors": errors,
                     "by_type": by_type,
+                    "sections_total": sections_total,
+                    "sections_nonconformant": sections_nonconformant,
+                    "sections_scaffoldable": sections_scaffoldable,
+                    "sections_need_rewrite": sections_need_rewrite,
                 }))?
             );
         } else {
             println!("Applied frontmatter normalization to {}", vault.display());
             println!("  backup: {}", backup_dir.display());
             println!("  {written} file(s) written, {excluded} excluded, {errors} skipped (errors)");
+            if args.scaffold_empty {
+                println!("  {scaffolded_sections} empty/stub section(s) scaffolded (prose sections left for --rewrite)");
+            }
         }
         return Ok(());
     }
 
     // ---- DRY-RUN ----
     let samples: Vec<&FilePlan> = plans.iter().filter(|p| p.changed).take(3).collect();
+    // Files most in need of section cleanup (for the conformance sample).
+    let mut nonconf_files: Vec<&FilePlan> = plans
+        .iter()
+        .filter(|p| p.sections_nonconformant > 0)
+        .collect();
+    nonconf_files.sort_by_key(|p| std::cmp::Reverse(p.sections_nonconformant));
+    let nonconf_samples: Vec<&FilePlan> = nonconf_files.iter().take(5).copied().collect();
+
     if args.json {
         let sample_json: Vec<_> = samples
             .iter()
@@ -221,6 +355,20 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                     "type": p.doc_type,
                     "before": p.before,
                     "after": p.after,
+                })
+            })
+            .collect();
+        let conf_json: Vec<_> = nonconf_samples
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "file": p.rel,
+                    "type": p.doc_type,
+                    "sections": p.sections_total,
+                    "nonconformant": p.sections_nonconformant,
+                    "scaffoldable": p.sections_scaffoldable,
+                    "need_rewrite": p.sections_need_rewrite,
+                    "missing_labels": p.missing_labels,
                 })
             })
             .collect();
@@ -236,6 +384,14 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                 "errors": errors,
                 "by_type": by_type,
                 "samples": sample_json,
+                "section_conformance": {
+                    "sections_total": sections_total,
+                    "sections_nonconformant": sections_nonconformant,
+                    "sections_scaffoldable": sections_scaffoldable,
+                    "sections_need_rewrite": sections_need_rewrite,
+                    "files_with_nonconformant": files_with_nonconformant,
+                    "samples": conf_json,
+                },
             }))?
         );
     } else {
@@ -250,8 +406,34 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
         for (t, n) in &by_type {
             println!("    {t:<14} {n}");
         }
+        println!("\n  section-template conformance:");
+        println!(
+            "    {sections_total} section(s) across {files_with_nonconformant} file(s) with \
+             issues; {sections_nonconformant} non-conformant"
+        );
+        println!(
+            "    → {sections_scaffoldable} empty/stub (scaffoldable now), \
+             {sections_need_rewrite} have prose but miss labels (LLM --rewrite)"
+        );
+        if !nonconf_samples.is_empty() {
+            println!("    top files needing section cleanup:");
+            for p in &nonconf_samples {
+                let labels = if p.missing_labels.is_empty() {
+                    String::new()
+                } else {
+                    format!(" missing: {}", p.missing_labels.join(", "))
+                };
+                println!(
+                    "      {} [{}] — {}/{} non-conformant{labels}",
+                    p.rel, p.doc_type, p.sections_nonconformant, p.sections_total
+                );
+            }
+        }
         if !samples.is_empty() {
-            println!("\n  sample before/after (first {}):", samples.len());
+            println!(
+                "\n  sample frontmatter before/after (first {}):",
+                samples.len()
+            );
             for p in &samples {
                 println!("  ─── {} [{}] ───", p.rel, p.doc_type);
                 println!("  BEFORE:");
@@ -260,9 +442,84 @@ async fn normalize(args: NormalizeArgs) -> anyhow::Result<()> {
                 print_indented(&p.after, "    ");
             }
         }
-        println!("\n  Run with --apply to write (a full vault backup is made first).");
+        println!("\n  Run with --apply to write frontmatter (full vault backup first).");
+        println!("  Run with --scaffold-empty to also fill EMPTY sections with templates.");
     }
     Ok(())
+}
+
+/// Rewrite a document body, replacing the body of each EMPTY/stub `## ` section
+/// with the per-type section skeleton. Prose sections (and the preamble) are kept
+/// byte-for-byte. Returns (new_body, n_sections_scaffolded).
+///
+/// SAFETY: only sections whose body is empty or bare-label-stubs are touched — a
+/// section with any real prose is NEVER rewritten here (that's the LLM `--rewrite`
+/// job). No information is ever lost.
+fn scaffold_empty_sections(body: &str, doc_type: &str) -> (String, usize) {
+    let sections = parse_sections(body);
+    if sections.is_empty() {
+        return (body.to_string(), 0);
+    }
+    // Index the lines; we rebuild the doc, swapping only stub-section bodies.
+    let lines: Vec<&str> = body.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut n_scaffolded = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        // Is this the start of a `## ` heading?
+        let is_h2 = line.strip_prefix("## ").map(|r| !r.trim().is_empty()) == Some(true)
+            || line.trim_end() == "##";
+        if !is_h2 {
+            out.push(line.to_string());
+            i += 1;
+            continue;
+        }
+        // Collect this section's body lines (until next `## ` or EOF).
+        let heading = line;
+        let mut j = i + 1;
+        let mut body_lines: Vec<&str> = Vec::new();
+        while j < lines.len() {
+            let l = lines[j];
+            let next_h2 = l.strip_prefix("## ").map(|r| !r.trim().is_empty()) == Some(true)
+                || l.trim_end() == "##";
+            if next_h2 {
+                break;
+            }
+            body_lines.push(l);
+            j += 1;
+        }
+        out.push(heading.to_string());
+        // Build a Section to test stub-only.
+        let sec = Section {
+            heading: heading.trim_start_matches("## ").trim().to_string(),
+            level: 2,
+            body: body_lines.join("\n"),
+            date: None,
+        };
+        let conf = section_conformance(&sec, doc_type);
+        let stub = sec.body.trim().is_empty() || section_is_stub_only(&sec);
+        if !conf.conformant && stub {
+            // Replace the (empty/stub) body with the scaffold skeleton.
+            out.push(String::new());
+            for sl in scaffold_section(doc_type).lines() {
+                out.push(sl.to_string());
+            }
+            out.push(String::new());
+            n_scaffolded += 1;
+        } else {
+            // Keep the original body verbatim (prose section or already conformant).
+            for bl in &body_lines {
+                out.push(bl.to_string());
+            }
+        }
+        i = j;
+    }
+    let mut joined = out.join("\n");
+    if body.ends_with('\n') && !joined.ends_with('\n') {
+        joined.push('\n');
+    }
+    (joined, n_scaffolded)
 }
 
 fn default_vault_root() -> PathBuf {
@@ -393,6 +650,7 @@ mod tests {
             apply: false,
             backup_ts: None,
             backup_root: None,
+            scaffold_empty: false,
             json: true,
         })
         .await
@@ -422,6 +680,7 @@ mod tests {
             apply: true,
             backup_ts: Some(12345),
             backup_root: Some(backups.clone()),
+            scaffold_empty: false,
             json: true,
         })
         .await
@@ -459,6 +718,7 @@ mod tests {
             apply: true,
             backup_ts: Some(1),
             backup_root: Some(backups.clone()),
+            scaffold_empty: false,
             json: true,
         })
         .await
@@ -475,6 +735,7 @@ mod tests {
             apply: true,
             backup_ts: Some(2),
             backup_root: Some(backups.clone()),
+            scaffold_empty: false,
             json: true,
         })
         .await
@@ -483,6 +744,116 @@ mod tests {
         assert_eq!(
             after_first, after_second,
             "a fully-normalized file is left untouched on re-apply"
+        );
+    }
+
+    // ---------- Phase 1: section-template conformance + --scaffold-empty ----------
+
+    #[test]
+    fn analyze_sections_classifies_conformant_stub_and_prose() {
+        // decision file: 1 conformant, 1 empty-stub, 1 prose-missing-label.
+        let body = "# Decisions\n\n\
+                    ## Conformant\n**Odluka:** X.\n\n**Zašto:** Y.\n\n\
+                    ## Empty stub\n\n\
+                    ## Prose missing label\nSamo slobodan tekst bez Odluke.\n";
+        let (total, non, scaf, rew, _missing) = analyze_sections(body, "decision");
+        assert_eq!(total, 2, "empty-body section is dropped by parse_sections");
+        // "Empty stub" has no body → not a section. So 2 sections: conformant + prose.
+        assert_eq!(
+            non, 1,
+            "only the prose-missing-label section is non-conformant"
+        );
+        assert_eq!(scaf, 0, "prose section is NOT scaffoldable");
+        assert_eq!(rew, 1, "prose-missing-label → needs LLM rewrite");
+    }
+
+    #[test]
+    fn stub_only_detection() {
+        let stub = Section {
+            heading: "x".into(),
+            level: 2,
+            body: "**Odluka:**\n\n**Zašto:**".into(),
+            date: None,
+        };
+        assert!(section_is_stub_only(&stub));
+        let prose = Section {
+            heading: "x".into(),
+            level: 2,
+            body: "**Odluka:** real value here.".into(),
+            date: None,
+        };
+        assert!(!section_is_stub_only(&prose));
+    }
+
+    #[test]
+    fn scaffold_empty_sections_fills_stub_keeps_prose_verbatim() {
+        // A decision doc with a stub section and a prose section.
+        let body = "# Decisions\n\n\
+                    ## Stub section\n**Odluka:**\n\n\
+                    ## Real decision\n**Odluka:** Keep ReVesta P0.\n\n**Zašto:** Market signal.\n";
+        let (out, n) = scaffold_empty_sections(body, "decision");
+        assert_eq!(n, 1, "exactly the stub section is scaffolded");
+        // The prose section survives byte-for-byte.
+        assert!(out.contains("**Odluka:** Keep ReVesta P0."));
+        assert!(out.contains("**Zašto:** Market signal."));
+        // The stub now carries the full skeleton (both required labels present).
+        assert!(out.contains("**Zašto:**"));
+        // Preamble preserved.
+        assert!(out.contains("# Decisions"));
+    }
+
+    #[test]
+    fn scaffold_never_touches_a_fully_prose_doc() {
+        let body = "# Decisions\n\n## A\n**Odluka:** x.\n\n**Zašto:** y.\n";
+        let (out, n) = scaffold_empty_sections(body, "decision");
+        assert_eq!(n, 0);
+        assert_eq!(
+            out, body,
+            "a doc with no stub sections is returned unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn scaffold_empty_apply_fills_stubs_and_never_loses_prose() {
+        let dir = TempDir::new().unwrap();
+        let vault = dir.path().join("vault");
+        let backups = dir.path().join("backups");
+        let original = "# Decisions\n\n\
+                        ## Stub one\n**Odluka:**\n\n\
+                        ## Has prose\n**Odluka:** Existing decision text that must survive.\n\n\
+                        **Zašto:** And its reasoning.\n";
+        write(&vault.join("Memory/Decisions.md"), original);
+
+        normalize(NormalizeArgs {
+            vault: Some(vault.clone()),
+            apply: false, // scaffold_empty implies apply
+            backup_ts: Some(7),
+            backup_root: Some(backups.clone()),
+            scaffold_empty: true,
+            json: true,
+        })
+        .await
+        .unwrap();
+
+        // Backup holds the ORIGINAL.
+        let backup = backups
+            .join("obsidian-normalize-7")
+            .join("Memory/Decisions.md");
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), original);
+
+        let written = std::fs::read_to_string(vault.join("Memory/Decisions.md")).unwrap();
+        // frontmatter added
+        assert!(written.contains("type: decision"));
+        // the prose decision is preserved verbatim — NO content loss
+        assert!(written.contains("Existing decision text that must survive."));
+        assert!(written.contains("**Zašto:** And its reasoning."));
+        // the stub section got the skeleton (now has the Zašto label slot too)
+        let stub_idx = written.find("## Stub one").unwrap();
+        let prose_idx = written.find("## Has prose").unwrap();
+        let stub_block = &written[stub_idx..prose_idx];
+        assert!(
+            stub_block.contains("**Zašto:**"),
+            "stub section gained the section skeleton"
         );
     }
 }
