@@ -139,15 +139,21 @@ impl CodexOAuthProvider {
         }
         ResponsesRequest {
             model: self.model.clone(),
-            instructions: if instructions.is_empty() {
-                None
+            // The ChatGPT codex Responses backend REQUIRES a non-null `instructions`
+            // field (it 400s on "Instructions are required"), so always send one —
+            // a minimal default when no system prompt was provided.
+            instructions: Some(if instructions.is_empty() {
+                "You are a helpful assistant.".to_string()
             } else {
-                Some(instructions)
-            },
+                instructions
+            }),
             input,
-            max_output_tokens: opts.max_tokens,
-            temperature: opts.temperature,
-            stream: false,
+            // The codex backend rejects max_output_tokens/temperature; omit them.
+            max_output_tokens: None,
+            temperature: None,
+            // It requires streaming + no server-side storage.
+            stream: true,
+            store: false,
         }
     }
 
@@ -208,6 +214,51 @@ fn token_older_than_days(ts: &str, days: i64) -> bool {
     }
 }
 
+/// Consume the SSE (`text/event-stream`) Responses stream and return the assembled
+/// assistant text. Accumulates `response.output_text.delta` events; prefers the final
+/// `response.completed` output_text if present. Buffers BYTES (not lossy per-chunk
+/// strings) so multi-byte UTF-8 split across chunks is never corrupted.
+async fn read_responses_stream(resp: reqwest::Response) -> anyhow::Result<String> {
+    use futures::StreamExt;
+    let mut stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut deltas = String::new();
+    let mut final_text: Option<String> = None;
+
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line_bytes);
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() || data == "[DONE]" {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(d) = v.get("delta").and_then(|d| d.as_str()) {
+                        deltas.push_str(d);
+                    }
+                }
+                "response.completed" => {
+                    if let Some(t) = v.pointer("/response/output_text").and_then(|t| t.as_str()) {
+                        final_text = Some(t.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(final_text.filter(|s| !s.is_empty()).unwrap_or(deltas))
+}
+
 #[async_trait]
 impl crate::provider::ChatProvider for CodexOAuthProvider {
     fn id(&self) -> &str {
@@ -227,17 +278,17 @@ impl crate::provider::ChatProvider for CodexOAuthProvider {
                     .header("chatgpt-account-id", &self.account_id)
                     .header("OpenAI-Beta", "responses=experimental")
                     .header("originator", "codex_cli_rs")
+                    .header("Accept", "text/event-stream")
                     .json(&body)
                     .send()
                     .await?;
                 let status = resp.status();
-                let text = resp.text().await?;
                 if !status.is_success() {
+                    let text = resp.text().await?;
                     return Err(map_http_error(status, &text));
                 }
-                let parsed: ResponsesResponse = serde_json::from_str(&text)
-                    .map_err(|e| anyhow::anyhow!("decode Codex Responses: {e}; body={text}"))?;
-                Ok(parsed.into_text())
+                // The codex backend only streams (SSE). Accumulate the output_text deltas.
+                read_responses_stream(resp).await
             }
             CodexWire::ChatCompletions => {
                 let body = self.build_chat_body(messages, opts);
@@ -274,6 +325,8 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     stream: bool,
+    /// The ChatGPT codex backend rejects server-side storage; must be false.
+    store: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,44 +354,8 @@ struct ContentPart {
     text: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ResponsesResponse {
-    #[serde(default)]
-    output_text: Option<String>,
-    #[serde(default)]
-    output: Vec<OutputItem>,
-}
-
-impl ResponsesResponse {
-    fn into_text(self) -> String {
-        if let Some(t) = self.output_text {
-            if !t.is_empty() {
-                return t;
-            }
-        }
-        self.output
-            .into_iter()
-            .flat_map(|o| o.content)
-            .filter(|c| c.kind == "output_text")
-            .filter_map(|c| c.text)
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct OutputItem {
-    #[serde(default)]
-    content: Vec<OutContent>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OutContent {
-    #[serde(rename = "type", default)]
-    kind: String,
-    #[serde(default)]
-    text: Option<String>,
-}
+// (Non-streaming Responses parsing removed: the codex backend only streams, so the
+// SSE reader `read_responses_stream` parses events directly.)
 
 // ---- Chat Completions wire types ----
 
@@ -429,7 +446,25 @@ mod tests {
         assert_eq!(v["input"][0]["role"], "user");
         assert_eq!(v["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(v["input"][0]["content"][0]["text"], "hello");
-        assert_eq!(v["stream"], false);
+        // codex backend protocol requirements (verified live): stream + no store.
+        assert_eq!(v["stream"], true);
+        assert_eq!(v["store"], false);
+        // max_output_tokens/temperature are rejected by the backend → omitted.
+        assert!(v.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn empty_system_still_sends_instructions() {
+        // The backend 400s on missing instructions, so a user-only call must still
+        // carry a default instructions string.
+        let dir = tempfile::tempdir().unwrap();
+        let prov = CodexOAuthProvider::from_auth_file(&write_fixture(dir.path())).unwrap();
+        let body = prov.build_responses_body(&[ChatMessage::user("hi")], &ChatOpts::default());
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v["instructions"]
+            .as_str()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false));
     }
 
     #[test]
@@ -456,18 +491,31 @@ mod tests {
     }
 
     #[test]
-    fn responses_response_extracts_output_text() {
-        let json = r#"{"output":[{"content":[{"type":"output_text","text":"hello "},{"type":"output_text","text":"world"}]}]}"#;
-        let parsed: ResponsesResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(parsed.into_text(), "hello world");
-    }
-
-    #[test]
     fn missing_auth_file_errors_clearly() {
         let r = CodexOAuthProvider::from_auth_file(std::path::Path::new("/nonexistent/auth.json"));
         assert!(r.is_err());
         // Avoid unwrap_err (would require Debug on the provider; we deliberately
         // don't derive Debug so the access token can't leak into logs).
         assert!(r.err().unwrap().to_string().contains("codex login"));
+    }
+
+    // LIVE: calls the real ChatGPT backend via ~/.codex/auth.json. Sends only a
+    // generic test prompt (no personal data). #[ignore] so it never runs in CI;
+    // run manually to verify codex_oauth end-to-end.
+    #[tokio::test]
+    #[ignore = "live: calls ChatGPT backend via ~/.codex/auth.json; run manually"]
+    async fn live_codex_completes() {
+        let p = CodexOAuthProvider::from_default_auth().expect("read ~/.codex/auth.json");
+        let r = p
+            .complete(
+                &[ChatMessage::user("Reply with exactly the word: PONG")],
+                &ChatOpts::default().with_max_tokens(16),
+            )
+            .await;
+        match r {
+            Ok(s) => println!("LIVE_CODEX_OK len={} body={:?}", s.len(), s),
+            Err(e) => println!("LIVE_CODEX_ERR {e}"),
+        }
+        // The point is the printed outcome; we don't assert on live content.
     }
 }
