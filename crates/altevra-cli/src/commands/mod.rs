@@ -28,5 +28,6 @@ pub mod skill;
 pub mod turn;
 pub mod turn_search;
 pub mod updates;
+pub mod vault;
 pub mod watch;
 pub mod wiki;

@@ -5,6 +5,7 @@
 //! optional YAML frontmatter.
 
 pub mod frontmatter;
+pub mod normalize;
 pub mod parser;
 pub mod scanner;
 pub mod sections;
@@ -12,6 +13,10 @@ pub mod wiki;
 pub mod writer;
 
 pub use frontmatter::{parse_frontmatter, serialize_frontmatter, Frontmatter, FrontmatterError};
+pub use normalize::{
+    classify_path, normalize_frontmatter, render_normalized, split_for_normalize, DocClass,
+    UNIVERSAL_KEYS,
+};
 pub use parser::{parse_document, parse_document_from_str, ParsedDocument, ParserError};
 pub use scanner::{list_sections, scan_vault, ScannedFile, ScannerError, VaultSection};
 pub use sections::{parse_sections, Section};

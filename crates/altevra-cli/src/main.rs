@@ -136,6 +136,10 @@ enum Commands {
     /// Control plane — review queue, redaction check, exposure audit (P0.3)
     #[command(subcommand)]
     Control(commands::control::ControlCommands),
+
+    /// Vault maintenance — normalize document frontmatter (dry-run by default)
+    #[command(subcommand)]
+    Vault(commands::vault::VaultCommands),
 }
 
 #[tokio::main]
@@ -181,5 +185,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Wiki(cmd) => commands::wiki::run(cmd).await,
         Commands::Resident(cmd) => commands::resident::run(cmd).await,
         Commands::Control(cmd) => commands::control::run(cmd).await,
+        Commands::Vault(cmd) => commands::vault::run(cmd).await,
     }
 }
