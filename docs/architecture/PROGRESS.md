@@ -117,6 +117,25 @@ injection-safe MATCH. The primary lexical retrieval substrate.
 - Remaining wiring (optional polish): route the OTHER durable writers (decisions,
   wiki, etc.) through index_object too; wire CLI `context` to the same compiler.
 
+### Session 2c — more keyless P0.8 (committed, green, pushed)
+- **Lifecycle deriver** (`666b70b`) — pure derive_lifecycle_state (legal-hold precedence).
+- **export + forget** (`fe01db5`) — sovereignty manifest + RTBF soft-forget (presence-gated,
+  live-verified REFUSED on non-TTY).
+- **Imperium mirror renderer** (`4c46a4d`) — render_mirror, D4: confidential+/high-water
+  never mirrored as plaintext (pure; no disk write — safe).
+- **Lifecycle sweep** (`0066749`) — brain::lifecycle_sweep over object_index + DomainPolicy,
+  non-destructive retention report. DomainPolicyRow gained soft_ttl/hard_expiry.
+
+### Remaining keyless has PREREQUISITES (not just typing) — honest blockers
+- **decisions/wiki → index_object**: needs the decision/wiki WRITE path guarded first
+  (T1.13) — indexing unguarded rationale would risk a leak (redaction_status unknown).
+  Learnings are wired because their repo contract says caller-guards. Do T1.13 (route
+  every durable write through ingest_guard, carry the verdict) THEN index the rest.
+- **Full lifecycle (valid_until/review_after + active legal-hold)**: needs object_index
+  to carry those temporal fields OR a per-source-table sweep. Schema/struct work.
+- **mirror WRITER** (actual ~/Obsidian/Imperium/ write): renderer is done; the writer is
+  a filesystem side-effect → path-gated, Pavle-authorized.
+
 ### What's genuinely LEFT (key-dependent OR interactive — the goal's stop condition)
 - LLM-driven loops (resident 7-stage orchestration, skill_factory_proposer detection):
   scaffolded + noop-ready; doing real work needs a provider key (flip noop→live).
