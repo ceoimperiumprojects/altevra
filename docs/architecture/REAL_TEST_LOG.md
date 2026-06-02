@@ -202,3 +202,24 @@ verified above.
   connect correctly.**
 - Interactive half (a live Cursor TUI agent in a herdr pane calling Altevra) is
   Pavle's hands-on step — cursor CLI + herdr are both installed and ready.
+
+## 2026-06-02 (session 5 cont'd) — LIVE Codex reformat on the REAL vault ✅ APPLIED
+
+After Pavle's "preformuliši sve, ne menjaj sadržaj" + explicit "Da, pusti 21 sad":
+
+- **Frontmatter apply (513 files) ✅** — real `~/Obsidian/Imperium` normalized; backup
+  `obsidian-normalize-<ts>/` first; bodies verbatim (Decisions.md `##` count 31→31).
+  Idempotency bug found+fixed live (`updated` was bumped each pass → rewrote all 513;
+  now seeded-once → re-run reports "513 already normalized; 0 changes").
+- **SI-7 guard added to --rewrite ✅** — high-water domain + non-local provider → skip.
+  Live: codex_oauth (cloud) → would_rewrite=21 (Decisions/business), si7_skipped=6
+  (People.md/relationship). People NEVER sent to ChatGPT.
+- **LIVE Codex reformat of 21 Decisions sections ✅** — `--rewrite --reasoning-mode
+  codex_oauth --apply`: rewritten=21, si7_skipped=6, backup `obsidian-rewrite-<ts>/`.
+  Verified: Decisions.md section count preserved 31→31; conformance now 0
+  non-conformant in Decisions (was 21); **People.md byte-identical to backup**
+  (SI-7 held). Demo confirmed fact-preservation: a bullet-list section became
+  **Odluka:**/**Zašto:**/**Pravilo za primenu:** with every fact retained.
+
+Left for Pavle: the 6 People.md sections need a LOCAL model (SI-7 bars cloud) —
+pending Ollama/vLLM, or hand-edit. Code all pushed; vault edits live on disk (+ backups).
