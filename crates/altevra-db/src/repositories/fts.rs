@@ -3,6 +3,7 @@
 //! the packet compiler ranks survivors by `bm25 + tag_match + graph + recency`,
 //! and this provides the bm25 signal deterministically with no model.
 
+use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 
 #[derive(Debug, Clone)]
@@ -12,6 +13,24 @@ pub struct FtsHit {
     pub title: String,
     /// FTS5 bm25 score — LOWER is a better match (sqlite bm25 returns negatives
     /// for better matches); we expose it raw and sort ascending.
+    pub score: f64,
+}
+
+/// A FTS hit enriched with `object_index` metadata (domain, sensitivity,
+/// updated_at) + the indexed body — everything `recall` needs to render a
+/// provenance breadcrumb for a durable object (decision/learning/wiki/…) the
+/// same way it does for session turns. `redaction_status` is carried so callers
+/// can fail-closed on un-redacted objects (R11).
+#[derive(Debug, Clone)]
+pub struct ObjectHit {
+    pub object_type: String,
+    pub object_id: String,
+    pub title: String,
+    pub body: String,
+    pub domain: String,
+    pub sensitivity: String,
+    pub redaction_status: String,
+    pub updated_at: DateTime<Utc>,
     pub score: f64,
 }
 
@@ -78,6 +97,66 @@ impl<'a> FtsRepository<'a> {
                 score: r.get("score"),
             })
             .collect())
+    }
+
+    /// BM25 search that returns the body + `object_index` metadata in one query —
+    /// the durable-object half of unified recall (decisions/learnings/wiki/…).
+    /// Joins `object_fts` (which holds the body) with `object_index` (domain,
+    /// sensitivity, updated_at). Best-first (ascending bm25).
+    pub async fn search_objects(&self, query: &str, limit: i64) -> anyhow::Result<Vec<ObjectHit>> {
+        let safe = sanitize_query(query);
+        if safe.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Step 1: FTS match (the proven non-aliased pattern; +body which object_fts
+        // stores). FTS5 MATCH inside a JOIN is finicky across versions, so we keep
+        // the match query pure and enrich metadata in step 2.
+        let fts_rows = sqlx::query(
+            "SELECT object_type, object_id, title, body, bm25(object_fts) AS score \
+             FROM object_fts WHERE object_fts MATCH ? ORDER BY score LIMIT ?",
+        )
+        .bind(&safe)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+
+        // Step 2: enrich each hit with object_index metadata (domain, sensitivity,
+        // redaction_status, updated_at). Fail-soft defaults if the index row is
+        // missing (shouldn't happen — index_object writes both atomically).
+        let mut out = Vec::with_capacity(fts_rows.len());
+        for r in fts_rows {
+            let object_type: String = r.get("object_type");
+            let object_id: String = r.get("object_id");
+            let meta = sqlx::query(
+                "SELECT domain, sensitivity, redaction_status, updated_at \
+                 FROM object_index WHERE type = ? AND id = ?",
+            )
+            .bind(&object_type)
+            .bind(&object_id)
+            .fetch_optional(self.pool)
+            .await?;
+            let (domain, sensitivity, redaction_status, updated_at) = match meta {
+                Some(m) => (
+                    m.get::<String, _>("domain"),
+                    m.get::<String, _>("sensitivity"),
+                    m.get::<String, _>("redaction_status"),
+                    crate::util::opt_ts_from_text(m.get("updated_at")).unwrap_or_else(Utc::now),
+                ),
+                None => ("?".into(), "internal".into(), "clean".into(), Utc::now()),
+            };
+            out.push(ObjectHit {
+                object_type,
+                object_id,
+                title: r.get("title"),
+                body: r.get("body"),
+                domain,
+                sensitivity,
+                redaction_status,
+                updated_at,
+                score: r.get("score"),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -156,5 +235,30 @@ mod tests {
         let repo = FtsRepository::new(&p);
         assert!(repo.search("", 10).await.unwrap().is_empty());
         assert!(repo.search("   !!! ", 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_objects_returns_body_and_metadata() {
+        // Unified-recall path: a learning indexed via LearningsRepository becomes
+        // searchable WITH its body + domain + updated_at (joined from object_index).
+        let p = pool().await;
+        let learnings = crate::repositories::objects::LearningsRepository::new(&p);
+        let mut row = crate::repositories::objects::LearningRow::new(
+            "L1",
+            "GTM Decision",
+            "Target Florida surplus buyers for ReVesta",
+        );
+        row.domain = "business".into();
+        learnings.insert(&row).await.unwrap();
+
+        let repo = FtsRepository::new(&p);
+        let hits = repo.search_objects("Florida surplus", 10).await.unwrap();
+        assert_eq!(hits.len(), 1, "the learning is found via object_fts");
+        let h = &hits[0];
+        assert_eq!(h.object_type, "learning");
+        assert_eq!(h.object_id, "L1");
+        assert!(h.body.contains("Florida surplus"), "body is returned");
+        assert_eq!(h.domain, "business", "domain joined from object_index");
+        assert_eq!(h.redaction_status, "clean");
     }
 }

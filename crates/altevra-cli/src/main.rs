@@ -99,6 +99,10 @@ enum Commands {
     /// Answers "šta smo radili pre mesec dana sa Amerikancima" in natural prose.
     Recall(commands::recall::RecallArgs),
 
+    /// Capture a markdown note (Obsidian etc.) into the brain through the safety
+    /// gate — redacts secrets/PII, infers domain, persists + indexes for recall.
+    Capture(commands::capture::CaptureArgs),
+
     /// File change history (recorded by watcher/hooks)
     #[command(subcommand)]
     Files(commands::files::FilesCommands),
@@ -167,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Turn(args) => commands::turn::run(args).await,
         Commands::TurnSearch(args) => commands::turn_search::run(args).await,
         Commands::Recall(args) => commands::recall::run(args).await,
+        Commands::Capture(args) => commands::capture::run(args).await,
         Commands::Files(cmd) => commands::files::run(cmd).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,

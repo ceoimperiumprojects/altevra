@@ -8,10 +8,22 @@
 //! tool uses, so no leak surface differs).
 
 use altevra_core::time_window::{humanize_relative, parse_since_until, parse_window};
-use altevra_db::{create_pool, run_migrations, SessionsRepository, TurnSearchHit};
-use chrono::Utc;
+use altevra_db::{create_pool, run_migrations, FtsRepository, SessionsRepository, TurnSearchHit};
+use chrono::{DateTime, Utc};
 use clap::Args;
 use std::path::PathBuf;
+
+/// One unified recall result — a session turn OR a durable object
+/// (decision/learning/wiki). Both render identically: a "when — source" line +
+/// snippet. This is what makes recall span the whole second brain (§4.1), not
+/// just the turns table.
+struct RecallItem {
+    when: DateTime<Utc>,
+    when_human: String,
+    /// Breadcrumb: "claude-code · revesta" (turn) | "learning · business" (object).
+    source: String,
+    snippet: String,
+}
 
 #[derive(Args)]
 pub struct RecallArgs {
@@ -74,8 +86,9 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
 
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
-    let repo = SessionsRepository::new(&pool);
-    let hits: Vec<TurnSearchHit> = repo
+
+    // --- Source 1: session turns (the work stream). ---
+    let turn_hits: Vec<TurnSearchHit> = SessionsRepository::new(&pool)
         .search_turns_with_provenance(
             &args.query,
             args.project.as_deref(),
@@ -86,26 +99,61 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
         )
         .await?;
 
+    // --- Source 2: durable objects (decisions/learnings/wiki — captured memory). ---
+    // Only when not tool/project-scoped to a session (objects have no tool/session).
+    // Apply the same temporal window against the object's updated_at.
+    let object_hits = if args.tool.is_some() {
+        Vec::new() // tool filter is session-only; objects don't carry a tool.
+    } else {
+        FtsRepository::new(&pool)
+            .search_objects(&args.query, args.limit)
+            .await?
+            .into_iter()
+            .filter(|o| in_window(o.updated_at, t_since, t_until))
+            .filter(|o| {
+                // Honor a project filter loosely: object scope/domain match.
+                args.project
+                    .as_deref()
+                    .map(|p| o.domain == p || o.object_type == p)
+                    .unwrap_or(true)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // --- Merge into a unified, recency-sorted list. ---
+    let mut items: Vec<RecallItem> = Vec::new();
+    for h in &turn_hits {
+        let when_human = humanize_relative(h.row.created_at, now);
+        let tool_s = h.session_tool.as_deref().unwrap_or("?");
+        let proj_s = h.session_project.as_deref().unwrap_or("?");
+        items.push(RecallItem {
+            when: h.row.created_at,
+            when_human,
+            source: format!("{tool_s} · {proj_s}"),
+            snippet: snippet(&h.row.content, &args.query, 200),
+        });
+    }
+    for o in &object_hits {
+        let when_human = humanize_relative(o.updated_at, now);
+        items.push(RecallItem {
+            when: o.updated_at,
+            when_human,
+            source: format!("{} · {}", o.object_type, o.domain),
+            snippet: snippet_with_title(&o.title, &o.body, &args.query, 200),
+        });
+    }
+    items.sort_by_key(|it| std::cmp::Reverse(it.when));
+    items.truncate(args.limit as usize);
+
     if args.json {
-        let entries: Vec<_> = hits
+        let entries: Vec<_> = items
             .iter()
-            .map(|h| {
-                let when_human = humanize_relative(h.row.created_at, now);
-                let tool_s = h.session_tool.as_deref().unwrap_or("?");
-                let proj_s = h.session_project.as_deref().unwrap_or("?");
+            .map(|it| {
                 serde_json::json!({
-                    "score": h.score,
-                    "snippet": snippet(&h.row.content, &args.query, 220),
-                    "created_at": h.row.created_at,
-                    "session_id": h.row.session_id,
-                    "turn_idx": h.row.turn_idx,
-                    "role": h.row.role,
-                    "provenance": {
-                        "tool": h.session_tool,
-                        "project": h.session_project,
-                        "when_human": when_human,
-                        "breadcrumb": format!("{tool_s} · {proj_s} · {when_human}"),
-                    },
+                    "when": it.when,
+                    "when_human": it.when_human,
+                    "source": it.source,
+                    "snippet": it.snippet,
                 })
             })
             .collect();
@@ -114,6 +162,8 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "query": args.query,
                 "count": entries.len(),
+                "turns": turn_hits.len(),
+                "objects": object_hits.len(),
                 "window": t_since.map(|s| serde_json::json!({"since": s, "until": t_until})),
                 "results": entries,
             }))?
@@ -123,20 +173,48 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
 
     // Human prose layout.
     let scope = describe_scope(t_since, t_until, &args);
-    if hits.is_empty() {
+    if items.is_empty() {
         println!("No memory of '{}'{}.", args.query, scope);
         return Ok(());
     }
-    println!("Recall '{}'{} — {} hit(s):\n", args.query, scope, hits.len());
-    for h in &hits {
-        let when_human = humanize_relative(h.row.created_at, now);
-        let tool_s = h.session_tool.as_deref().unwrap_or("?");
-        let proj_s = h.session_project.as_deref().unwrap_or("?");
-        let snip = snippet(&h.row.content, &args.query, 200);
-        println!("  • {when_human} — {tool_s} on {proj_s}");
-        println!("    {snip}");
+    println!(
+        "Recall '{}'{} — {} hit(s) ({} turn / {} note):\n",
+        args.query,
+        scope,
+        items.len(),
+        turn_hits.len(),
+        object_hits.len()
+    );
+    for it in &items {
+        println!("  • {} — {}", it.when_human, it.source);
+        println!("    {}", it.snippet);
     }
     Ok(())
+}
+
+/// Half-open window membership; `None` bounds are unbounded.
+fn in_window(t: DateTime<Utc>, since: Option<DateTime<Utc>>, until: Option<DateTime<Utc>>) -> bool {
+    since.map(|s| t >= s).unwrap_or(true) && until.map(|u| t < u).unwrap_or(true)
+}
+
+/// Snippet for an object: prefer a body window around the match; if the match is
+/// only in the title, lead with the title.
+fn snippet_with_title(title: &str, body: &str, query: &str, max: usize) -> String {
+    let s = snippet(body, query, max);
+    if s.to_lowercase().contains(&query.to_lowercase()) || body_has_token(body, query) {
+        s
+    } else {
+        format!("{title} — {s}")
+    }
+}
+
+fn body_has_token(body: &str, query: &str) -> bool {
+    let lc = body.to_lowercase();
+    query
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 2)
+        .any(|t| lc.contains(t))
 }
 
 fn describe_scope(
@@ -209,9 +287,24 @@ mod tests {
         let now = Utc::now();
 
         for (tool, project, days_ago, body) in [
-            ("claude-code", "altevra", 28_i64, "called Americans about the deal terms"),
-            ("cursor", "revesta", 35_i64, "Americans replied with pricing concerns"),
-            ("codex", "altevra", 2_i64, "rust refactor on the americans handler module"),
+            (
+                "claude-code",
+                "altevra",
+                28_i64,
+                "called Americans about the deal terms",
+            ),
+            (
+                "cursor",
+                "revesta",
+                35_i64,
+                "Americans replied with pricing concerns",
+            ),
+            (
+                "codex",
+                "altevra",
+                2_i64,
+                "rust refactor on the americans handler module",
+            ),
         ] {
             let s = SessionRow {
                 id: Uuid::new_v4(),
