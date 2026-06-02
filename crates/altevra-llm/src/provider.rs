@@ -125,8 +125,7 @@ impl std::fmt::Debug for ModelRouter {
     // Manual: providers are trait objects (no Debug) and could hold tokens. Print
     // only the registered roles + fallback id — never provider internals.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut roles: Vec<&'static str> =
-            self.providers.keys().map(|r| r.as_str()).collect();
+        let mut roles: Vec<&'static str> = self.providers.keys().map(|r| r.as_str()).collect();
         roles.sort_unstable();
         f.debug_struct("ModelRouter")
             .field("roles", &roles)

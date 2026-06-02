@@ -419,10 +419,7 @@ mod tests {
     fn responses_body_folds_system_into_instructions() {
         let dir = tempfile::tempdir().unwrap();
         let prov = CodexOAuthProvider::from_auth_file(&write_fixture(dir.path())).unwrap();
-        let msgs = [
-            ChatMessage::system("be terse"),
-            ChatMessage::user("hello"),
-        ];
+        let msgs = [ChatMessage::system("be terse"), ChatMessage::user("hello")];
         let opts = ChatOpts::default().with_system("also be kind");
         let body = prov.build_responses_body(&msgs, &opts);
         let v = serde_json::to_value(&body).unwrap();

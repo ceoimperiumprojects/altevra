@@ -82,8 +82,14 @@ async fn run_show(args: ConfigShowArgs) -> anyhow::Result<()> {
             "database.max_connections = {}",
             cfg.database.max_connections
         );
-        println!("llm.reasoning_mode       = {}", cfg.llm.reasoning_mode.as_str());
-        println!("llm.embedding_mode       = {}", cfg.llm.embedding_mode.as_str());
+        println!(
+            "llm.reasoning_mode       = {}",
+            cfg.llm.reasoning_mode.as_str()
+        );
+        println!(
+            "llm.embedding_mode       = {}",
+            cfg.llm.embedding_mode.as_str()
+        );
         println!(
             "llm.codex_model          = {}",
             cfg.llm.codex_model.as_deref().unwrap_or("(default)")
@@ -132,9 +138,8 @@ async fn run_set(args: ConfigSetArgs) -> anyhow::Result<()> {
             })?;
         }
         "llm.embedding_mode" => {
-            cfg.llm.embedding_mode = EmbeddingMode::parse(&args.value).ok_or_else(|| {
-                anyhow::anyhow!("llm.embedding_mode must be one of: off | local")
-            })?;
+            cfg.llm.embedding_mode = EmbeddingMode::parse(&args.value)
+                .ok_or_else(|| anyhow::anyhow!("llm.embedding_mode must be one of: off | local"))?;
         }
         "llm.codex_model" => cfg.llm.codex_model = Some(args.value.clone()),
         other => anyhow::bail!(

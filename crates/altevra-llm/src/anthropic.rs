@@ -47,7 +47,11 @@ impl AnthropicProvider {
         MessagesRequest {
             model: self.model.clone(),
             max_tokens: opts.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-            system: if system.is_empty() { None } else { Some(system) },
+            system: if system.is_empty() {
+                None
+            } else {
+                Some(system)
+            },
             messages: msgs,
             temperature: opts.temperature,
         }

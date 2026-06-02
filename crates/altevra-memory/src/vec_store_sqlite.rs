@@ -21,10 +21,11 @@ impl SqliteVecStore {
     fn register_extension() {
         // Register the statically-linked sqlite-vec extension before opening a conn.
         unsafe {
-            sqlite3_auto_extension(Some(std::mem::transmute::<
-                *const (),
-                unsafe extern "C" fn(),
-            >(sqlite3_vec_init as *const ())));
+            sqlite3_auto_extension(Some(
+                std::mem::transmute::<*const (), unsafe extern "C" fn()>(
+                    sqlite3_vec_init as *const (),
+                ),
+            ));
         }
     }
 
@@ -75,7 +76,10 @@ impl SqliteVecStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("vec store mutex poisoned"))?;
         // vec0 virtual tables don't support UPSERT; delete-then-insert is the idiom.
-        conn.execute("DELETE FROM object_vec WHERE object_id = ?1", params![object_id])?;
+        conn.execute(
+            "DELETE FROM object_vec WHERE object_id = ?1",
+            params![object_id],
+        )?;
         conn.execute(
             "INSERT INTO object_vec(object_id, embedding) VALUES (?1, ?2)",
             params![object_id, json],

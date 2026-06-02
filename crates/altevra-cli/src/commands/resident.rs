@@ -91,8 +91,10 @@ async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
     // inside build_router + ModelRouter::resolve.
     let mut cfg = crate::commands::config::load_config(&args.repo);
     if let Some(rm) = args.reasoning_mode.as_deref() {
-        cfg.llm.reasoning_mode = altevra_core::config::ReasoningMode::parse(rm)
-            .ok_or_else(|| anyhow::anyhow!("--reasoning-mode must be: delegated|codex_oauth|api"))?;
+        cfg.llm.reasoning_mode =
+            altevra_core::config::ReasoningMode::parse(rm).ok_or_else(|| {
+                anyhow::anyhow!("--reasoning-mode must be: delegated|codex_oauth|api")
+            })?;
     }
     let router = altevra_llm::build_router(&cfg.llm);
     let runner = ResidentRunner::new(&router);

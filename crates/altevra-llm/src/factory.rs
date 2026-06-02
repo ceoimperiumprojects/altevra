@@ -58,7 +58,9 @@ pub fn build_router(cfg: &LlmConfig) -> ModelRouter {
                     .with_provider(ModelRole::StrongReasoner, arc);
             }
             Err(e) => {
-                tracing::warn!("codex_oauth selected but auth unavailable ({e}); reasoning stays noop");
+                tracing::warn!(
+                    "codex_oauth selected but auth unavailable ({e}); reasoning stays noop"
+                );
             }
         },
         ReasoningMode::Api => {
@@ -160,7 +162,10 @@ mod tests {
             ..Default::default()
         };
         let router = build_router(&cfg);
-        assert_eq!(router.resolve(ModelRole::StrongReasoner).id(), "codex-oauth");
+        assert_eq!(
+            router.resolve(ModelRole::StrongReasoner).id(),
+            "codex-oauth"
+        );
         assert_eq!(router.resolve(ModelRole::CheapWorker).id(), "codex-oauth");
         // THE headline SI-7 assertion: cloud reasoning must NOT reach local_private.
         assert_eq!(router.resolve(ModelRole::LocalPrivate).id(), "noop");

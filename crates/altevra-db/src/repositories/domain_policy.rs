@@ -80,7 +80,9 @@ impl EmbeddingModelRole {
     /// Most-restrictive of two (local_private wins). R3 across multi-domain objects.
     pub fn most_restrictive(a: EmbeddingModelRole, b: EmbeddingModelRole) -> EmbeddingModelRole {
         match (a, b) {
-            (EmbeddingModelRole::CloudOk, EmbeddingModelRole::CloudOk) => EmbeddingModelRole::CloudOk,
+            (EmbeddingModelRole::CloudOk, EmbeddingModelRole::CloudOk) => {
+                EmbeddingModelRole::CloudOk
+            }
             _ => EmbeddingModelRole::LocalPrivate,
         }
     }
