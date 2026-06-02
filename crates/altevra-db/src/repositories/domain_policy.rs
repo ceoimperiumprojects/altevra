@@ -62,6 +62,8 @@ pub struct DomainPolicyRow {
     pub cloud_sync: CloudSync,
     pub embedding_model_role: String,
     pub obsidian_mirror: String,
+    pub soft_ttl_days: Option<i64>,
+    pub hard_expiry_days: Option<i64>,
     pub rtbf_required: bool,
     pub legal_hold_capable: bool,
 }
@@ -78,7 +80,7 @@ impl<'a> DomainPolicyRepository<'a> {
     pub async fn get(&self, domain_key: &str) -> anyhow::Result<Option<DomainPolicyRow>> {
         let row = sqlx::query(
             "SELECT domain_key, display_name, default_sensitivity, max_sensitivity, cloud_sync, \
-             embedding_model_role, obsidian_mirror, rtbf_required, legal_hold_capable \
+             embedding_model_role, obsidian_mirror, soft_ttl_days, hard_expiry_days, rtbf_required, legal_hold_capable \
              FROM domain_policies WHERE domain_key = ?",
         )
         .bind(domain_key)
@@ -90,7 +92,7 @@ impl<'a> DomainPolicyRepository<'a> {
     pub async fn list(&self) -> anyhow::Result<Vec<DomainPolicyRow>> {
         let rows = sqlx::query(
             "SELECT domain_key, display_name, default_sensitivity, max_sensitivity, cloud_sync, \
-             embedding_model_role, obsidian_mirror, rtbf_required, legal_hold_capable \
+             embedding_model_role, obsidian_mirror, soft_ttl_days, hard_expiry_days, rtbf_required, legal_hold_capable \
              FROM domain_policies ORDER BY domain_key",
         )
         .fetch_all(self.pool)
@@ -132,6 +134,8 @@ fn row_to_policy(r: sqlx::sqlite::SqliteRow) -> DomainPolicyRow {
         cloud_sync: CloudSync::parse(&cs),
         embedding_model_role: r.get("embedding_model_role"),
         obsidian_mirror: r.get("obsidian_mirror"),
+        soft_ttl_days: r.get("soft_ttl_days"),
+        hard_expiry_days: r.get("hard_expiry_days"),
         rtbf_required: r.get::<i64, _>("rtbf_required") != 0,
         legal_hold_capable: r.get::<i64, _>("legal_hold_capable") != 0,
     }
