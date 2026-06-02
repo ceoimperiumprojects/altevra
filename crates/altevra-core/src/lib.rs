@@ -6,6 +6,7 @@ pub mod envelope;
 pub mod errors;
 pub mod events;
 pub mod lifecycle;
+pub mod mirror;
 pub mod observer;
 pub mod packet;
 pub mod paths;
@@ -25,6 +26,7 @@ pub use domain::{Domain, RiskTag};
 pub use envelope::{Confidence, Envelope, HasEnvelope, Provenance, ProvenanceOrigin};
 pub use errors::AltevraError;
 pub use lifecycle::derive_lifecycle_state;
+pub use mirror::{render_mirror, MirrorDoc};
 pub use observer::{
     detect_decision_conflict, detect_high_session_volume, detect_low_task_velocity,
     detect_patterns, detect_recurring_drift, detect_repeated_hook_failure, detect_secret_churn,
