@@ -95,6 +95,10 @@ enum Commands {
     /// Search across recorded turn content (BM25-style)
     TurnSearch(commands::turn_search::TurnSearchArgs),
 
+    /// Human recall over captured turns — temporal + source-tracing breadcrumbs.
+    /// Answers "šta smo radili pre mesec dana sa Amerikancima" in natural prose.
+    Recall(commands::recall::RecallArgs),
+
     /// File change history (recorded by watcher/hooks)
     #[command(subcommand)]
     Files(commands::files::FilesCommands),
@@ -162,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Session(cmd) => commands::session::run(cmd).await,
         Commands::Turn(args) => commands::turn::run(args).await,
         Commands::TurnSearch(args) => commands::turn_search::run(args).await,
+        Commands::Recall(args) => commands::recall::run(args).await,
         Commands::Files(cmd) => commands::files::run(cmd).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,

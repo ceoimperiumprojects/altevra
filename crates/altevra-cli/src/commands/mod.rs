@@ -20,6 +20,7 @@ pub mod research;
 pub mod resident;
 pub mod secrets;
 pub mod serve;
+pub mod recall;
 pub mod session;
 pub mod setup;
 pub mod skill;
