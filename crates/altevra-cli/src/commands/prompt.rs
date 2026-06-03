@@ -1,3 +1,4 @@
+use altevra_core::presence::require_human_presence;
 use altevra_core::prompts::{
     build_for_tool, PromptInput, PromptOutput, PromptSkill, DEFAULT_UPDATES_LIMIT,
 };
@@ -10,6 +11,24 @@ use std::path::{Path, PathBuf};
 pub enum PromptCommands {
     /// Build the layered system prompt for a given tool
     Build(PromptBuildArgs),
+    /// Roll a registry prompt back to an old version by minting a derived active
+    /// copy of it. Requires human presence (TTY or ALTEVRA_UNLOCK); an agent/
+    /// non-interactive caller is refused. Constitutional-locked slugs (safety,
+    /// altevra_rules) are refused by the registry (SI-2).
+    Rollback(PromptRollbackArgs),
+}
+
+#[derive(Args)]
+pub struct PromptRollbackArgs {
+    /// Prompt slug to roll back (e.g. `resident:observer`).
+    pub name: String,
+
+    /// The old version whose body becomes the new active version.
+    #[arg(long = "to")]
+    pub to: i64,
+
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
 }
 
 #[derive(Args)]
@@ -46,7 +65,50 @@ pub struct PromptBuildArgs {
 pub async fn run(cmd: PromptCommands) -> anyhow::Result<()> {
     match cmd {
         PromptCommands::Build(args) => run_build(args).await,
+        PromptCommands::Rollback(args) => run_rollback(args).await,
     }
+}
+
+/// `altevra prompt rollback <name> --to <version>` — mint a derived ACTIVE copy of
+/// an old version. This is a self-modify of a registry prompt, so it is gated:
+///   1. **Human presence (R4):** refuse unless TTY or ALTEVRA_UNLOCK — an agent
+///      may never roll a prompt back.
+///   2. **SI-2 (constitutional lock):** the registry refuses a locked slug; the
+///      error names the Tier-2 path. Presence alone does not unlock it.
+///   3. **SI-8 (one active per slug):** the mint runs deactivate-old-then-
+///      activate-new in one transaction.
+async fn run_rollback(args: PromptRollbackArgs) -> anyhow::Result<()> {
+    // HP gate FIRST — refuse a non-interactive/agent caller before touching the DB.
+    let proof = require_human_presence().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let repo = altevra_db::PromptsRepository::new(&pool);
+
+    // Find the source version's body.
+    let snapshot = repo.snapshot_for(&args.name).await?;
+    let source = snapshot
+        .iter()
+        .find(|r| r.version == args.to)
+        .ok_or_else(|| anyhow::anyhow!("prompt '{}' has no version {}", args.name, args.to))?;
+    let layer = source.layer.clone();
+    let body = source.body.clone();
+
+    // The derived version is one past the current max (monotonic mint). SI-2 is
+    // enforced inside `mint` (a locked slug errors out, no SQL runs).
+    let next_version = snapshot.iter().map(|r| r.version).max().unwrap_or(0) + 1;
+    let plan = repo
+        .mint(&args.name, next_version, &layer, &body, true)
+        .await?;
+
+    println!(
+        "rolled '{}' back to v{} → minted active v{} (by pavle:{})",
+        args.name,
+        args.to,
+        plan.new_version,
+        proof.method.as_str()
+    );
+    Ok(())
 }
 
 async fn run_build(args: PromptBuildArgs) -> anyhow::Result<()> {
@@ -188,5 +250,29 @@ mod tests {
         std::fs::write(proj_dir.join("README.md"), "hello").unwrap();
         let body = load_project_readme(tmp.path(), "foo");
         assert_eq!(body.as_deref(), Some("hello"));
+    }
+
+    /// `prompt rollback` is a self-modify of a registry prompt → it MUST refuse a
+    /// non-interactive (agent) caller. Under `cargo test` stdin is not a TTY; with
+    /// `ALTEVRA_UNLOCK` cleared the presence gate refuses BEFORE any DB work, so the
+    /// command errors and the registry is never touched.
+    #[tokio::test]
+    async fn rollback_requires_presence() {
+        // Ensure no unlock token leaks in from the ambient env (deterministic refuse).
+        std::env::remove_var("ALTEVRA_UNLOCK");
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("a.db");
+        let args = PromptRollbackArgs {
+            name: "resident:observer".to_string(),
+            to: 1,
+            db: db.clone(),
+        };
+        let err = run_rollback(args).await.expect_err("non-TTY must be refused");
+        assert!(
+            err.to_string().contains("requires_human_presence"),
+            "expected presence refusal, got: {err}"
+        );
+        // The gate runs before create_pool → no DB file is created.
+        assert!(!db.exists(), "presence gate must refuse before any DB work");
     }
 }

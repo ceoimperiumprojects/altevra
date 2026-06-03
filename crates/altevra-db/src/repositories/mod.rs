@@ -8,6 +8,7 @@ pub mod improvement_signals;
 pub mod installations;
 pub mod mentions;
 pub mod objects;
+pub mod prompts;
 pub mod proposals;
 pub mod read_state;
 pub mod resident;
@@ -36,6 +37,7 @@ pub use objects::{
     InsightCardRow, InsightCardsRepository, LearningRow, LearningsRepository,
     ObjectIndexRepository, ObjectIndexRow,
 };
+pub use prompts::PromptsRepository;
 pub use proposals::{
     write_resident_proposals, NewProposal, ProposalRow, ProposalsRepository,
 };

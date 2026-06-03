@@ -12,6 +12,7 @@ pub mod observer;
 pub mod packet;
 pub mod paths;
 pub mod presence;
+pub mod prompt_registry;
 pub mod prompts;
 pub mod resident;
 pub mod retrieval;
@@ -44,6 +45,11 @@ pub use packet::{
 };
 pub use paths::{default_db_path, DEFAULT_DB_PATH};
 pub use presence::{require_human_presence, PresenceError, PresenceMethod, PresenceProof};
+pub use prompt_registry::{
+    assert_one_active_per_slug, checksum_body, detect_drift, mint_plan, render, try_auto_activate,
+    AutoActivateDecision, DriftFinding, DuplicateActive, MintError, MintPlan, MissingSlug,
+    PromptEval, PromptRecord, RenderManifest, RenderManifestEntry, RenderedPrompt,
+};
 pub use resident::{
     parse_resident_output, ResidentMode, ResidentOutput, ResidentProposal, ResidentRunStatus,
 };
