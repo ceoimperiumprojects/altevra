@@ -22,6 +22,7 @@ pub mod selfimprove;
 pub mod status;
 pub mod template;
 pub mod time_window;
+pub mod tombstone;
 pub mod updates;
 
 pub use capability::{Support, TrustLevel};
@@ -64,3 +65,4 @@ pub use status::{
 };
 pub use template::gate::{GateOutcome, TemplateGate};
 pub use template::{Template, TemplateRegistry};
+pub use tombstone::{build_tombstone, detect_conflict, ConflictMarker, ConflictSide, Tombstone};
