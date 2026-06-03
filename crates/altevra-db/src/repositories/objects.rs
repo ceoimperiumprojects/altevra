@@ -393,6 +393,77 @@ impl<'a> ObjectIndexRepository<'a> {
         Ok(res.rows_affected() > 0)
     }
 
+    /// E1 — soft-archive the index row (Active → Archived). Status only; the
+    /// row stays and the FTS substrate stays (an archived object can still be
+    /// recalled with status=archived predicates downstream). Returns true if a
+    /// row was affected. Skips rows under legal hold (D7).
+    pub async fn archive(&self, object_type: &str, id: &str) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE object_index \
+             SET status = 'archived', updated_at = ? \
+             WHERE type = ? AND id = ? AND status = 'active' AND legal_hold = 0",
+        )
+        .bind(ts_to_text(&Utc::now()))
+        .bind(object_type)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// E1 — set the per-object legal-hold flag (D7). A held object is never
+    /// purged or auto-archived by the lifecycle sweep. The destructive forget
+    /// path also consults this flag downstream.
+    pub async fn set_legal_hold(
+        &self,
+        object_type: &str,
+        id: &str,
+        held: bool,
+    ) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE object_index SET legal_hold = ? WHERE type = ? AND id = ?",
+        )
+        .bind(if held { 1i64 } else { 0i64 })
+        .bind(object_type)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// E1 — read the per-object legal-hold flag.
+    pub async fn is_legal_held(&self, object_type: &str, id: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query(
+            "SELECT legal_hold FROM object_index WHERE type = ? AND id = ?",
+        )
+        .bind(object_type)
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<i64, _>("legal_hold") != 0).unwrap_or(false))
+    }
+
+    /// E1 — set the soft lifecycle marker (e.g. `"pending_delete"`) on an
+    /// `object_index` row. Surfaces delete-due objects in Pavle's digest
+    /// WITHOUT actually deleting — the destructive forget remains
+    /// presence-gated (R4). `marker=None` clears the column.
+    pub async fn set_lifecycle_marker(
+        &self,
+        object_type: &str,
+        id: &str,
+        marker: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            "UPDATE object_index SET lifecycle_marker = ? WHERE type = ? AND id = ?",
+        )
+        .bind(marker)
+        .bind(object_type)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// IDs of non-forgotten index rows whose id begins with `prefix`. Used by the
     /// incremental re-atomize path (`capture --watch`) to find the prior objects
     /// derived from one file (all share the `capture-<filestem>-` id prefix) so the
@@ -494,6 +565,26 @@ impl<'a> ObjectIndexRepository<'a> {
             .flatten();
         row.and_then(|r| serde_json::from_str::<Vec<String>>(&r.get::<String, _>("categories")).ok())
             .unwrap_or_default()
+    }
+
+    /// E1 — every index row PLUS its `legal_hold` flag, for the lifecycle
+    /// sweep. Reuses the same row shape as `candidates`; callers that need
+    /// the hold bit call this. Forgotten rows are excluded — they already
+    /// passed the destructive seam.
+    pub async fn iter_for_lifecycle(&self) -> anyhow::Result<Vec<(ObjectIndexRow, bool)>> {
+        let rows = sqlx::query(
+            "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at, legal_hold \
+             FROM object_index WHERE status != 'forgotten'",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let held: i64 = r.try_get("legal_hold").unwrap_or(0);
+                (row_to_index(r), held != 0)
+            })
+            .collect())
     }
 
     /// Candidate rows for packet compilation, optionally filtered by domain.

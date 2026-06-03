@@ -25,6 +25,15 @@ pub enum JobKind {
     /// transitions, never deletes; runs ~7 days (idle-gated by period). See
     /// [`crate::curator`] for the policy.
     Curator,
+    /// E1 — lifecycle archiver. Soft-archives Active → Archived for
+    /// retention-due objects, marks delete-due objects `pending_delete`
+    /// (never deletes), and purges the ephemeral `context_packets` body
+    /// past its 14-day window (R-EPH). Honors per-object legal hold (D7)
+    /// and never touches `exposure_decisions` or `audit_log` (R5-INV).
+    /// Distinct from [`Curator`] — that one targets the proposal/skill
+    /// *status* archive; this one targets the lifecycle_state derived
+    /// from envelope timestamps + domain policy. See [`crate::lifecycle`].
+    LifecycleArchiver,
 }
 
 impl JobKind {
@@ -43,6 +52,7 @@ impl JobKind {
             Self::AutoCategorizer => "auto_categorizer",
             Self::SelfImproveOrchestrator => "self_improve_orchestrator",
             Self::Curator => "curator",
+            Self::LifecycleArchiver => "lifecycle_archiver",
         }
     }
 
@@ -61,6 +71,7 @@ impl JobKind {
             "auto_categorizer" => Self::AutoCategorizer,
             "self_improve_orchestrator" => Self::SelfImproveOrchestrator,
             "curator" => Self::Curator,
+            "lifecycle_archiver" => Self::LifecycleArchiver,
             _ => return None,
         })
     }
@@ -88,6 +99,10 @@ impl JobKind {
             // curator is intentionally infrequent — it sweeps long-tail status
             // staleness, not real-time signals.
             Self::Curator => 7 * 24 * 60 * 60,
+            // E1: once per day. The actor only acts on objects whose envelope
+            // timestamps cross a TTL/expiry boundary — a sub-day cadence would
+            // burn DB ticks for no observable effect.
+            Self::LifecycleArchiver => 24 * 60 * 60,
         }
     }
 }
@@ -1166,13 +1181,28 @@ pub async fn dispatch(
         JobKind::AutoCategorizer => run_auto_categorizer(pool, ctx).await,
         JobKind::SelfImproveOrchestrator => crate::selfimprove::run_self_improve(pool, ctx).await,
         JobKind::Curator => crate::curator::run_curator(pool, ctx).await,
+        JobKind::LifecycleArchiver => run_lifecycle_archiver(pool, ctx).await,
     }
+}
+
+/// E1 — brain-job wrapper around [`crate::lifecycle::lifecycle_archive`]. Pure
+/// adapter: pass the context clock through, project the structured report onto
+/// a one-line `JobResult` for `brain_jobs.result_summary`.
+pub async fn run_lifecycle_archiver(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    let report = crate::lifecycle::lifecycle_archive(pool, ctx.now).await?;
+    Ok(JobResult {
+        summary: report.summary(),
+        items_processed: report.total_actions(),
+    })
 }
 
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 13] {
+pub fn all_kinds() -> [JobKind; 14] {
     [
         JobKind::EventClassifier,
         JobKind::ObserverScan,
@@ -1187,6 +1217,7 @@ pub fn all_kinds() -> [JobKind; 13] {
         JobKind::AutoCategorizer,
         JobKind::SelfImproveOrchestrator,
         JobKind::Curator,
+        JobKind::LifecycleArchiver,
     ]
 }
 

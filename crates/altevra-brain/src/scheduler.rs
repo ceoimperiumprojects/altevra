@@ -308,6 +308,11 @@ mod tests {
                 // curator pass is opted out here. Curator is tested directly in
                 // `crate::curator::tests`.
                 "curator".into(),
+                // E1 lifecycle archiver needs `object_index` + `context_packets`
+                // + `domain_policies` from the full migrations; opted out here
+                // for the same reason as the curator. Tested directly in
+                // `crate::lifecycle::tests`.
+                "lifecycle_archiver".into(),
             ],
             ..BrainConfig::default()
         };
@@ -337,6 +342,11 @@ mod tests {
                 // curator pass is opted out here. Curator is tested directly in
                 // `crate::curator::tests`.
                 "curator".into(),
+                // E1 lifecycle archiver needs `object_index` + `context_packets`
+                // + `domain_policies` from the full migrations; opted out here
+                // for the same reason as the curator. Tested directly in
+                // `crate::lifecycle::tests`.
+                "lifecycle_archiver".into(),
             ],
             ..BrainConfig::default()
         };
@@ -371,6 +381,7 @@ mod tests {
                 "auto_categorizer".into(),
                 "self_improve_orchestrator".into(),
                 "curator".into(),
+                "lifecycle_archiver".into(),
             ],
             ..BrainConfig::default()
         };

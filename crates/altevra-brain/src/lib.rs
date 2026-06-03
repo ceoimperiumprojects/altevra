@@ -24,7 +24,10 @@ pub mod selfimprove;
 
 pub use curator::{curator_digest_line, curate, run_curator, CuratorReport};
 pub use jobs::{all_kinds, run_all, JobKind, JobResult};
-pub use lifecycle::{lifecycle_sweep, LifecycleReport};
+pub use lifecycle::{
+    lifecycle_archive, lifecycle_sweep, LifecycleArchiveReport, LifecycleReport,
+    CONTEXT_PACKET_RETENTION_DAYS, PENDING_DELETE_MARKER,
+};
 pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};
 pub use selfimprove::{resident_disabled, run_self_improve, ApplyOutcome, SelfImproveReport};
