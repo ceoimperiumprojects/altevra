@@ -30,6 +30,12 @@ pub struct ObjectHit {
     pub domain: String,
     pub sensitivity: String,
     pub redaction_status: String,
+    /// JSON array of category/tag strings from `object_index`. Carries the
+    /// `kind:<type>` tag for atomized objects (every captured section is stored
+    /// as a `learning` row, so the *real* type — decision/person/note — lives
+    /// here). Lets `recall` label a captured decision as a decision, not a
+    /// generic learning, matching the `--with` entity path.
+    pub tags: String,
     pub updated_at: DateTime<Utc>,
     pub score: f64,
 }
@@ -128,21 +134,28 @@ impl<'a> FtsRepository<'a> {
             let object_type: String = r.get("object_type");
             let object_id: String = r.get("object_id");
             let meta = sqlx::query(
-                "SELECT domain, sensitivity, redaction_status, updated_at \
+                "SELECT domain, sensitivity, redaction_status, tags, updated_at \
                  FROM object_index WHERE type = ? AND id = ?",
             )
             .bind(&object_type)
             .bind(&object_id)
             .fetch_optional(self.pool)
             .await?;
-            let (domain, sensitivity, redaction_status, updated_at) = match meta {
+            let (domain, sensitivity, redaction_status, tags, updated_at) = match meta {
                 Some(m) => (
                     m.get::<String, _>("domain"),
                     m.get::<String, _>("sensitivity"),
                     m.get::<String, _>("redaction_status"),
+                    m.get::<String, _>("tags"),
                     crate::util::opt_ts_from_text(m.get("updated_at")).unwrap_or_else(Utc::now),
                 ),
-                None => ("?".into(), "internal".into(), "clean".into(), Utc::now()),
+                None => (
+                    "?".into(),
+                    "internal".into(),
+                    "clean".into(),
+                    "[]".into(),
+                    Utc::now(),
+                ),
             };
             out.push(ObjectHit {
                 object_type,
@@ -152,6 +165,7 @@ impl<'a> FtsRepository<'a> {
                 domain,
                 sensitivity,
                 redaction_status,
+                tags,
                 updated_at,
                 score: r.get("score"),
             });

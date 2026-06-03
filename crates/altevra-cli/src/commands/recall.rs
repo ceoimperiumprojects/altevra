@@ -157,7 +157,11 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
         items.push(RecallItem {
             when: o.updated_at,
             when_human,
-            source: format!("{} · {}", o.object_type, o.domain),
+            // Atomized objects are stored as `learning` rows, but their real type
+            // (decision/person/note) lives in a `kind:` tag — prefer it so a
+            // captured decision reads as a decision, not a generic learning
+            // (parity with the `--with` entity path's `row_kind`).
+            source: format!("{} · {}", row_kind(&o.tags, &o.object_type), o.domain),
             snippet: snippet_with_title(&o.title, &o.body, &args.query, 200),
         });
     }
@@ -571,6 +575,65 @@ mod tests {
         })
         .await;
         assert!(r.is_err(), "garbage window must fail-closed");
+    }
+
+    /// A1 UX contract: a captured DECISION must recall as a `decision`, not as the
+    /// generic `learning` row it is physically stored as. The atomizer types every
+    /// section as a `learning` (object_index.type='learning'); its real kind lives
+    /// in a `kind:decision` tag. `recall <query>` must surface that kind in the
+    /// breadcrumb so a user can tell a decision apart from a learning — matching the
+    /// `--with` entity path. Without the fix the breadcrumb read "learning · …".
+    #[tokio::test]
+    async fn recall_labels_captured_decision_as_decision_not_learning() {
+        use altevra_core::{Domain, Sensitivity};
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("dec.db");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        // Mirror the real Memory/ layout so the file is typed as a decision aggregate.
+        let mem = tmp.path().join("Memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let file = mem.join("Decisions.md");
+        std::fs::write(
+            &file,
+            "# Decisions\n\n\
+             ## ReVesta direct-call hypothesis validated\n\
+             **Odluka:** Keep pushing direct-call discovery, do not return to build mode.\n",
+        )
+        .unwrap();
+        let secs = altevra_vault::parse_sections(&std::fs::read_to_string(&file).unwrap());
+        let domain: Domain = "business".parse().unwrap();
+        let declared: Sensitivity = "internal".parse().unwrap();
+        crate::commands::capture::atomize_file(
+            &pool, &file, &secs, &domain, &declared, &[], None,
+        )
+        .await
+        .unwrap();
+
+        // The object is physically a `learning` row but tagged kind:decision.
+        let hits = altevra_db::FtsRepository::new(&pool)
+            .search_objects("direct-call hypothesis", 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "the captured decision is FTS-searchable");
+        assert_eq!(
+            hits[0].object_type, "learning",
+            "physically stored as a learning row"
+        );
+        assert!(
+            hits[0].tags.contains("kind:decision"),
+            "tags carry the real kind: {}",
+            hits[0].tags
+        );
+
+        // The breadcrumb the CLI renders must say `decision`, NOT `learning`.
+        let label = row_kind(&hits[0].tags, &hits[0].object_type);
+        assert_eq!(
+            label, "decision",
+            "recall must label a captured decision as a decision, not a learning"
+        );
     }
 
     #[tokio::test]
