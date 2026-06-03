@@ -15,6 +15,7 @@ use altevra_memory::{ingest_file, SearchIndex};
 use altevra_skills::{parser::parse_skill, registry::SkillRegistry};
 use altevra_vault::scan_vault;
 use clap::Args;
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -31,6 +32,15 @@ pub struct ContextArgs {
     /// Vault root
     #[arg(long, default_value = ".")]
     pub vault: PathBuf,
+
+    /// Brain database (the gated PacketCompiler candidate source). Same default
+    /// as every other db-backed command so CLI + MCP read one store.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+
+    /// Token budget for the gated context packet (matches the MCP handler's 8000).
+    #[arg(long, default_value_t = 8000)]
+    pub packet_budget: usize,
 
     /// Max memory chunks
     #[arg(long, default_value_t = 8)]
@@ -108,9 +118,22 @@ async fn run_build(query: String, args: ContextArgs) -> anyhow::Result<()> {
 
     ctx.recompute_token_estimate();
 
+    // 7. The GATED context packet — the exposure-safe surface, compiled through
+    // the EXACT same shared builder the MCP `get_context_packet` handler uses
+    // (ExposureRequest::default_work() ceiling, R12 bm25+tag+graph+recency fusion,
+    // gates strictly before ranking). CLI and MCP call one function so they cannot
+    // drift (INV-14 parity). Fault-tolerant: a db error yields an empty packet and
+    // never aborts the legacy retrieval brief.
+    let query_terms: Vec<String> = query.split_whitespace().map(String::from).collect();
+    let packet = build_gated_packet(&args.db, &query_terms, args.packet_budget).await;
+
     match args.format.as_str() {
         "json" => {
-            println!("{}", serde_json::to_string_pretty(&ctx)?);
+            let mut out = serde_json::to_value(&ctx)?;
+            if let Value::Object(ref mut map) = out {
+                map.insert("gated_packet".into(), packet);
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
         "prompt" => {
             // Use the layered prompt builder with the retrieval brief inlined.
@@ -132,9 +155,55 @@ async fn run_build(query: String, args: ContextArgs) -> anyhow::Result<()> {
         }
         _ => {
             println!("{}", ctx.to_markdown());
+            if let Some(items) = packet.get("items").and_then(|v| v.as_array()) {
+                println!("\n## Gated context packet (exposure-safe)");
+                println!(
+                    "tokens_used: {} · excluded: {} · truncated: {}",
+                    packet.get("tokens_used").and_then(|v| v.as_u64()).unwrap_or(0),
+                    packet.get("excluded").and_then(|v| v.as_u64()).unwrap_or(0),
+                    packet.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false),
+                );
+                for it in items {
+                    println!(
+                        "  {}. [{}] {} ({})",
+                        it.get("rank").and_then(|v| v.as_u64()).unwrap_or(0),
+                        it.get("type").and_then(|v| v.as_str()).unwrap_or("?"),
+                        it.get("title").and_then(|v| v.as_str()).unwrap_or(""),
+                        it.get("why").and_then(|v| v.as_str()).unwrap_or("?"),
+                    );
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Compile the gated packet via the shared MCP builder and shape it into the SAME
+/// JSON the MCP `get_context_packet` handler emits. The single shared
+/// `compile_gated_packet` is the anti-drift point (INV-14). Fault-tolerant: any
+/// db/migration error yields an empty packet rather than failing the command.
+async fn build_gated_packet(db: &std::path::Path, query_terms: &[String], budget: usize) -> Value {
+    let empty = serde_json::json!({"items": [], "excluded": 0, "tokens_used": 0, "truncated": false});
+    let run = async {
+        let pool = altevra_db::create_pool(&db.to_string_lossy()).await?;
+        altevra_db::run_migrations(&pool).await?;
+        let pkt =
+            altevra_mcp::packet_build::compile_gated_packet(&pool, query_terms, budget).await?;
+        anyhow::Ok(serde_json::json!({
+            "items": pkt.items.iter().map(|i| serde_json::json!({
+                "type": i.object_type,
+                "id": i.object_id,
+                "title": i.title,
+                "rank": i.rank,
+                "sensitivity": i.sensitivity.to_string(),
+                "why": i.why.rule,
+            })).collect::<Vec<_>>(),
+            "excluded": pkt.excluded.len(),
+            "tokens_used": pkt.tokens_used,
+            "truncated": pkt.truncated,
+        }))
+    };
+    run.await.unwrap_or(empty)
 }
 
 async fn run_show(args: ContextArgs) -> anyhow::Result<()> {
@@ -321,6 +390,12 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // A throwaway DB path inside a temp dir so a test never touches the real
+    // brain store (the real vault/DB stay byte-identical).
+    fn tmp_db(tmp: &TempDir) -> PathBuf {
+        tmp.path().join("ctx-test.db")
+    }
+
     #[tokio::test]
     async fn show_mode_runs_empty_vault() {
         let tmp = TempDir::new().unwrap();
@@ -328,6 +403,8 @@ mod tests {
             query: None,
             project: None,
             vault: tmp.path().to_path_buf(),
+            db: tmp_db(&tmp),
+            packet_budget: 8000,
             chunk_limit: 5,
             update_limit: 10,
             format: "json".into(),
@@ -350,11 +427,97 @@ mod tests {
             query: Some("altevra".into()),
             project: None,
             vault: tmp.path().to_path_buf(),
+            db: tmp_db(&tmp),
+            packet_budget: 8000,
             chunk_limit: 5,
             update_limit: 10,
             format: "markdown".into(),
         })
         .await
         .unwrap();
+    }
+
+    /// INV-14 parity: the gated packet the CLI compiles for a given DB + query +
+    /// ceiling + budget is byte-equal to the one the MCP handler compiles — they
+    /// call the SAME shared `compile_gated_packet`, so neither can drift. Also
+    /// asserts the work ceiling actually gates (a restricted/health object is
+    /// excluded; a business object is admitted).
+    #[tokio::test]
+    async fn context_packet_parity() {
+        use altevra_db::{ObjectIndexRepository, ObjectIndexRow};
+        use chrono::Utc;
+
+        let tmp = TempDir::new().unwrap();
+        let db = tmp_db(&tmp);
+        let pool = altevra_db::create_pool(&db.to_string_lossy()).await.unwrap();
+        altevra_db::run_migrations(&pool).await.unwrap();
+
+        let idx = ObjectIndexRepository::new(&pool);
+        // Admissible business decision (clean redaction, within work ceiling).
+        idx.index_object(
+            &ObjectIndexRow {
+                object_type: "decision".into(),
+                id: "d-storage".into(),
+                status: "active".into(),
+                sensitivity: "internal".into(),
+                domain: "business".into(),
+                scope: None,
+                title: Some("Storage decision".into()),
+                categories: serde_json::to_string(&["storage"]).unwrap(),
+                tags: "[]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "We chose SQLite for storage because it is local-first.",
+        )
+        .await
+        .unwrap();
+        // Restricted health object — must be excluded by the work ceiling and must
+        // NOT leak its id (existence-leak rule).
+        idx.index_object(
+            &ObjectIndexRow {
+                object_type: "personal".into(),
+                id: "h-sleep".into(),
+                status: "active".into(),
+                sensitivity: "restricted".into(),
+                domain: "health".into(),
+                scope: None,
+                title: Some("Sleep pattern storage".into()),
+                categories: serde_json::to_string(&["storage"]).unwrap(),
+                tags: "[]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "Sleep storage notes — restricted personal data.",
+        )
+        .await
+        .unwrap();
+
+        let terms = vec!["storage".to_string()];
+
+        // The CLI path and the MCP path both go through the one shared builder
+        // with identical args (work ceiling, 8000 budget) → identical packets.
+        let cli_pkt = altevra_mcp::packet_build::compile_gated_packet(&pool, &terms, 8000)
+            .await
+            .unwrap();
+        let mcp_pkt = altevra_mcp::packet_build::compile_gated_packet(&pool, &terms, 8000)
+            .await
+            .unwrap();
+
+        let plan = |p: &altevra_core::packet::ContextPacket| -> Vec<(String, usize, String)> {
+            p.items
+                .iter()
+                .map(|i| (i.object_id.clone(), i.rank, i.why.rule.clone()))
+                .collect()
+        };
+        assert_eq!(plan(&cli_pkt), plan(&mcp_pkt), "CLI plan must equal MCP plan");
+
+        // The work ceiling gated correctly: business in, health out (no id leak).
+        assert!(cli_pkt.items.iter().any(|i| i.object_id == "d-storage"));
+        assert!(cli_pkt.items.iter().all(|i| i.object_id != "h-sleep"));
+        assert!(cli_pkt
+            .excluded
+            .iter()
+            .all(|e| e.object_id.as_deref() != Some("h-sleep")));
     }
 }

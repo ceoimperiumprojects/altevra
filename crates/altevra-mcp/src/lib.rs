@@ -1,3 +1,4 @@
+pub mod packet_build;
 pub mod server;
 pub mod tools_bootstrap;
 pub mod tools_capabilities;

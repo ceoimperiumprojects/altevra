@@ -1,10 +1,3 @@
-use altevra_core::envelope::{Envelope, Provenance, ProvenanceOrigin};
-use altevra_core::packet::{PacketCandidate, PacketCompiler, PacketRequest};
-use altevra_core::safety::ExposureRequest;
-use altevra_core::security::Sensitivity;
-use altevra_core::status::{ObjectStatus, RedactionStatus};
-use altevra_core::Domain;
-use altevra_db::{ExposureAudit, ExposureDecisionsRepository, ObjectIndexRepository};
 use altevra_memory::{ingest_file, SearchIndex};
 use altevra_vault::scan_vault;
 use serde_json::Value;
@@ -124,6 +117,9 @@ fn empty_packet() -> Value {
 fn gated_packet(db_path: &std::path::Path, query_terms: &[String]) -> Value {
     let db = db_path.to_path_buf();
     let terms = query_terms.to_vec();
+    // Runs on a dedicated thread with its own current-thread runtime (see the
+    // doc comment above) and delegates to the SINGLE shared builder so CLI + MCP
+    // cannot drift (INV-14 parity).
     let joined = std::thread::spawn(move || -> anyhow::Result<Value> {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -131,62 +127,10 @@ fn gated_packet(db_path: &std::path::Path, query_terms: &[String]) -> Value {
         rt.block_on(async move {
             let pool = altevra_db::create_pool(&db.to_string_lossy()).await?;
             altevra_db::run_migrations(&pool).await?;
-            let rows = ObjectIndexRepository::new(&pool).candidates(None).await?;
-            if rows.is_empty() {
+            let pkt = crate::packet_build::compile_gated_packet(&pool, &terms, 8000).await?;
+            if pkt.items.is_empty() && pkt.excluded.is_empty() {
                 return Ok(empty_packet());
             }
-            let now = rows.iter().map(|r| r.updated_at).max().unwrap();
-            let candidates: Vec<PacketCandidate> = rows.iter().map(row_to_candidate).collect();
-            let req = PacketRequest {
-                intent: "context".into(),
-                project: None,
-                query_terms: terms,
-                exposure: ExposureRequest::default_work(),
-                token_budget: 8000,
-            };
-            let pkt = PacketCompiler::compile(&candidates, &req, now);
-
-            // R5 audit: every packet compile emits ONE content-free aggregate row
-            // to exposure_decisions (append-only, never auto-purged). The compiler
-            // stays pure (no db dep); the handler does the write here from the
-            // already-compiled packet + request. Content-free by construction —
-            // counts + ceiling + why-excluded aggregate, NEVER object ids/titles
-            // of denied items (§2.13 no existence leak).
-            let mut by_reason: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            for ex in &pkt.excluded {
-                *by_reason.entry(ex.reason.clone()).or_insert(0) += 1;
-            }
-            let mut redaction_counts: std::collections::BTreeMap<String, usize> =
-                std::collections::BTreeMap::new();
-            // The packet items are the admitted candidates; record their redaction
-            // mix by re-reading the candidate verdicts (no object id is stored).
-            for item in &pkt.items {
-                if let Some(c) = candidates.iter().find(|c| c.envelope.id == item.object_id) {
-                    *redaction_counts
-                        .entry(c.redaction_status.to_string())
-                        .or_insert(0) += 1;
-                }
-            }
-            let audit = ExposureAudit {
-                packet_id: None,
-                sensitivity_ceiling: req.exposure.sensitivity_ceiling.to_string(),
-                domain_scope: req
-                    .exposure
-                    .domain_scope
-                    .iter()
-                    .map(|d| d.to_string())
-                    .collect(),
-                included_count: pkt.items.len(),
-                excluded_count: pkt.excluded.len(),
-                excluded_by_reason: by_reason.into_iter().collect(),
-                redaction_counts: redaction_counts.into_iter().collect(),
-                truncated: pkt.truncated,
-            };
-            // Fault-tolerant: an audit-write failure must not break the response,
-            // but it is the natural, always-attempted side effect of a compile.
-            let _ = ExposureDecisionsRepository::new(&pool).insert(&audit).await;
-
             Ok(serde_json::json!({
                 "items": pkt.items.iter().map(|i| serde_json::json!({
                     "type": i.object_type,
@@ -207,27 +151,6 @@ fn gated_packet(db_path: &std::path::Path, query_terms: &[String]) -> Value {
         .ok()
         .and_then(|r| r.ok())
         .unwrap_or_else(empty_packet)
-}
-
-fn row_to_candidate(r: &altevra_db::ObjectIndexRow) -> PacketCandidate {
-    let mut e = Envelope::new(
-        &r.id,
-        &r.object_type,
-        r.updated_at,
-        Provenance::new(ProvenanceOrigin::Imported),
-    );
-    e.domain = r.domain.parse::<Domain>().unwrap();
-    e.sensitivity = r.sensitivity.parse::<Sensitivity>().unwrap();
-    e.status = r.status.parse::<ObjectStatus>().unwrap();
-    let categories: Vec<String> = serde_json::from_str(&r.categories).unwrap_or_default();
-    PacketCandidate::new(
-        e,
-        r.title.clone().unwrap_or_default(),
-        categories,
-        r.redaction_status
-            .parse::<RedactionStatus>()
-            .unwrap_or(RedactionStatus::Unscanned),
-    )
 }
 
 pub fn handle_get_source_of_truth(id: Value, args: &Value) -> McpResponse {
