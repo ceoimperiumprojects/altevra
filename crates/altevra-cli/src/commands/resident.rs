@@ -117,6 +117,19 @@ async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
         )
         .await?;
 
+    // B1: persist the run's proposals into the unified `proposals` table
+    // (additive — the brain_jobs output_json above is unchanged). SI-14: a
+    // schema-invalid run writes ZERO proposal rows. SI-9: core re-derives each
+    // row's risk_tier from its kind (any agent-supplied tier is ignored).
+    let proposals_repo = altevra_db::ProposalsRepository::new(&pool);
+    let proposal_rows = altevra_db::write_resident_proposals(
+        &proposals_repo,
+        &report.mode,
+        report.status,
+        &report.output,
+    )
+    .await?;
+
     if args.json {
         println!(
             "{}",
@@ -127,6 +140,7 @@ async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
                 "model_role": report.model_role,
                 "provider": report.provider_id,
                 "proposals_emitted": report.proposals_emitted(),
+                "proposal_rows_written": proposal_rows,
                 "dry_run": report.dry_run,
             }))?
         );
@@ -140,6 +154,9 @@ async fn run_resident(args: ResidentRunArgs) -> anyhow::Result<()> {
             report.proposals_emitted(),
             if report.dry_run { " (dry-run)" } else { "" }
         );
+        if proposal_rows > 0 {
+            println!("  {proposal_rows} proposal row(s) written to the proposals table");
+        }
         if report.provider_id == "noop" {
             println!("  (noop provider — add API keys to enable a real model)");
         }
