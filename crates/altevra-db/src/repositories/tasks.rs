@@ -73,6 +73,17 @@ impl DecisionIndexEnvelope {
     }
 }
 
+/// A decision whose scheduled re-check (`review_after`, migration 019) has passed.
+/// The daily briefing surfaces these as "decision '<title>' from <date> — still
+/// applies?" (CLAUDE.md §3.6).
+#[derive(Debug, Clone)]
+pub struct DecisionDueForReview {
+    pub id: String,
+    pub title: String,
+    pub decided_at: DateTime<Utc>,
+    pub review_after: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewItemRow {
     pub id: Uuid,
@@ -223,6 +234,41 @@ impl<'a> TasksRepository<'a> {
             )
             .await?;
         Ok(())
+    }
+
+    /// Decisions whose envelope `review_after` (migration 019) is in the past —
+    /// the "decision still valid?" seed for the daily briefing (CLAUDE.md §3.6).
+    /// Only `active` decisions are returned (a superseded/archived one needs no
+    /// re-check). `now` is supplied so the caller controls the clock (deterministic
+    /// tests). Returns `(id, title, decided_at, review_after)` newest-decision first.
+    pub async fn decisions_due_for_review(
+        &self,
+        now: DateTime<Utc>,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DecisionDueForReview>> {
+        let now_text = ts_to_text(&now);
+        let rows = sqlx::query(
+            r#"SELECT id, title, decided_at, review_after
+               FROM decisions
+               WHERE review_after IS NOT NULL
+                 AND review_after <= ?
+                 AND status = 'active'
+               ORDER BY decided_at DESC
+               LIMIT ?"#,
+        )
+        .bind(now_text)
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DecisionDueForReview {
+                id: r.get("id"),
+                title: r.get("title"),
+                decided_at: ts_from_text(r.get::<String, _>("decided_at")),
+                review_after: ts_from_text(r.get::<String, _>("review_after")),
+            })
+            .collect())
     }
 
     pub async fn list_goals(&self, project_id: Option<Uuid>) -> anyhow::Result<Vec<GoalRow>> {

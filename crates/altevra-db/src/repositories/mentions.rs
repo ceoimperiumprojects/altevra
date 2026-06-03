@@ -127,6 +127,38 @@ impl<'a> MentionsRepository<'a> {
             .collect())
     }
 
+    /// Dated mention rows for feeding `altevra_core::last_contact`: every active
+    /// `mentions` edge as `(vec![entity_id], date)` where `date` is the mentioning
+    /// object's `object_index.updated_at` (NULL when the object isn't indexed). This
+    /// is the substrate for the "haven't talked to X in N weeks" briefing line
+    /// (CLAUDE.md §3.6) — the caller passes the whole set to `last_contact` per
+    /// entity, which picks the most-recent date.
+    pub async fn dated_mentions(&self) -> anyhow::Result<Vec<(Vec<String>, Option<chrono::NaiveDate>)>> {
+        let rows = sqlx::query(
+            "SELECT r.to_id AS eid, oi.updated_at AS up \
+             FROM relations r \
+             LEFT JOIN object_index oi ON oi.type = r.from_type AND oi.id = r.from_id \
+             WHERE r.rel = ? AND r.status = 'active'",
+        )
+        .bind(REL_MENTIONS)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let eid: String = r.get("eid");
+                let up: Option<String> = r.get("up");
+                let date = up.and_then(|s| {
+                    // `object_index.updated_at` is canonical RFC3339; take the date.
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.date_naive())
+                });
+                (vec![eid], date)
+            })
+            .collect())
+    }
+
     /// Count of distinct objects mentioning each entity — for a quick graph
     /// summary. Returns `(entity_id, count)` sorted by count desc.
     pub async fn mention_counts(&self) -> anyhow::Result<Vec<(String, i64)>> {

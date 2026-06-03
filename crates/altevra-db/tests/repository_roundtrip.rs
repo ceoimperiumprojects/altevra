@@ -485,3 +485,72 @@ async fn exposure_decision_written() {
     assert!(request.contains("internal"));
     assert!(request.contains("project"));
 }
+
+
+/// B3 substrate: `decisions_due_for_review` returns only `active` decisions whose
+/// `review_after` is in the past — the "decision still valid?" daily-briefing seed.
+#[tokio::test]
+async fn decisions_due_for_review_filters_by_review_after_and_status() {
+    let pool = fresh_pool().await;
+    let repo = TasksRepository::new(&pool);
+
+    // Three decisions: one due (review_after in the past), one not yet due, one
+    // due but already superseded (status != active → excluded).
+    let due = DecisionRow {
+        id: Uuid::new_v4(),
+        project_id: None,
+        title: "Stop building, start selling".into(),
+        rationale: Some("Đorđe directive".into()),
+        decided_at: "2026-04-10T00:00:00Z".parse().unwrap(),
+        decided_by: Some("djordje".into()),
+        metadata: serde_json::json!({}),
+    };
+    let future = DecisionRow {
+        id: Uuid::new_v4(),
+        project_id: None,
+        title: "Adopt SQLite local-first".into(),
+        rationale: None,
+        decided_at: "2026-05-01T00:00:00Z".parse().unwrap(),
+        decided_by: None,
+        metadata: serde_json::json!({}),
+    };
+    let superseded = DecisionRow {
+        id: Uuid::new_v4(),
+        project_id: None,
+        title: "Old GTM plan".into(),
+        rationale: None,
+        decided_at: "2026-03-01T00:00:00Z".parse().unwrap(),
+        decided_by: None,
+        metadata: serde_json::json!({}),
+    };
+    for d in [&due, &future, &superseded] {
+        repo.save_decision(d).await.unwrap();
+    }
+
+    // Set review_after / status directly (save_decision defaults status='active'
+    // and leaves review_after NULL).
+    sqlx::query("UPDATE decisions SET review_after = ? WHERE id = ?")
+        .bind("2026-05-01T00:00:00.000Z")
+        .bind(due.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE decisions SET review_after = ? WHERE id = ?")
+        .bind("2026-12-01T00:00:00.000Z")
+        .bind(future.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE decisions SET review_after = ?, status = 'superseded' WHERE id = ?")
+        .bind("2026-05-01T00:00:00.000Z")
+        .bind(superseded.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let now = "2026-06-03T00:00:00Z".parse().unwrap();
+    let dues = repo.decisions_due_for_review(now, 10).await.unwrap();
+    assert_eq!(dues.len(), 1, "only the active, past-review decision");
+    assert_eq!(dues[0].id, due.id.to_string());
+    assert_eq!(dues[0].title, "Stop building, start selling");
+}

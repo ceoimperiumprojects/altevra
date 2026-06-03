@@ -33,7 +33,8 @@ pub use resident::ResidentRepository;
 pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow, TurnSearchHit};
 pub use skills::{SkillRow, SkillsRepository};
 pub use tasks::{
-    DecisionIndexEnvelope, DecisionRow, GoalRow, ReviewItemRow, TaskRow, TasksRepository,
+    DecisionDueForReview, DecisionIndexEnvelope, DecisionRow, GoalRow, ReviewItemRow, TaskRow,
+    TasksRepository,
 };
 pub use updates::UpdatesRepository;
 pub use wiki::{WikiPageLinkRow, WikiPageRow, WikiPagesRepository};
