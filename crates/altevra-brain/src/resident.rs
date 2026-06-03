@@ -13,7 +13,10 @@
 use altevra_core::resident::{
     parse_resident_output, ResidentMode, ResidentOutput, ResidentRunStatus,
 };
+use altevra_core::Domain;
 use altevra_llm::{ChatMessage, ChatOpts, ModelRole, ModelRouter};
+
+use crate::routing::role_for_object;
 
 /// Canonical generic-envelope OUTPUT CONTRACT appended to every mode's system
 /// prompt. It is the ONE output shape [`parse_resident_output`] accepts (R10/§4):
@@ -93,7 +96,20 @@ impl<'a> ResidentRunner<'a> {
             );
         }
 
-        let role = parse_role(&mode.model_role);
+        // SI-7 fail-safe: a CLOUD-eligible role (cheap_worker / strong_reasoner)
+        // must not see high-water packet text. We pass the mode's declared role as
+        // the DEFAULT; `role_for_object` escalates to LocalPrivate when the packet
+        // content looks high-water (independent of any upstream domain stamp). For
+        // a mode already declared `local_private` this is a no-op (default in =
+        // local out). A high-water mode whose packet is clean keeps its declared
+        // role — no over-promotion either way. When LocalPrivate resolves to noop
+        // (no local model configured), the provider call returns the canonical
+        // empty stub — same skip-cleanly behavior as before.
+        let declared = parse_role(&mode.model_role);
+        // `Domain::Business` is the most permissive seed: the helper only ESCALATES
+        // (never demotes). The escalation gate is the content scan; a real domain
+        // for the packet isn't tracked here.
+        let role = role_for_object(&Domain::Business, packet_text, declared);
         let provider = self.router.resolve(role);
         let provider_id = provider.id().to_string();
 
@@ -209,6 +225,83 @@ mod tests {
         async fn complete(&self, _m: &[ChatMessage], _o: &ChatOpts) -> anyhow::Result<String> {
             Ok("this is not valid resident output json".into())
         }
+    }
+
+    /// SI-7 fail-safe at the resident layer: a mode declared with the CLOUD
+    /// `cheap_worker` role whose packet text is high-water (e.g. mentions
+    /// Pavle's girlfriend Elena) must NOT reach a cloud provider — the runner
+    /// re-routes it to local_private. With a CLOUD cheap_worker registered and
+    /// no local_private, the high-water run resolves to the noop fallback and
+    /// the cloud provider is never called.
+    #[tokio::test]
+    async fn high_water_packet_never_reaches_cloud_cheap_worker() {
+        // A cloud-like provider that PANICS if asked to complete — proves nothing
+        // ever calls it for the high-water packet.
+        struct PanicCloudProvider;
+        #[async_trait]
+        impl ChatProvider for PanicCloudProvider {
+            fn id(&self) -> &str {
+                "panic-cloud"
+            }
+            fn is_local(&self) -> bool {
+                false
+            }
+            async fn complete(
+                &self,
+                _m: &[ChatMessage],
+                _o: &ChatOpts,
+            ) -> anyhow::Result<String> {
+                panic!("a high-water packet must NEVER reach the cloud worker (SI-7)")
+            }
+        }
+        let router = ModelRouter::noop()
+            .with_provider(ModelRole::CheapWorker, Arc::new(PanicCloudProvider));
+        let runner = ResidentRunner::new(&router);
+        let packet = "danas sam shvatio nesto vazno — moja devojka Elena me podrzava u svemu";
+        let r = runner
+            .run_dry(&mode("memory_curator", "cheap_worker", false), packet)
+            .await;
+        // The runner escalated to LocalPrivate → noop → schema-valid empty output
+        // with NO panic from PanicCloudProvider.
+        assert_eq!(r.status, ResidentRunStatus::Completed);
+        assert_eq!(r.provider_id, "noop");
+        assert_eq!(r.proposals_emitted(), 0);
+    }
+
+    /// A clean packet keeps the declared role (no over-promotion).
+    #[tokio::test]
+    async fn clean_packet_keeps_declared_role() {
+        struct StubCheap;
+        #[async_trait]
+        impl ChatProvider for StubCheap {
+            fn id(&self) -> &str {
+                "stub-cheap"
+            }
+            fn is_local(&self) -> bool {
+                false
+            }
+            async fn complete(
+                &self,
+                _m: &[ChatMessage],
+                _o: &ChatOpts,
+            ) -> anyhow::Result<String> {
+                Ok("{\"proposals\":[]}".into())
+            }
+        }
+        let router =
+            ModelRouter::noop().with_provider(ModelRole::CheapWorker, Arc::new(StubCheap));
+        let runner = ResidentRunner::new(&router);
+        let r = runner
+            .run_dry(
+                &mode("memory_curator", "cheap_worker", false),
+                "blog draft about Rust async runtimes",
+            )
+            .await;
+        assert_eq!(r.status, ResidentRunStatus::Completed);
+        assert_eq!(
+            r.provider_id, "stub-cheap",
+            "a non-high-water packet keeps the declared cloud role"
+        );
     }
 
     #[tokio::test]

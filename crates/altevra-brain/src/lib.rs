@@ -19,6 +19,7 @@ pub mod curator;
 pub mod jobs;
 pub mod lifecycle;
 pub mod resident;
+pub mod routing;
 pub mod scheduler;
 pub mod selfimprove;
 
@@ -29,5 +30,6 @@ pub use lifecycle::{
     CONTEXT_PACKET_RETENTION_DAYS, PENDING_DELETE_MARKER,
 };
 pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
+pub use routing::role_for_object;
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};
 pub use selfimprove::{resident_disabled, run_self_improve, ApplyOutcome, SelfImproveReport};

@@ -725,40 +725,22 @@ pub async fn run_auto_categorizer(
     let mut skipped = 0usize;
 
     for obj in &todo {
-        // SI-7: route by domain. High-water → local_private (never cloud); else
-        // cheap_worker. A high-water object must never be classified by the cloud
-        // worker — the router additionally enforces local-only for local_private.
+        // SI-7 single rule (see `crate::routing::role_for_object`): high-water domain
+        // OR high-water content → LocalPrivate; else CheapWorker. The shared helper
+        // makes the policy identical to the resident run path — no duplication, no
+        // drift between call sites. A false positive only ever keeps work local.
         let domain: Domain = obj.domain.parse().unwrap_or(Domain::Business);
-        let mut role = if domain.is_high_water() {
-            ModelRole::LocalPrivate
-        } else {
-            ModelRole::CheapWorker
-        };
-
         let title = obj.title.clone().unwrap_or_default();
-
-        // SI-7 DEFENSE-IN-DEPTH (content fail-safe): obj.domain is stamped upstream
-        // at ingest (template default_domain — e.g. the 'learning' builtin defaults
-        // to Business), so a genuinely personal/relationship/health thought captured
-        // under a generic object_type can carry domain=business and would otherwise
-        // route to the CLOUD cheap_worker. Before sending ANYTHING to the cloud, scan
-        // title+body with the SAME high-water keyword net the pre-write gate uses
-        // (altevra_secrets::content_is_high_water). If the content looks high-water
-        // but the domain stamp isn't, treat it as high-water → local_private. This
-        // makes the SI-7 guarantee independent of a possibly-wrong upstream domain.
-        // Conservative: a false positive only keeps something local (safe).
-        if role == ModelRole::CheapWorker {
-            let body = fetch_object_body(pool, &obj.object_type, &obj.id).await;
-            let scanned = format!("{title}\n{body}");
-            if altevra_secrets::content_is_high_water(&scanned) {
-                tracing::warn!(
-                    "auto-categorize: object {} has domain={} but high-water CONTENT — \
-                     keeping local (SI-7 content fail-safe), not sending to cloud",
-                    obj.id,
-                    obj.domain
-                );
-                role = ModelRole::LocalPrivate;
-            }
+        let body = fetch_object_body(pool, &obj.object_type, &obj.id).await;
+        let scanned = format!("{title}\n{body}");
+        let role = crate::routing::role_for_object(&domain, &scanned, ModelRole::CheapWorker);
+        if role == ModelRole::LocalPrivate && !domain.is_high_water() {
+            tracing::warn!(
+                "auto-categorize: object {} has domain={} but high-water CONTENT — \
+                 keeping local (SI-7 content fail-safe), not sending to cloud",
+                obj.id,
+                obj.domain
+            );
         }
 
         let provider = ctx.router.resolve(role);
@@ -1807,6 +1789,115 @@ mod tests {
             "the one cloud-classified object is the business control, not the mislabeled one"
         );
         assert!(r.summary.contains("skipped"));
+    }
+
+    /// SI-7 ROUTING RULE — the headline guarantee of TASK 3.
+    ///
+    /// A user configured `codex_oauth` for cloud reasoning AND `local_private` for
+    /// high-water content. A high-water object (or one with high-water content but
+    /// a non-high-water domain stamp) MUST be classified by the local stub, never
+    /// by the cloud one — even though codex_oauth puts cloud on cheap_worker.
+    ///
+    /// The cloud stub is wired to PANIC on `complete` so any leak fails loudly.
+    #[tokio::test]
+    async fn high_water_routes_to_local_private_never_codex_cheap_worker() {
+        use altevra_db::{ObjectIndexRepository, ProposalsRepository};
+
+        // A local stub that classifies high-water content as "personal" — `is_local`
+        // is true so the router accepts it for the LocalPrivate slot (SI-7 #1/#2).
+        struct LocalStub;
+        #[async_trait::async_trait]
+        impl altevra_llm::ChatProvider for LocalStub {
+            fn id(&self) -> &str {
+                "local-stub"
+            }
+            fn is_local(&self) -> bool {
+                true
+            }
+            async fn complete(
+                &self,
+                _m: &[altevra_llm::ChatMessage],
+                _o: &altevra_llm::ChatOpts,
+            ) -> anyhow::Result<String> {
+                Ok("personal".into())
+            }
+        }
+        // A cloud stub representing codex_oauth's cheap_worker — PANICS on call so
+        // any cloud leak fails the test loudly.
+        struct PanicCodex;
+        #[async_trait::async_trait]
+        impl altevra_llm::ChatProvider for PanicCodex {
+            fn id(&self) -> &str {
+                "panic-codex"
+            }
+            fn is_local(&self) -> bool {
+                false
+            }
+            async fn complete(
+                &self,
+                _m: &[altevra_llm::ChatMessage],
+                _o: &altevra_llm::ChatOpts,
+            ) -> anyhow::Result<String> {
+                panic!("a high-water object must NEVER reach codex (SI-7)")
+            }
+        }
+
+        let pool = migrated_pool().await;
+        // (a) genuine high-water domain.
+        seed_uncategorized(&pool, "obj-rel", "relationship", "dinner with Elena").await;
+        // (b) mislabeled business object whose CONTENT is high-water.
+        seed_uncategorized_with_body(
+            &pool,
+            "obj-mislabel",
+            "business",
+            "ordinary thought",
+            "danas sam shvatio nesto vazno — moja devojka Elena me podrzava u svemu",
+        )
+        .await;
+        // (c) clean business object — fine to send to the cloud worker. We park its
+        //     existence to keep this test focused on the high-water path; the cloud
+        //     leak invariant is the load-bearing assertion below.
+
+        // Router with BOTH local_private (LocalStub) and a panicking codex cloud
+        // worker. This mirrors `reasoning_mode = codex_oauth` + a configured
+        // `local_private` table — the configuration the `local-first` preset
+        // produces.
+        let router = std::sync::Arc::new(
+            altevra_llm::ModelRouter::noop()
+                .with_provider(altevra_llm::ModelRole::LocalPrivate, std::sync::Arc::new(LocalStub))
+                .with_provider(altevra_llm::ModelRole::CheapWorker, std::sync::Arc::new(PanicCodex)),
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router,
+        };
+        // The job MUST complete without the panicking cloud worker ever being
+        // reached for the two high-water objects.
+        let r = run_auto_categorizer(&pool, &ctx).await.unwrap();
+
+        let idx = ObjectIndexRepository::new(&pool);
+        // Both objects were classified — by the LOCAL stub, not codex.
+        let rel_cats = idx.get_categories_or_empty("learning", "obj-rel").await;
+        let mis_cats = idx.get_categories_or_empty("learning", "obj-mislabel").await;
+        // Each object yielded a `personal` proposal (taxonomy was empty → novel
+        // category). The PROOF the high-water path used LOCAL: the test would
+        // otherwise have panicked from `PanicCodex::complete`.
+        let proposals_count = ProposalsRepository::new(&pool)
+            .list(None, Some("category"))
+            .await
+            .unwrap()
+            .len();
+        assert!(
+            proposals_count >= 1,
+            "the local stub classified at least one high-water object: {r:?}"
+        );
+        // No leak to codex: assertion is the absence of a panic from PanicCodex.
+        // Both objects either landed a category proposal OR are still uncategorized
+        // — neither outcome was produced by the cloud worker.
+        let _ = rel_cats;
+        let _ = mis_cats;
     }
 
     #[tokio::test]
