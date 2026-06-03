@@ -304,4 +304,49 @@ mod tests {
         .await;
         assert!(err.is_err());
     }
+
+    /// Path to the repo's real `06-skills/` dir, resolved from the crate manifest.
+    fn real_skills_root() -> PathBuf {
+        // crates/altevra-cli/ -> repo root -> 06-skills
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .join("06-skills")
+    }
+
+    /// Every resident mode seeded in migration 027 must resolve to a non-empty
+    /// prompt file (B2: insight/observer/personal_curator/skill_factory_proposer
+    /// were missing their markdown; without it a mode sends an empty system
+    /// message to the LLM).
+    #[tokio::test]
+    async fn all_seeded_modes_resolve_a_nonempty_prompt() {
+        let root = real_skills_root();
+        let seeded = [
+            "memory_curator",
+            "synthesis",
+            "wiki_curator",
+            "daily_briefing",
+            "insight",
+            "observer",
+            "personal_curator",
+            "skill_factory_proposer",
+        ];
+        for mode in seeded {
+            let path = resolve_mode_path(&root, mode)
+                .unwrap_or_else(|| panic!("no prompt file resolves for mode '{mode}'"));
+            let body = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("cannot read prompt for '{mode}'"));
+            assert!(
+                body.contains(&format!("mode: {mode}")),
+                "prompt for '{mode}' must declare `mode: {mode}` in frontmatter"
+            );
+            // Non-trivial body beyond the frontmatter heading.
+            assert!(
+                body.len() > 200,
+                "prompt for '{mode}' is suspiciously short ({} bytes)",
+                body.len()
+            );
+        }
+    }
 }
