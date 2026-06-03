@@ -12,9 +12,10 @@ use altevra_core::updates::{Importance, UpdateFeedItem, UpdatesQuery};
 use altevra_db::{
     create_pool, run_migrations, DecisionIndexEnvelope, DecisionRow, EventsRepository,
     ExposureAudit, ExposureDecisionsRepository, FtsRepository, GoalRow, HookRow, HookRunRow,
-    HooksRepository, InstallationsRepository, InstalledComponentRow, ObjectIndexRepository,
-    ReadStateRepository, ReviewItemRow, SkillRow, SkillsRepository, TaskRow, TasksRepository,
-    ToolInstallationRow, UpdatesRepository, WikiPagesRepository,
+    HooksRepository, InsightCardRow, InsightCardsRepository, InstallationsRepository,
+    InstalledComponentRow, ObjectIndexRepository, ReadStateRepository, ReviewItemRow, SkillRow,
+    SkillsRepository, TaskRow, TasksRepository, ToolInstallationRow, UpdatesRepository,
+    WikiPagesRepository,
 };
 use chrono::{NaiveDate, Utc};
 use uuid::Uuid;
@@ -486,6 +487,49 @@ async fn exposure_decision_written() {
     assert!(request.contains("project"));
 }
 
+/// B4 substrate: an insight card auto-indexes on write (A1 / T-INV14) — it is a
+/// packet candidate (`object_index`) AND full-text searchable (`object_fts`), so
+/// `recall` finds it.
+#[tokio::test]
+async fn insight_card_writes_and_is_recallable() {
+    let pool = fresh_pool().await;
+    let repo = InsightCardsRepository::new(&pool);
+
+    let mut card = InsightCardRow::new(
+        "ic-1",
+        "Late-night coding correlates with next-day rework",
+        "Across the last month, sessions started after 03:00 preceded a 30% rise in same-file edits the following day.",
+    );
+    card.categories = "[\"productivity\"]".into();
+    card.tags = "[\"sleep\",\"productivity\"]".into();
+    repo.insert(&card).await.unwrap();
+
+    // round-trips
+    let got = repo.get("ic-1").await.unwrap().expect("card exists");
+    assert_eq!(got.title, card.title);
+    assert_eq!(repo.count().await.unwrap(), 1);
+
+    // A1: packet candidate in object_index...
+    let idx = ObjectIndexRepository::new(&pool);
+    assert!(
+        idx.candidates(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|c| c.object_type == "insight_card" && c.id == "ic-1"),
+        "insight card must be a packet candidate"
+    );
+    // ...and full-text searchable (recall path).
+    let fts = FtsRepository::new(&pool);
+    assert!(
+        fts.search("late-night rework", 10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|h| h.object_type == "insight_card" && h.object_id == "ic-1"),
+        "insight card must be recallable via FTS"
+    );
+}
 
 /// B3 substrate: `decisions_due_for_review` returns only `active` decisions whose
 /// `review_after` is in the past — the "decision still valid?" daily-briefing seed.

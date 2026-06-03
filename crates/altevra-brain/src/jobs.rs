@@ -205,16 +205,23 @@ pub async fn run_vault_indexer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
     })
 }
 
-/// LLM-powered synthesis. Resolves the `strong_reasoner` role from the router:
+/// LLM-powered synthesis (B4). Resolves the `strong_reasoner` role from the router:
 /// with `delegated` mode (noop) it skips cleanly (connected tool synthesizes over
-/// MCP instead); with a real provider (codex_oauth / api) it produces an insight.
+/// MCP instead); with a real provider (codex_oauth / api) it produces an insight
+/// AND persists it as a durable `insight_card` (migration 020). The card
+/// auto-indexes via the A1 `index_object` path inside [`InsightCardsRepository`],
+/// so `recall` finds it. SI-14: a card is only written when the model returns
+/// non-empty prose; an empty/failed completion writes nothing.
 pub async fn run_insight_synthesizer(
-    _pool: &SqlitePool,
+    pool: &SqlitePool,
     ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
+    use altevra_db::{InsightCardRow, InsightCardsRepository};
     use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
 
     let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+    // StrongReasoner is a non-personal reasoning role (cloud-eligible, SI-7); the
+    // router already forbids personal/local_private from ever reaching the cloud.
     if provider.id() == "noop" {
         return Ok(JobResult {
             summary: "insight synthesis skipped (no LLM configured)".into(),
@@ -233,9 +240,33 @@ pub async fn run_insight_synthesizer(
         .await
     {
         Ok(text) => {
-            let one: String = text.trim().chars().take(240).collect();
+            let body = text.trim().to_string();
+            // SI-14: no real content → no write (validate-then-write).
+            if body.is_empty() {
+                return Ok(JobResult {
+                    summary: format!("insight ({}): empty completion, no card written", provider.id()),
+                    items_processed: 0,
+                });
+            }
+            // Title = first line (truncated); body = full prose.
+            let title: String = body
+                .lines()
+                .next()
+                .unwrap_or(&body)
+                .chars()
+                .take(120)
+                .collect();
+            let id = format!("insight-{}", ctx.now.format("%Y%m%dT%H%M%S"));
+            let mut card = InsightCardRow::new(id, title.clone(), body.clone());
+            // Synthesized over non-personal activity → business domain, internal,
+            // agent-inferred (the constructor default), low-ish confidence.
+            card.categories = "[\"synthesis\"]".into();
+            card.tags = "[\"insight\",\"synthesis\"]".into();
+            InsightCardsRepository::new(pool).insert(&card).await?;
+
+            let one: String = body.chars().take(240).collect();
             Ok(JobResult {
-                summary: format!("insight ({}): {one}", provider.id()),
+                summary: format!("insight card ({}): {one}", provider.id()),
                 items_processed: 1,
             })
         }
@@ -926,6 +957,48 @@ mod tests {
         std::sync::Arc::new(altevra_llm::ModelRouter::noop())
     }
 
+    /// A deterministic stub provider that stands in for a configured (non-noop)
+    /// cloud reasoner — it returns canned prose so the LLM-backed path (card
+    /// write / classification) runs without keys or network. `is_local` is false
+    /// (it represents a cloud provider) so SI-7 routing is exercised honestly:
+    /// the router refuses to use it for `local_private`.
+    struct StubProvider {
+        id: &'static str,
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl altevra_llm::ChatProvider for StubProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn is_local(&self) -> bool {
+            false
+        }
+        async fn complete(
+            &self,
+            _messages: &[altevra_llm::ChatMessage],
+            _opts: &altevra_llm::ChatOpts,
+        ) -> anyhow::Result<String> {
+            Ok(self.reply.clone())
+        }
+    }
+
+    /// A router with a stub cloud provider on a single role.
+    fn router_with_stub(
+        role: altevra_llm::ModelRole,
+        id: &'static str,
+        reply: &str,
+    ) -> std::sync::Arc<altevra_llm::ModelRouter> {
+        std::sync::Arc::new(altevra_llm::ModelRouter::noop().with_provider(
+            role,
+            std::sync::Arc::new(StubProvider {
+                id,
+                reply: reply.to_string(),
+            }),
+        ))
+    }
+
     /// A fully-migrated in-memory db (real schema) for jobs that persist objects.
     async fn migrated_pool() -> SqlitePool {
         let pool = altevra_db::create_pool("sqlite::memory:").await.unwrap();
@@ -1148,6 +1221,57 @@ mod tests {
         assert!(content.contains("generated_by: altevra-brain\n"));
     }
 
+    #[tokio::test]
+    async fn insight_synthesizer_writes_card() {
+        use altevra_db::InsightCardsRepository;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // noop → skipped cleanly, ZERO cards.
+        let pool = migrated_pool().await;
+        let ctx_noop = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: noop_router(),
+        };
+        let r = run_insight_synthesizer(&pool, &ctx_noop).await.unwrap();
+        assert_eq!(r.items_processed, 0);
+        assert!(r.summary.contains("skipped"));
+        assert_eq!(
+            InsightCardsRepository::new(&pool).count().await.unwrap(),
+            0,
+            "noop must write no cards"
+        );
+
+        // stub non-noop StrongReasoner → an insight_card row exists + is recallable.
+        let pool2 = migrated_pool().await;
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: router_with_stub(
+                altevra_llm::ModelRole::StrongReasoner,
+                "stub-reasoner",
+                "Late-night sessions precede a spike in next-day rework.",
+            ),
+        };
+        let r = run_insight_synthesizer(&pool2, &ctx).await.unwrap();
+        assert_eq!(r.items_processed, 1);
+        assert!(r.summary.contains("insight card"));
+
+        let cards = InsightCardsRepository::new(&pool2);
+        assert_eq!(cards.count().await.unwrap(), 1, "exactly one card written");
+
+        // recallable: the card auto-indexed into the FTS substrate (A1).
+        let fts = altevra_db::FtsRepository::new(&pool2);
+        assert!(
+            fts.search("rework", 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|h| h.object_type == "insight_card"),
+            "synthesized card must be recallable"
+        );
+    }
 
 
     #[tokio::test]

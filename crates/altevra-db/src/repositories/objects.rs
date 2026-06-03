@@ -165,6 +165,145 @@ impl<'a> LearningsRepository<'a> {
     }
 }
 
+/// A durable insight-card row (DB-only synthesized insight, migration 020).
+///
+/// Mirrors [`LearningRow`]'s envelope subset. The default provenance is
+/// `agent_inferred` (an insight is synthesized, not a direct Pavle statement)
+/// and the default confidence `medium`.
+#[derive(Debug, Clone)]
+pub struct InsightCardRow {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub status: String,
+    pub domain: String,
+    pub scope: Option<String>,
+    pub sensitivity: String,
+    pub provenance: String,       // JSON
+    pub redaction_status: String, // result of ingest_guard
+    pub categories: String,       // JSON array
+    pub tags: String,             // JSON array
+    pub confidence: String,
+}
+
+impl InsightCardRow {
+    /// Minimal constructor with safe envelope defaults (agent-inferred provenance).
+    pub fn new(id: impl Into<String>, title: impl Into<String>, body: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+            body: body.into(),
+            status: "active".into(),
+            domain: "business".into(),
+            scope: None,
+            sensitivity: "internal".into(),
+            provenance: "{\"origin\":\"agent_inferred\"}".into(),
+            redaction_status: "clean".into(),
+            categories: "[]".into(),
+            tags: "[]".into(),
+            confidence: "medium".into(),
+        }
+    }
+}
+
+pub struct InsightCardsRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+impl<'a> InsightCardsRepository<'a> {
+    pub fn new(pool: &'a SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Insert (or replace) an insight card. `INSERT OR REPLACE` so re-synthesizing
+    /// the same content-id is idempotent. Like [`LearningsRepository::insert`], the
+    /// write immediately populates the retrieval substrate (`object_index` +
+    /// `object_fts`) via [`ObjectIndexRepository::index_object`] (A1 / T-INV14), so
+    /// `recall` finds the card. Caller is responsible for `ingest_guard` upstream
+    /// (TAG-1 / redaction).
+    pub async fn insert(&self, row: &InsightCardRow) -> anyhow::Result<()> {
+        let now = ts_to_text(&Utc::now());
+        sqlx::query(
+            "INSERT OR REPLACE INTO insight_cards \
+             (id, type, title, body, status, domain, scope, sensitivity, provenance, \
+              redaction_status, categories, tags, confidence, created_at, updated_at) \
+             VALUES (?, 'insight_card', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&row.id)
+        .bind(&row.title)
+        .bind(&row.body)
+        .bind(&row.status)
+        .bind(&row.domain)
+        .bind(row.scope.as_deref())
+        .bind(&row.sensitivity)
+        .bind(&row.provenance)
+        .bind(&row.redaction_status)
+        .bind(&row.categories)
+        .bind(&row.tags)
+        .bind(&row.confidence)
+        .bind(&now)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+
+        // A1 / T-INV14: a written card is immediately a packet candidate + full-text
+        // searchable (so `recall` finds it). Same single index-maintenance point as
+        // every other durable write.
+        ObjectIndexRepository::new(self.pool)
+            .index_object(
+                &ObjectIndexRow {
+                    object_type: "insight_card".into(),
+                    id: row.id.clone(),
+                    status: row.status.clone(),
+                    sensitivity: row.sensitivity.clone(),
+                    domain: row.domain.clone(),
+                    scope: row.scope.clone(),
+                    title: Some(row.title.clone()),
+                    categories: row.categories.clone(),
+                    tags: row.tags.clone(),
+                    redaction_status: row.redaction_status.clone(),
+                    updated_at: Utc::now(),
+                },
+                &row.body,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get(&self, id: &str) -> anyhow::Result<Option<InsightCardRow>> {
+        let row = sqlx::query(
+            "SELECT id, title, body, status, domain, scope, sensitivity, provenance, \
+                    redaction_status, categories, tags, confidence \
+             FROM insight_cards WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(|r| InsightCardRow {
+            id: r.get("id"),
+            title: r.get("title"),
+            body: r.get("body"),
+            status: r.get("status"),
+            domain: r.get("domain"),
+            scope: r.get("scope"),
+            sensitivity: r.get("sensitivity"),
+            provenance: r.get("provenance"),
+            redaction_status: r.get("redaction_status"),
+            categories: r.get("categories"),
+            tags: r.get("tags"),
+            confidence: r.get("confidence"),
+        }))
+    }
+
+    /// Count of insight cards (for quick verification/reporting).
+    pub async fn count(&self) -> anyhow::Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM insight_cards")
+            .fetch_one(self.pool)
+            .await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+}
+
 /// A denormalized cross-type index row (the packet compiler's candidate source).
 #[derive(Debug, Clone)]
 pub struct ObjectIndexRow {

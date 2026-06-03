@@ -24,7 +24,10 @@ pub use fts::{FtsHit, FtsRepository, ObjectHit};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
 pub use mentions::{MentionEdge, MentionsRepository};
-pub use objects::{LearningRow, LearningsRepository, ObjectIndexRepository, ObjectIndexRow};
+pub use objects::{
+    InsightCardRow, InsightCardsRepository, LearningRow, LearningsRepository,
+    ObjectIndexRepository, ObjectIndexRow,
+};
 pub use proposals::{
     write_resident_proposals, NewProposal, ProposalRow, ProposalsRepository,
 };
