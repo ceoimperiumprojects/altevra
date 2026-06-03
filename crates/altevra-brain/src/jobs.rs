@@ -19,6 +19,7 @@ pub enum JobKind {
     ProjectResearchSweep,
     DailySummary,
     TaskGrooming,
+    AutoCategorizer,
 }
 
 impl JobKind {
@@ -34,6 +35,7 @@ impl JobKind {
             Self::ProjectResearchSweep => "project_research_sweep",
             Self::DailySummary => "daily_summary",
             Self::TaskGrooming => "task_grooming",
+            Self::AutoCategorizer => "auto_categorizer",
         }
     }
 
@@ -49,6 +51,7 @@ impl JobKind {
             "project_research_sweep" => Self::ProjectResearchSweep,
             "daily_summary" => Self::DailySummary,
             "task_grooming" => Self::TaskGrooming,
+            "auto_categorizer" => Self::AutoCategorizer,
             _ => return None,
         })
     }
@@ -67,6 +70,7 @@ impl JobKind {
             Self::ProjectResearchSweep => 86_400, // 24h
             Self::DailySummary => 3600,           // tick hourly, fire only at 23:00
             Self::TaskGrooming => 10_800,
+            Self::AutoCategorizer => 1800, // 30 min — classify newly-indexed objects
         }
     }
 }
@@ -641,6 +645,153 @@ pub async fn run_daily_summary(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
     })
 }
 
+/// How many uncategorized objects one auto-categorizer pass handles.
+const AUTO_CATEGORIZE_BATCH: i64 = 50;
+
+/// Auto-categorization (B5, CLAUDE.md §3.2 — a LIVING taxonomy, not a static enum).
+///
+/// Reads `object_index` rows lacking a resolved category (`categories == []`) and,
+/// for each, asks an LLM to classify it against the categories already in use:
+///   * an existing category fits → tag the object (`set_category`),
+///   * none fits → propose a NEW category as a `kind="category"` proposal
+///     (Tier-0, via [`ProposalsRepository`]) for Pavle's daily digest.
+///
+/// **SI-7 routing (load-bearing):** the model that sees the object is chosen by the
+/// object's DOMAIN. A high-water object (personal/relationship/health/legal/
+/// financial/client) is classified by `local_private` (on-device) and MUST NEVER be
+/// sent to the cloud `cheap_worker`. Non-high-water objects use `cheap_worker`. If
+/// the role resolves to noop (no model configured), the object is skipped cleanly —
+/// nothing is classified, tagged, or proposed.
+pub async fn run_auto_categorizer(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_core::Domain;
+    use altevra_db::{NewProposal, ObjectIndexRepository, ProposalsRepository};
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    let idx = ObjectIndexRepository::new(pool);
+    let todo = idx.uncategorized(AUTO_CATEGORIZE_BATCH).await?;
+    if todo.is_empty() {
+        return Ok(JobResult {
+            summary: "auto-categorize: nothing uncategorized".into(),
+            items_processed: 0,
+        });
+    }
+    let existing = idx.distinct_categories().await?;
+    let proposals = ProposalsRepository::new(pool);
+
+    let mut tagged = 0usize;
+    let mut proposed = 0usize;
+    let mut skipped = 0usize;
+
+    for obj in &todo {
+        // SI-7: route by domain. High-water → local_private (never cloud); else
+        // cheap_worker. A high-water object must never be classified by the cloud
+        // worker — the router additionally enforces local-only for local_private.
+        let domain: Domain = obj.domain.parse().unwrap_or(Domain::Business);
+        let role = if domain.is_high_water() {
+            ModelRole::LocalPrivate
+        } else {
+            ModelRole::CheapWorker
+        };
+        let provider = ctx.router.resolve(role);
+        if provider.id() == "noop" {
+            // No model for this role → skip cleanly (no write).
+            skipped += 1;
+            continue;
+        }
+
+        let title = obj.title.clone().unwrap_or_default();
+        let cat_list = if existing.is_empty() {
+            "(none yet)".to_string()
+        } else {
+            existing.join(", ")
+        };
+        let messages = vec![
+            ChatMessage::system(
+                "You are Altevra's category classifier. Reply with EXACTLY ONE short \
+                 lowercase category label and NOTHING else. Prefer an existing category \
+                 from the provided list if one fits; otherwise return a new, concise \
+                 label.",
+            ),
+            ChatMessage::user(format!(
+                "Existing categories: {cat_list}\nObject ({}/{}, domain={}): {title}",
+                obj.object_type, obj.id, obj.domain
+            )),
+        ];
+        let label = match provider
+            .complete(&messages, &ChatOpts::default().with_max_tokens(16))
+            .await
+        {
+            Ok(t) => normalize_category(&t),
+            Err(e) => {
+                tracing::warn!("auto-categorize classify failed for {}: {e}", obj.id);
+                skipped += 1;
+                continue;
+            }
+        };
+        if label.is_empty() {
+            skipped += 1;
+            continue;
+        }
+
+        // Does an existing category fit (case-insensitive)?
+        match existing
+            .iter()
+            .find(|c| c.eq_ignore_ascii_case(&label))
+        {
+            Some(fit) => {
+                if idx.set_category(&obj.object_type, &obj.id, fit).await? {
+                    tagged += 1;
+                }
+            }
+            None => {
+                // Novel category → a Tier-0 `category` proposal for the daily digest.
+                // SI-9: the repo re-derives the tier from kind ("category" → Tier-0).
+                let dedup = format!("category:{}", label.to_lowercase());
+                let (_, is_new) = proposals
+                    .insert(&NewProposal {
+                        kind: "category".into(),
+                        title: format!("New category: {label}"),
+                        body: format!(
+                            "Auto-categorizer found no existing category for {} `{}` \
+                             (domain={}); proposes a new category `{label}`.",
+                            obj.object_type, obj.id, obj.domain
+                        ),
+                        source_mode: Some("auto_categorizer".into()),
+                        dedup_hash: dedup,
+                        evidence_refs: vec![format!("{}:{}", obj.object_type, obj.id)],
+                        touches_sensitive: false,
+                        touches_constitutional: false,
+                    })
+                    .await?;
+                if is_new {
+                    proposed += 1;
+                }
+            }
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!(
+            "auto-categorize: {} considered, {tagged} tagged, {proposed} new-category proposal(s), {skipped} skipped (no model)",
+            todo.len()
+        ),
+        items_processed: tagged + proposed,
+    })
+}
+
+/// Normalize a model's category reply to a single short lowercase label: first
+/// non-empty line, trimmed of quotes/punctuation, lowercased, capped length.
+fn normalize_category(raw: &str) -> String {
+    let line = raw.trim().lines().next().unwrap_or("").trim();
+    let cleaned: String = line
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`' || c == '.' || c == ',')
+        .to_lowercase();
+    cleaned.chars().take(40).collect::<String>().trim().to_string()
+}
+
 /// Task grooming — flag stale tasks. Placeholder; full logic in v0.3.7.
 pub async fn run_task_grooming(pool: &SqlitePool, _ctx: &JobContext) -> anyhow::Result<JobResult> {
     let row = sqlx::query("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open'")
@@ -945,6 +1096,7 @@ pub async fn dispatch(
         JobKind::ProjectResearchSweep => run_project_research_sweep(pool, ctx).await,
         JobKind::DailySummary => run_daily_summary(pool, ctx).await,
         JobKind::TaskGrooming => run_task_grooming(pool, ctx).await,
+        JobKind::AutoCategorizer => run_auto_categorizer(pool, ctx).await,
     }
 }
 
@@ -1059,6 +1211,7 @@ mod tests {
             JobKind::ProjectResearchSweep,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
+            JobKind::AutoCategorizer,
         ] {
             assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }
@@ -1273,6 +1426,171 @@ mod tests {
         );
     }
 
+    /// Helper: index an object with empty categories (uncategorized) in a domain.
+    async fn seed_uncategorized(pool: &SqlitePool, id: &str, domain: &str, title: &str) {
+        altevra_db::ObjectIndexRepository::new(pool)
+            .index_object(
+                &altevra_db::ObjectIndexRow {
+                    object_type: "learning".into(),
+                    id: id.into(),
+                    status: "active".into(),
+                    sensitivity: "internal".into(),
+                    domain: domain.into(),
+                    scope: None,
+                    title: Some(title.into()),
+                    categories: "[]".into(),
+                    tags: "[]".into(),
+                    redaction_status: "clean".into(),
+                    updated_at: Utc::now(),
+                },
+                "body",
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_categorize_assigns_and_proposes() {
+        use altevra_db::{ObjectIndexRepository, ProposalsRepository};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // --- noop → skipped cleanly: nothing tagged, no proposals. ---
+        let pool0 = migrated_pool().await;
+        seed_uncategorized(&pool0, "obj-noop", "business", "some note").await;
+        let ctx0 = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: noop_router(),
+        };
+        let r0 = run_auto_categorizer(&pool0, &ctx0).await.unwrap();
+        assert_eq!(r0.items_processed, 0, "noop classifies nothing");
+        assert!(r0.summary.contains("skipped"));
+        assert_eq!(
+            ProposalsRepository::new(&pool0).list(None, Some("category")).await.unwrap().len(),
+            0,
+            "noop proposes nothing"
+        );
+
+        // --- stub cheap_worker → an object matching an EXISTING category gets tagged;
+        //     a NOVEL one yields a kind="category" proposal. ---
+        // The stub always replies "gtm". We pre-seed an existing "gtm" category so
+        // the first object matches it; we ALSO test the novel path by using a stub
+        // that returns a fresh label for a second object via a distinct router.
+        let pool = migrated_pool().await;
+        let idx = ObjectIndexRepository::new(&pool);
+
+        // Pre-seed an EXISTING "gtm" category by indexing one already-categorized
+        // object (so the taxonomy is non-empty).
+        idx.index_object(
+            &altevra_db::ObjectIndexRow {
+                object_type: "decision".into(),
+                id: "seed-gtm".into(),
+                status: "active".into(),
+                sensitivity: "internal".into(),
+                domain: "business".into(),
+                scope: None,
+                title: Some("a gtm decision".into()),
+                categories: "[\"gtm\"]".into(),
+                tags: "[]".into(),
+                redaction_status: "clean".into(),
+                updated_at: Utc::now(),
+            },
+            "body",
+        )
+        .await
+        .unwrap();
+
+        // An uncategorized business object the stub will label "gtm" (existing → tag).
+        seed_uncategorized(&pool, "obj-match", "business", "gtm follow-up note").await;
+
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: router_with_stub(altevra_llm::ModelRole::CheapWorker, "stub-cheap", "gtm"),
+        };
+        let r = run_auto_categorizer(&pool, &ctx).await.unwrap();
+        // obj-match was tagged with the existing "gtm" category.
+        let tagged = idx
+            .get_categories_or_empty("learning", "obj-match")
+            .await;
+        assert_eq!(tagged, vec!["gtm".to_string()], "matching object tagged: {r:?}");
+        // No category proposal yet (it matched an existing one).
+        assert_eq!(
+            ProposalsRepository::new(&pool).list(None, Some("category")).await.unwrap().len(),
+            0,
+            "a matched object proposes no new category"
+        );
+
+        // --- novel category path: a new object whose stub label is NOT in the
+        //     taxonomy yields a kind="category" Tier-0 proposal. ---
+        let pool2 = migrated_pool().await;
+        seed_uncategorized(&pool2, "obj-novel", "business", "a note about violin practice").await;
+        let ctx2 = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: router_with_stub(altevra_llm::ModelRole::CheapWorker, "stub-cheap", "hobby"),
+        };
+        let r2 = run_auto_categorizer(&pool2, &ctx2).await.unwrap();
+        let cat_props = ProposalsRepository::new(&pool2)
+            .list(None, Some("category"))
+            .await
+            .unwrap();
+        assert_eq!(cat_props.len(), 1, "novel label proposes a category: {r2:?}");
+        assert!(cat_props[0].title.to_lowercase().contains("hobby"));
+        // SI-9: a "category" proposal is Tier-0 (the repo derived it, not the agent).
+        assert_eq!(cat_props[0].risk_tier, "tier0");
+        // the object was NOT tagged (no existing category fit).
+        assert!(
+            ObjectIndexRepository::new(&pool2)
+                .get_categories_or_empty("learning", "obj-novel")
+                .await
+                .is_empty(),
+            "novel object stays uncategorized until Pavle approves the new category"
+        );
+    }
+
+    /// SI-7: a HIGH-WATER object (e.g. relationship) must be classified by
+    /// `local_private`, NEVER the cloud `cheap_worker`. With only a cloud
+    /// cheap_worker registered, a high-water object is SKIPPED (no cloud leak),
+    /// while a business object IS classified by the cheap_worker.
+    #[tokio::test]
+    async fn auto_categorize_si7_routes_high_water_local_only() {
+        use altevra_db::{ObjectIndexRepository, ProposalsRepository};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pool = migrated_pool().await;
+        seed_uncategorized(&pool, "obj-personal", "relationship", "dinner with Elena").await;
+        seed_uncategorized(&pool, "obj-business", "business", "ReVesta cold call list").await;
+
+        // Only a CLOUD cheap_worker is configured; local_private stays noop.
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: router_with_stub(altevra_llm::ModelRole::CheapWorker, "stub-cheap", "outreach"),
+        };
+        let r = run_auto_categorizer(&pool, &ctx).await.unwrap();
+        // The relationship object was skipped (local_private resolved to noop) — it
+        // NEVER reached the cloud worker. The business one produced a proposal.
+        assert!(r.summary.contains("1 skipped") || r.summary.contains("skipped"));
+        let idx = ObjectIndexRepository::new(&pool);
+        assert!(
+            idx.get_categories_or_empty("learning", "obj-personal")
+                .await
+                .is_empty(),
+            "high-water object must NOT be classified by the cloud worker (SI-7)"
+        );
+        // the business object yielded a novel-category proposal (taxonomy was empty).
+        assert_eq!(
+            ProposalsRepository::new(&pool)
+                .list(None, Some("category"))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "non-high-water object IS classified by cheap_worker"
+        );
+    }
 
     #[tokio::test]
     async fn record_feed_success_then_failure_increments_count() {

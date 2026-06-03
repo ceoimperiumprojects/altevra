@@ -93,6 +93,7 @@ impl BrainScheduler {
             JobKind::ProjectResearchSweep,
             JobKind::DailySummary,
             JobKind::TaskGrooming,
+            JobKind::AutoCategorizer,
         ] {
             if self.config.disabled.iter().any(|d| d == kind.as_str()) {
                 continue;
@@ -364,6 +365,7 @@ mod tests {
                 "github_trending_fetch".into(),
                 "project_research_sweep".into(),
                 "task_grooming".into(),
+                "auto_categorizer".into(),
             ],
             ..BrainConfig::default()
         };

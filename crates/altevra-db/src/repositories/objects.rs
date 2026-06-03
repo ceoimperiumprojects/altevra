@@ -417,6 +417,85 @@ impl<'a> ObjectIndexRepository<'a> {
             .collect())
     }
 
+    /// Non-forgotten index rows whose `categories` is still the empty array `[]`
+    /// (no resolved category yet) — the AutoCategorizer's work queue (B5,
+    /// CLAUDE.md §3.2). Newest first; `limit` caps a batch.
+    pub async fn uncategorized(&self, limit: i64) -> anyhow::Result<Vec<ObjectIndexRow>> {
+        let rows = sqlx::query(
+            "SELECT type, id, status, sensitivity, domain, scope, title, categories, tags, redaction_status, updated_at \
+             FROM object_index \
+             WHERE status != 'forgotten' AND TRIM(categories) IN ('[]', '') \
+             ORDER BY updated_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_index).collect())
+    }
+
+    /// The set of distinct categories already in use across the index (the living
+    /// taxonomy the classifier matches against). Flattens each row's JSON
+    /// `categories` array; sorted + deduped. Empty arrays contribute nothing.
+    pub async fn distinct_categories(&self) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT categories FROM object_index WHERE status != 'forgotten'",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        let mut out: Vec<String> = Vec::new();
+        for r in rows {
+            let raw: String = r.get("categories");
+            if let Ok(cats) = serde_json::from_str::<Vec<String>>(&raw) {
+                for c in cats {
+                    let c = c.trim().to_string();
+                    if !c.is_empty() && !out.contains(&c) {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Tag one object with a resolved category (B5). Sets `object_index.categories`
+    /// to the JSON array `[category]` and bumps `updated_at`. Does NOT touch the FTS
+    /// body (the category is index metadata, not searchable prose). Returns true if
+    /// a row was updated.
+    pub async fn set_category(
+        &self,
+        object_type: &str,
+        id: &str,
+        category: &str,
+    ) -> anyhow::Result<bool> {
+        let cats = serde_json::to_string(&vec![category])?;
+        let now = ts_to_text(&Utc::now());
+        let res = sqlx::query(
+            "UPDATE object_index SET categories = ?, updated_at = ? WHERE type = ? AND id = ?",
+        )
+        .bind(&cats)
+        .bind(&now)
+        .bind(object_type)
+        .bind(id)
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// The parsed `categories` array for one object (empty if absent/unparseable).
+    /// Convenience for verifying a tag write (B5).
+    pub async fn get_categories_or_empty(&self, object_type: &str, id: &str) -> Vec<String> {
+        let row = sqlx::query("SELECT categories FROM object_index WHERE type = ? AND id = ?")
+            .bind(object_type)
+            .bind(id)
+            .fetch_optional(self.pool)
+            .await
+            .ok()
+            .flatten();
+        row.and_then(|r| serde_json::from_str::<Vec<String>>(&r.get::<String, _>("categories")).ok())
+            .unwrap_or_default()
+    }
+
     /// Candidate rows for packet compilation, optionally filtered by domain.
     /// (The ExposureGate does the actual ceiling/scope filtering downstream.)
     pub async fn candidates(&self, domain: Option<&str>) -> anyhow::Result<Vec<ObjectIndexRow>> {
@@ -436,22 +515,23 @@ impl<'a> ObjectIndexRepository<'a> {
             .fetch_all(self.pool)
             .await?
         };
-        Ok(rows
-            .into_iter()
-            .map(|r| ObjectIndexRow {
-                object_type: r.get("type"),
-                id: r.get("id"),
-                status: r.get("status"),
-                sensitivity: r.get("sensitivity"),
-                domain: r.get("domain"),
-                scope: r.get("scope"),
-                title: r.get("title"),
-                categories: r.get("categories"),
-                tags: r.get("tags"),
-                redaction_status: r.get("redaction_status"),
-                updated_at: crate::util::ts_from_text(r.get::<String, _>("updated_at")),
-            })
-            .collect())
+        Ok(rows.into_iter().map(row_to_index).collect())
+    }
+}
+
+fn row_to_index(r: sqlx::sqlite::SqliteRow) -> ObjectIndexRow {
+    ObjectIndexRow {
+        object_type: r.get("type"),
+        id: r.get("id"),
+        status: r.get("status"),
+        sensitivity: r.get("sensitivity"),
+        domain: r.get("domain"),
+        scope: r.get("scope"),
+        title: r.get("title"),
+        categories: r.get("categories"),
+        tags: r.get("tags"),
+        redaction_status: r.get("redaction_status"),
+        updated_at: crate::util::ts_from_text(r.get::<String, _>("updated_at")),
     }
 }
 

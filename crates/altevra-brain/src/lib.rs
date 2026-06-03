@@ -8,6 +8,7 @@
 //!   * research_fetcher (every 2 h)
 //!   * daily_summary (once/day @ 23:00)
 //!   * task_grooming (every 3 h)
+//!   * auto_categorizer (every 30 min)
 //!
 //! Each job records its start/end/error in `brain_jobs`. The scheduler is
 //! cooperative: jobs that fail just log and continue; one slow job does not
