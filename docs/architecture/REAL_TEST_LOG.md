@@ -2,6 +2,39 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-03 (Faza A) — retrieval temelj: sve pretraživo + R5 audit ✅ PASS
+
+Workflow-orchestrated (implement write-side → read-side, then 4-lens adversarial verify) +
+parent full-baseline verify. Baseline 790 → **801 tests / 0 fail**; clippy
+`--workspace --all-targets -D warnings` clean (incl. `--features embedding`); fmt. 9 local
+commits, pushed to origin/altevra-overnight-p0.
+
+- **A1 — all durable writers → guard+index** (`fc9da9f`): DecisionsRepository
+  (`save_decision_indexed`) + WikiPagesRepository (`upsert_indexed`) + memory-lane
+  (`guard_document`/`fts_index_chunk`) now route the redaction verdict → object_index +
+  object_fts. Fail-closed: only `clean`/`redacted` index; unscanned/empty never enters
+  (TAG-1). Wiki CLI `list --sync` wired to `upsert_indexed` (`e7557b2`) so synced pages
+  are recallable (fail-closed on credential-class).
+- **A2 — ExposureDecisionsRepository** (`268038b`): R5 content-free audit (counts +
+  by_reason map; NO object ids/titles — §2.13 no-existence-leak). Emitted on every MCP
+  packet compile. Migration left byte-identical (sqlx checksum on live DB); contract
+  documented in repo source (`c10402e`).
+- **A3 — PacketCompiler BM25+graph fusion** (`b9f6984`): relevance =
+  `0.25*bm25 + 0.45*tag + 0.15*graph + 0.15*recency`. bm25 rank-normalized (byte-equal
+  across SQLite versions), graph = mentions-edge overlap to FTS anchors. Compiler stays
+  db-free (signals precomputed in `altevra-mcp::packet_build`); gates strictly before rank;
+  id tie-break for determinism. Comment fixed to 0.45 (`4f6da82`).
+- **A4 — CLI context ↔ MCP parity** (`d29cf17`): both surfaces call one
+  `compile_gated_packet`; `context_packet_parity` drives BOTH real shapers and asserts a
+  byte-equal packet (`85d6522`) so a future single-surface divergence fails.
+- **Decision-label fix** (`9459f15`): atomized decisions recall as `decision`, not `learning`.
+
+**LIVE on REAL `~/Obsidian/Imperium/Memory/Decisions.md`** (read-only copy; vault byte-identical,
+sha256 verified before/after): 34 decisions atomized; `recall "validated under 20 numbers"` →
+the real DECISION returned (pre-A1 invisible — only learnings were indexed). 4-lens adversarial
+verify all PASS: baseline/test, SI-7/leak (planted secret grep-absent from the whole DB file),
+determinism/R12, real-data recall.
+
 ## 2026-06-02 (session 9) — `recall_about` MCP tool: entity graph over MCP ✅ PASS
 
 Made the mention graph UNIVERSAL — Claude Code / Cursor / Codex (not just the CLI)

@@ -3,6 +3,21 @@
 > Live task tracker for the autonomous run. Top = morning handoff summary. Below = per-task log.
 > Authority: `OVERNIGHT_GOAL.md` + `RECONCILIATION.md` (R1–R14) + `BUILD_TASKS.md`.
 
+## ROAD-TO-DONE FAZA A — retrieval temelj DONE (2026-06-03)
+
+Plan `~/.claude/plans/giggly-humming-ullman.md` (A→F: temelj→pamet→self-improve→skill
+factory→integracija→Pavlovi blokeri). Faza A closes the "half the brain is invisible to
+search" gap. Workflow-orchestrated (implement + 4-lens adversarial verify) + parent full
+baseline. **790 → 801 tests / 0 fail**, clippy `--all-targets -D` clean (incl. embedding).
+
+- A1 decisions/wiki/memory writers → guard+index (fail-closed); wiki CLI `--sync` indexes.
+- A2 ExposureDecisionsRepository — R5 content-free audit on every packet compile.
+- A3 PacketCompiler bm25+graph fusion (db-free, rank-normalized, deterministic).
+- A4 CLI context ↔ MCP single `compile_gated_packet` (INV-14 parity, both-shaper test).
+- Live on real Decisions.md: decisions now recallable (were invisible pre-A1); vault untouched.
+
+9 commits `fc9da9f..` on altevra-overnight-p0. **NEXT: Faza B (upali pamet — codex_oauth).**
+
 ## 🛑 R11 SAFETY GATE — found leaks, fixed them (2026-06-01 afternoon)
 
 **The "P0.1 core done / leak suites = 0" claim was only true for the tested fixtures.**
