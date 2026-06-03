@@ -13,7 +13,10 @@
 //! Codex/Cursor schemas are similar enough — we read common fields (`prompt`,
 //! `tool_name`, `command`, `content`) defensively.
 
-use altevra_db::{create_pool, run_migrations, SessionRow, SessionsRepository, TurnRow};
+use altevra_db::{
+    create_pool, run_migrations, signal_for_session, ImprovementSignalsRepository, SessionRow,
+    SessionsRepository, TurnRow,
+};
 use altevra_secrets::{auto_capture, guard_text, SecretStore};
 use chrono::Utc;
 use clap::Args;
@@ -62,7 +65,7 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
 
     match args.event.as_str() {
         "session_start" => handle_session_start(&repo, &args, &payload).await?,
-        "session_end" | "stop" => handle_session_end(&repo, &args, &payload).await?,
+        "session_end" | "stop" => handle_session_end(&pool, &repo, &args, &payload).await?,
         "user_prompt_submit" => handle_user_prompt(&repo, &args, &payload).await?,
         "post_tool_use" => handle_post_tool_use(&repo, &args, &payload).await?,
         "pre_tool_use" => handle_pre_tool_use(&repo, &args, &payload).await?,
@@ -101,6 +104,7 @@ async fn handle_session_start(
 }
 
 async fn handle_session_end(
+    pool: &sqlx::SqlitePool,
     repo: &SessionsRepository<'_>,
     _args: &HookHandleArgs,
     payload: &serde_json::Value,
@@ -111,10 +115,43 @@ async fn handle_session_end(
         .map(String::from);
     if let Some(id) = read_current_session()? {
         repo.end_session(id, summary.as_deref()).await?;
+        // Real-time self-improve producer (C1): one cheap improvement_signal per
+        // session ingest — the orchestrator (a later seam) clusters open signals
+        // into proposals. SI-6 self-write exclusion: a resident-mode-authored
+        // session enqueues NOTHING (signal_for_session returns None), so
+        // Altevra's own output never feeds the loop back into itself. Best-effort:
+        // a signal-enqueue failure must NOT block closing the session.
+        enqueue_session_signal(pool, repo, id).await;
         clear_current_session()?;
         println!("{{\"closed_session\":\"{id}\"}}");
     }
     Ok(())
+}
+
+/// Enqueue the per-session improvement signal (C1 producer). Reads the closed
+/// session's provenance (`tool`/`project`/`turn_count`) and asks the pure
+/// [`signal_for_session`] producer for a signal — which is `None` when SI-6
+/// excludes a resident-authored session. Best-effort: any error is logged to
+/// stderr and swallowed so the hook never fails the agent's session close.
+async fn enqueue_session_signal(pool: &sqlx::SqlitePool, repo: &SessionsRepository<'_>, id: Uuid) {
+    let session = match repo.get_session(id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("[altevra] signal enqueue skipped (session lookup failed): {e}");
+            return;
+        }
+    };
+    // SI-6 is enforced inside signal_for_session: resident-authored → None.
+    let Some(new_signal) =
+        signal_for_session(&id.to_string(), &session.tool, session.project_name.as_deref(), session.turn_count)
+    else {
+        return;
+    };
+    let signals = ImprovementSignalsRepository::new(pool);
+    if let Err(e) = signals.insert(&new_signal).await {
+        eprintln!("[altevra] improvement_signal enqueue failed (non-fatal): {e}");
+    }
 }
 
 async fn handle_user_prompt(
@@ -379,6 +416,114 @@ fn clear_current_session() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Seed a closed session row with a given tool + turn count, returning its id.
+    async fn seed_session(
+        pool: &sqlx::SqlitePool,
+        tool: &str,
+        project: Option<&str>,
+        turns: i64,
+    ) -> Uuid {
+        let repo = SessionsRepository::new(pool);
+        let id = Uuid::new_v4();
+        repo.start_session(&SessionRow {
+            id,
+            tool: tool.to_string(),
+            project_id: None,
+            project_name: project.map(String::from),
+            started_at: Utc::now(),
+            ended_at: None,
+            summary: None,
+            tokens_in_total: 0,
+            tokens_out_total: 0,
+            cost_usd_estimate: 0.0,
+            turn_count: 0,
+            metadata: serde_json::json!({}),
+            external_id: None,
+            imported_from: None,
+        })
+        .await
+        .unwrap();
+        for i in 0..turns {
+            repo.record_turn(&TurnRow {
+                id: Uuid::new_v4(),
+                session_id: id,
+                turn_idx: i,
+                role: "user".into(),
+                content: format!("turn {i}"),
+                tool_calls: None,
+                tool_name: None,
+                model: None,
+                tokens_in: None,
+                tokens_out: None,
+                latency_ms: None,
+                file_changes: None,
+                redacted_count: 0,
+                source_tool: Some(tool.to_string()),
+                sensitivity: altevra_core::Sensitivity::Internal.to_string(),
+                redaction_status: altevra_core::status::RedactionStatus::Clean.to_string(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        }
+        repo.end_session(id, None).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn session_ingest_enqueues_exactly_one_signal() {
+        // C1 producer: a real external-tool session ingest enqueues exactly ONE
+        // improvement_signal; running the producer again is idempotent (no 2nd row).
+        let tmp = TempDir::new().unwrap();
+        let pool = create_pool(&tmp.path().join("a.db").to_string_lossy())
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let repo = SessionsRepository::new(&pool);
+        let id = seed_session(&pool, "claude-code", Some("altevra"), 3).await;
+
+        enqueue_session_signal(&pool, &repo, id).await;
+        let signals = ImprovementSignalsRepository::new(&pool);
+        let open = signals.list_open().await.unwrap();
+        assert_eq!(open.len(), 1, "exactly one signal per session ingest");
+        assert_eq!(open[0].kind, "session_ingest");
+        assert_eq!(open[0].source_ref, format!("session:{id}"));
+        assert_eq!(
+            open[0].cluster_key.as_deref(),
+            Some("session:claude-code:altevra")
+        );
+
+        // Idempotent: re-running the producer for the same session does NOT add a
+        // second row (stable dedup id).
+        enqueue_session_signal(&pool, &repo, id).await;
+        assert_eq!(
+            signals.list_open().await.unwrap().len(),
+            1,
+            "producer re-run is idempotent"
+        );
+    }
+
+    #[tokio::test]
+    async fn resident_authored_session_enqueues_no_signal_si6() {
+        // SI-6: a session authored by a resident mode must NEVER become a signal
+        // (no self-feedback loop). The producer enqueues ZERO rows for it.
+        let tmp = TempDir::new().unwrap();
+        let pool = create_pool(&tmp.path().join("b.db").to_string_lossy())
+            .await
+            .unwrap();
+        run_migrations(&pool).await.unwrap();
+        let repo = SessionsRepository::new(&pool);
+        let id = seed_session(&pool, "resident:observer", None, 2).await;
+
+        enqueue_session_signal(&pool, &repo, id).await;
+        let signals = ImprovementSignalsRepository::new(&pool);
+        assert_eq!(
+            signals.list_open().await.unwrap().len(),
+            0,
+            "SI-6: resident-authored session enqueues nothing"
+        );
+    }
 
     #[tokio::test]
     async fn session_start_writes_pointer_file() {

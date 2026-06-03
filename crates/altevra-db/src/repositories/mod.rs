@@ -4,6 +4,7 @@ pub mod events;
 pub mod exposure;
 pub mod fts;
 pub mod hooks;
+pub mod improvement_signals;
 pub mod installations;
 pub mod mentions;
 pub mod objects;
@@ -22,6 +23,10 @@ pub use events::EventsRepository;
 pub use exposure::{ExposureAudit, ExposureDecisionsRepository};
 pub use fts::{FtsHit, FtsRepository, ObjectHit};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
+pub use improvement_signals::{
+    is_resident_authored, signal_for_session, ImprovementSignalsRepository, NewSignal,
+    SignalCluster, SignalRow,
+};
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
 pub use mentions::{MentionEdge, MentionsRepository};
 pub use objects::{
