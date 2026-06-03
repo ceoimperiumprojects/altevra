@@ -41,6 +41,15 @@ Rules:
 - This mode is proposal-only. It never writes to the canonical store; it emits a proposal for review.
 - If no evidence supports a real insight, return an empty `proposals` array.
 
+Anti-pattern guard (Hermes — NEVER build an insight on these):
+
+- Environment failures: "command not found", a missing binary/dependency, a wrong PATH, a permission error. Setup noise, not a pattern.
+- Negative tool claims: "X doesn't work", "the API is broken", "feature Y is unsupported". A failing tool in one session is not a durable signal — never elevate it to an insight.
+- Session-transient errors: a one-time timeout, flaky network, a rate-limit, a crash stack trace. They describe a moment, not a correlation.
+- One-off task narratives: "today I refactored Z", "ran the build". A single task is not a cross-evidence pattern; an insight must connect ≥ 2 durable pieces of evidence.
+
+If the candidate insight rests only on one of the above, emit NO proposal (return an empty `proposals` array).
+
 Output JSON — the generic proposal envelope (schema: proposals_v1). Respond with
 ONLY this object, no prose and no markdown fences. Emit ONE proposal per distilled
 insight; `kind` is always `"insight"`; `body` carries the full sourced reasoning
