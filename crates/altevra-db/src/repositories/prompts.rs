@@ -61,6 +61,22 @@ impl<'a> PromptsRepository<'a> {
         Ok(rows.into_iter().map(row_to_record).collect())
     }
 
+    /// Is the slug constitutional-locked (SI-2)? A cheap existence probe for the
+    /// firewall belt-and-suspenders path: the orchestrator pre-resolves this for a
+    /// `prompt` candidate so [`firewall_check`] can deny a locked target with
+    /// `ConstitutionalLock` BEFORE the registry (`mint_plan`/`try_auto_activate`,
+    /// the deeper SI-2 backstop) is ever consulted. Any locked row for the name —
+    /// active or not — locks the whole slug, mirroring the registry's own check.
+    ///
+    /// [`firewall_check`]: altevra_core::selfimprove::firewall_check
+    pub async fn is_locked(&self, name: &str) -> anyhow::Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM prompts WHERE name = ? AND locked = 1 LIMIT 1")
+            .bind(name)
+            .fetch_optional(self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
     /// The single active row for a slug, if any (SI-8 → at most one).
     pub async fn active(&self, name: &str) -> anyhow::Result<Option<PromptRecord>> {
         let row = sqlx::query(

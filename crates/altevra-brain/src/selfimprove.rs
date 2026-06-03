@@ -26,6 +26,12 @@
 //!   * **SI-10 self-modify gate** — a prompt candidate only self-activates through
 //!     [`PromptsRepository::try_auto_activate`], which runs no SQL unless a passing
 //!     `prompt_eval_results` row exists.
+//!   * **Locked-prompt belt-and-suspenders** — a `kind="prompt"` candidate whose
+//!     title resolves to a constitutional-locked slug (safety / altevra_rules) is
+//!     marked `targets_locked` (the caller pre-resolves
+//!     [`PromptsRepository::is_locked`]), so [`firewall_check`] denies it with
+//!     `ConstitutionalLock` BEFORE the registry is even consulted — the registry's
+//!     SI-2 refusal is the deeper backstop, no longer a single point of defense.
 //!
 //! [`derive_risk_tier`]: altevra_core::selfimprove::derive_risk_tier
 //! [`try_auto_activate`]: altevra_db::PromptsRepository::try_auto_activate
@@ -162,17 +168,34 @@ impl SelfImproveReport {
 /// IGNORING any tier already stored on the row (SI-9). `is_auto_apply` reflects the
 /// aggressive intent: Tier-0 low-risk kinds and non-locked prompt self-modifies want
 /// to auto-apply; everything else is recorded, not applied.
-fn action_for(row: &ProposalRow, shadow_eval_passed: Option<bool>) -> ProposedAction {
+///
+/// `slug_is_locked` is the belt-and-suspenders input the caller pre-resolves for a
+/// `prompt` candidate (the slug its title targets is constitutional-locked, SI-2).
+/// Folding it into `touches_constitutional` makes the FIREWALL deny a locked-prompt
+/// target with `ConstitutionalLock` — so the lock holds at the gate, not only in the
+/// deeper [`PromptsRepository::try_auto_activate`] registry path. Pure: the caller
+/// resolves the lookup; this stays a synchronous field-only mapping.
+fn action_for(
+    row: &ProposalRow,
+    shadow_eval_passed: Option<bool>,
+    slug_is_locked: bool,
+) -> ProposedAction {
     // SI-9: never trust row.risk_tier — re-derive from the structured kind. The
-    // constitutional/sensitive inputs come from the kind itself.
-    let touches_constitutional = is_constitutional_kind(&row.kind);
+    // constitutional/sensitive inputs come from the kind itself, PLUS (for a prompt)
+    // whether the slug its title resolves to is a locked layer — so a `kind="prompt"`
+    // whose title targets "safety"/"altevra_rules" is constitutional even though its
+    // KIND alone is not (the firewall belt to the registry's suspenders, SI-2).
+    let touches_constitutional =
+        is_constitutional_kind(&row.kind) || (row.kind == "prompt" && slug_is_locked);
     let touches_sensitive = is_sensitive_kind(&row.kind);
 
     // A NON-locked prompt self-modify is the aggressive Tier-0 auto path GATED by the
     // firewall's SI-10 shadow-eval check (check #8) — exactly as the firewall models a
     // prompt change. (The prompt-registry `try_auto_activate` is the deeper SI-2/SI-10
     // backstop that actually runs the activate transaction.) A prompt targeting a
-    // constitutional-locked layer stays constitutional → Tier-2, never auto-applies.
+    // constitutional-locked layer is now constitutional HERE (slug_is_locked folded
+    // into touches_constitutional above) → the `else` branch → Tier-2, so the firewall
+    // denies it (ConstitutionalLock) without relying on the registry being consulted.
     let tier = if row.kind == "prompt" && !touches_constitutional {
         RiskTier::Tier0
     } else {
@@ -190,7 +213,8 @@ fn action_for(row: &ProposalRow, shadow_eval_passed: Option<bool>) -> ProposedAc
         risk_tier: tier,
         is_auto_apply,
         // A prompt (or anything) targeting a constitutional-locked layer is caught
-        // here; the prompt registry's SI-2 lock is the deeper backstop.
+        // by the FIREWALL here (touches_constitutional folds in slug_is_locked); the
+        // prompt registry's SI-2 lock is the deeper backstop, no longer the only one.
         targets_locked: touches_constitutional,
         // Real-time cooldown/dedup is upstream (the proposal dedup_hash merges
         // repeats); the firewall's per-window budget + circuit breaker do the
@@ -428,15 +452,24 @@ async fn apply_candidate(
     limits: &FirewallLimits,
     state: &FirewallState,
 ) -> anyhow::Result<ApplyOutcome> {
-    // A prompt candidate needs its shadow-eval verdict for the firewall's SI-10 gate.
-    // (We load the latest eval for the active→candidate version pair.)
-    let shadow_eval_passed = if row.kind == "prompt" {
-        prompt_shadow_eval_passed(pool, row).await
+    // A prompt candidate needs its shadow-eval verdict for the firewall's SI-10 gate
+    // (the latest eval for the active→candidate version pair), AND whether the slug
+    // its title targets is constitutional-locked (SI-2). Pre-resolving the lock here
+    // — where the pool is in hand — lets the FIREWALL deny a locked-prompt target
+    // BEFORE the registry is consulted, so the lock is belt-and-suspenders, not a
+    // single point of defense in `try_auto_activate`.
+    let (shadow_eval_passed, slug_is_locked) = if row.kind == "prompt" {
+        let slug = prompt_slug_for(row);
+        let locked = PromptsRepository::new(pool)
+            .is_locked(&slug)
+            .await
+            .unwrap_or(true); // fail-safe: a failed lock probe treats the slug as locked.
+        (prompt_shadow_eval_passed(pool, row).await, locked)
     } else {
-        None
+        (None, false)
     };
 
-    let action = action_for(row, shadow_eval_passed);
+    let action = action_for(row, shadow_eval_passed, slug_is_locked);
 
     // STAGE 4 — the FIRST real firewall caller.
     let verdict = firewall_check(limits, state, &action);
@@ -736,6 +769,55 @@ mod tests {
             2,
             "a passing shadow eval lets the prompt self-modify (SI-10)"
         );
+    }
+
+    #[tokio::test]
+    async fn self_improve_locked_prompt_denied_by_firewall_not_only_registry() {
+        let _g = LOOP_LOCK.lock().await;
+        let pool = migrated_pool().await;
+        // `safety` is seeded constitutional-locked (migration 028). A `kind="prompt"`
+        // candidate whose TITLE resolves to that locked slug must be denied by the
+        // FIREWALL (ConstitutionalLock), not merely by the deeper registry refusal.
+        let locked_prompt = seed_proposed(&pool, "prompt", "safety", "c:locked-prompt").await;
+
+        // Record a PASSING shadow eval for the candidate version. If the loop reached
+        // the registry's `try_auto_activate`, only SI-2 (registry) would stop it; this
+        // proves the FIREWALL stops it FIRST — a passing eval cannot open the path.
+        let prompts = PromptsRepository::new(&pool);
+        let candidate_version = prompts.active("safety").await.unwrap().unwrap().version + 1;
+        prompts
+            .record_eval(&PromptEval {
+                prompt_name: "safety".into(),
+                candidate_version,
+                baseline_version: 1,
+                score_delta: 0.9,
+                passed: true,
+            })
+            .await
+            .unwrap();
+
+        let report = run_self_improve_report(&pool, &ctx_for(chrono::Utc::now()))
+            .await
+            .unwrap();
+
+        // The candidate counts as DENIED (ApplyOutcome::DeniedStaysProposed → the
+        // firewall path), NOT as a prompt that merely stayed proposed at the registry
+        // (PromptStaysProposed is uncounted). report.denied incrementing is the proof
+        // the firewall — not `try_auto_activate` — rejected it.
+        assert!(
+            report.denied >= 1,
+            "a locked-prompt candidate must be DENIED BY THE FIREWALL (DeniedStaysProposed), \
+             not silently stay-proposed at the registry"
+        );
+        assert_eq!(report.prompts_activated, 0, "never activates");
+        // Nothing reached `apply_prompt` → the candidate never minted/activated a new
+        // version: `safety` stays at its seeded v1, still active, still locked.
+        assert_eq!(status_of(&pool, &locked_prompt).await, "proposed");
+        let snap = prompts.snapshot_for("safety").await.unwrap();
+        assert_eq!(snap.len(), 1, "no candidate version was ever minted/activated");
+        assert_eq!(snap[0].version, 1);
+        assert!(snap[0].locked);
+        assert!(snap[0].active);
     }
 
     #[tokio::test]
