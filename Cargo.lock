@@ -70,6 +70,7 @@ name = "altevra-adapters"
 version = "0.1.0"
 dependencies = [
  "altevra-core",
+ "altevra-db",
  "altevra-hooks",
  "altevra-secrets",
  "altevra-skills",
@@ -79,10 +80,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "sqlx",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
  "toml_edit",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -108,6 +112,7 @@ dependencies = [
 name = "altevra-brain"
 version = "0.1.0"
 dependencies = [
+ "altevra-adapters",
  "altevra-core",
  "altevra-db",
  "altevra-llm",

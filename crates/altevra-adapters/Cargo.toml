@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 altevra-core = { workspace = true }
+altevra-db = { workspace = true }
 altevra-skills = { workspace = true }
 altevra-hooks = { workspace = true }
 altevra-secrets = { workspace = true }
@@ -17,6 +18,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 toml_edit = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true }

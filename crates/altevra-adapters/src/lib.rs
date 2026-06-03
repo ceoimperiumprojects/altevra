@@ -3,6 +3,7 @@ pub mod base;
 pub mod claude_code;
 pub mod codex;
 pub mod cursor;
+pub mod factory;
 pub mod hermes;
 
 pub use antigravity::AntigravityAdapter;
@@ -13,4 +14,5 @@ pub use base::{
 pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::CursorAdapter;
+pub use factory::{render_skill_proposal, FactoryError, FactoryReport};
 pub use hermes::HermesAdapter;
