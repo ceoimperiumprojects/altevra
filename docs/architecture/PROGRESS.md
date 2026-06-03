@@ -3,6 +3,21 @@
 > Live task tracker for the autonomous run. Top = morning handoff summary. Below = per-task log.
 > Authority: `OVERNIGHT_GOAL.md` + `RECONCILIATION.md` (R1–R14) + `BUILD_TASKS.md`.
 
+## ROAD-TO-DONE FAZA B — upali pamet DONE (2026-06-03)
+
+Recorder → thinking system. **801 → 816 tests / 0 fail**, clippy `-D` clean (incl. embedding).
+
+- B1 ProposalsRepository + resident output → proposals rows (dedup, SI-9 tier re-derive, SI-14).
+- B2 4 missing mode prompts; all 8 modes resolve; personal_curator local-only (SI-7).
+- B3 daily_briefing notices: observer patterns + last_contact ("haven't talked to X") + stale decisions.
+- B4 insight_synthesizer persists a recallable insight_card.
+- B5 auto-categorization (living taxonomy) with SI-7 content-aware routing.
+- Schema-landing fix: runtime now sends the output contract → live codex insight run = completed, 4 proposals.
+- SI-7 content fail-safe: high-water content kept off cloud even when obj.domain is wrong.
+
+**LIVE codex GPT-5.5: `resident run insight` → completed, 4 real proposals citing object ids.**
+7 commits `0a5780e..7575cbd`. **NEXT: Faza C (self-improve loop — firewall exists, needs orchestrator).**
+
 ## ROAD-TO-DONE FAZA A — retrieval temelj DONE (2026-06-03)
 
 Plan `~/.claude/plans/giggly-humming-ullman.md` (A→F: temelj→pamet→self-improve→skill

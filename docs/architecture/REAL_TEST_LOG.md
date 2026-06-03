@@ -2,6 +2,42 @@
 
 > Live cross-tool tests. One entry per run.
 
+## 2026-06-03 (Faza B) — upali pamet: baza misli preko codex GPT-5.5 ✅ PASS
+
+Workflow-orchestrated (Foundation ∥ → Brain jobs → 3-lens verify incl. LIVE codex) + parent
+full baseline. 801 → **816 tests / 0 fail**; clippy `--all-targets -D` clean (incl. embedding);
+fmt. Branch altevra-overnight-p0.
+
+- **B1 — ProposalsRepository + resident→proposals wiring** (`0a5780e`): dedup by `dedup_hash`
+  (collision → increment evidence_count, never 2nd row); SI-9 tier always re-derived by core
+  (agent can't assert); SI-14 — only a `Completed` run writes rows, `FailedSchema`→0.
+- **B2 — 4 missing mode prompts** (`62b9fa2`): insight/observer/personal_curator/
+  skill_factory_proposer in `06-skills/resident-agent-modes/`; all 8 modes now resolve a
+  non-empty prompt; personal_curator pinned `local_private` + restricted (SI-7).
+- **B3 — daily_briefing STUB → brain that notices** (`31d9c2e`): `detect_patterns()` + first
+  caller of `last_contact()` ("haven't talked to Đorđe in N weeks" via new `dated_mentions`)
+  + decisions past `review_after` ("still applies?"); codex prose synth when non-noop.
+- **B4 — insight_synthesizer → recallable insight_card** (`2ea1530`): persists an InsightCard
+  (auto-indexed via A1) instead of a 240-char log; noop-skips clean.
+- **B5 — auto-categorization (living taxonomy)** (`cd5752f`): CheapWorker classify → tag or
+  `kind="category"` Tier-0 proposal; SI-7 routes high-water → local_private.
+- **Schema-landing fix** (`7f3b4ad`): runtime was sending only the one-line mode description,
+  not the output contract → every insight/synthesis run was `failed_schema`. Added
+  `GENERIC_OUTPUT_CONTRACT` to `run_dry` + a fence-tolerant balanced-brace JSON extractor in
+  `parse_resident_output` (SI-14 still strict). All 8 mode prompts aligned to the generic
+  `{proposals:[{kind,title,body,evidence_refs}]}` envelope.
+- **SI-7 content fail-safe** (`7575cbd`): auto-categorizer no longer trusts `obj.domain` alone
+  — a high-water content scan (`content_is_high_water`, reusing ingest_guard's keyword net)
+  keeps a personal thought captured as generic `learning`/business OFF the cloud worker.
+
+**LIVE codex_oauth (GPT-5.5) end-to-end on REAL `Decisions.md`** (read-only copy; vault sha256
+`0e95c96…` identical before/after): token ALIVE (PONG). `resident run insight
+--reasoning-mode codex_oauth` → **`status=completed`, 4 proposal rows** with real GPT-5.5
+titles citing captured object ids ("Altevra direction converging from task tracker to thinking
+OS", "GTM memory is the execution bridge", …) — the recorder now THINKS. 3-lens verify all
+PASS: baseline/test, SI-7/leak/injection (high-water never cloud, SI-14 zero-on-invalid,
+note-as-data), real-data live codex.
+
 ## 2026-06-03 (Faza A) — retrieval temelj: sve pretraživo + R5 audit ✅ PASS
 
 Workflow-orchestrated (implement write-side → read-side, then 4-lens adversarial verify) +
