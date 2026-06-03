@@ -389,7 +389,7 @@ struct RelevanceParts {
 
 // R12 fusion weights (constants for now — versioned profiles are a later task).
 // tag-match stays dominant so existing tag-only behavior is preserved when bm25
-// and graph are absent (`bm25=None`, `graph=0` → fused = 0.55*tag + 0.15*rec,
+// and graph are absent (`bm25=None`, `graph=0` → fused = 0.45*tag + 0.15*rec,
 // same ordering as the old 0.7*tag + 0.3*rec).
 const W_BM25: f64 = 0.25;
 const W_TAG: f64 = 0.45;
