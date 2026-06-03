@@ -17,7 +17,10 @@ pub mod tasks;
 pub mod updates;
 pub mod wiki;
 
-pub use capability::{CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository};
+pub use capability::{
+    CapabilityGrantRow, CapabilityGrantsRepository, CapabilityRecordRow,
+    CapabilityRecordsRepository, SkillProposalsRepository,
+};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
 pub use exposure::{ExposureAudit, ExposureDecisionsRepository};
