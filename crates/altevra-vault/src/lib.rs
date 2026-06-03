@@ -6,6 +6,7 @@
 
 pub mod entity_dict;
 pub mod frontmatter;
+pub mod mirror;
 pub mod normalize;
 pub mod parser;
 pub mod scanner;
@@ -18,6 +19,9 @@ pub use entity_dict::{
     build_dictionary, build_dictionary_for_vault, resolve_entity, vault_root_for,
 };
 pub use frontmatter::{parse_frontmatter, serialize_frontmatter, Frontmatter, FrontmatterError};
+pub use mirror::{
+    plan_mirror, write_mirror, MirrorWriterError, RefuseReason, SkipReason, WriteOutcome,
+};
 pub use normalize::{
     classify_path, normalize_frontmatter, render_normalized, split_for_normalize, DocClass,
     UNIVERSAL_KEYS,

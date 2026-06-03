@@ -17,6 +17,7 @@ pub mod hook_handle;
 pub mod init;
 pub mod journal;
 pub mod memory;
+pub mod mirror;
 pub mod observer;
 pub mod prompt;
 pub mod recall;
