@@ -11,10 +11,10 @@ use altevra_core::security::Sensitivity;
 use altevra_core::updates::{Importance, UpdateFeedItem, UpdatesQuery};
 use altevra_db::{
     create_pool, run_migrations, DecisionIndexEnvelope, DecisionRow, EventsRepository,
-    FtsRepository, GoalRow, HookRow, HookRunRow, HooksRepository, InstallationsRepository,
-    InstalledComponentRow, ObjectIndexRepository, ReadStateRepository, ReviewItemRow, SkillRow,
-    SkillsRepository, TaskRow, TasksRepository, ToolInstallationRow, UpdatesRepository,
-    WikiPagesRepository,
+    ExposureAudit, ExposureDecisionsRepository, FtsRepository, GoalRow, HookRow, HookRunRow,
+    HooksRepository, InstallationsRepository, InstalledComponentRow, ObjectIndexRepository,
+    ReadStateRepository, ReviewItemRow, SkillRow, SkillsRepository, TaskRow, TasksRepository,
+    ToolInstallationRow, UpdatesRepository, WikiPagesRepository,
 };
 use chrono::{NaiveDate, Utc};
 use uuid::Uuid;
@@ -438,4 +438,50 @@ async fn t1_13_all_writers_indexed() {
             .any(|h| h.object_type == "wiki" && h.object_id == wiki_id.to_string()),
         "wiki page must be full-text searchable"
     );
+}
+
+/// R5: the exposure-decision writer inserts a content-free aggregate row — no
+/// raw object id/title/body of any candidate is persisted (§2.13 no existence
+/// leak); only counts + the request ceiling/scope are stored.
+#[tokio::test]
+async fn exposure_decision_written() {
+    let pool = fresh_pool().await;
+    let repo = ExposureDecisionsRepository::new(&pool);
+    let audit = ExposureAudit {
+        packet_id: None,
+        sensitivity_ceiling: "internal".into(),
+        domain_scope: vec!["business".into(), "project".into()],
+        included_count: 4,
+        excluded_count: 2,
+        excluded_by_reason: vec![("over_sensitivity_ceiling".into(), 2)],
+        redaction_counts: vec![("clean".into(), 4)],
+        truncated: false,
+    };
+    let id = repo.insert(&audit).await.unwrap();
+
+    // exactly one row exists, and the content-free ref columns carry no {type,id}.
+    let (cnt,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM exposure_decisions")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(cnt, 1, "one audit row per compile");
+
+    let (included_refs, excluded_refs, request): (String, String, String) = sqlx::query_as(
+        "SELECT included_refs, excluded_refs, request FROM exposure_decisions WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    // aggregate counts present...
+    assert!(included_refs.contains("\"count\":4"));
+    assert!(excluded_refs.contains("\"count\":2"));
+    // ...but NO per-object id/title/body — never leak existence of denied items.
+    assert!(!included_refs.contains("\"id\""));
+    assert!(!excluded_refs.contains("\"id\""));
+    assert!(!included_refs.contains("\"title\""));
+    assert!(!excluded_refs.contains("\"title\""));
+    // the request echo is the content-free envelope (ceiling + scope only).
+    assert!(request.contains("internal"));
+    assert!(request.contains("project"));
 }

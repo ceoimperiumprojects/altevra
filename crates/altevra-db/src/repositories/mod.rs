@@ -1,6 +1,7 @@
 pub mod capability;
 pub mod domain_policy;
 pub mod events;
+pub mod exposure;
 pub mod fts;
 pub mod hooks;
 pub mod installations;
@@ -17,6 +18,7 @@ pub mod wiki;
 pub use capability::{CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
+pub use exposure::{ExposureAudit, ExposureDecisionsRepository};
 pub use fts::{FtsHit, FtsRepository, ObjectHit};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
