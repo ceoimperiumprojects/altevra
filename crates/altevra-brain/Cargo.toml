@@ -9,6 +9,7 @@ altevra-db = { workspace = true }
 altevra-llm = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
+altevra-secrets = { workspace = true }
 altevra-vault = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

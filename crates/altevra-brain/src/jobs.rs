@@ -690,11 +690,38 @@ pub async fn run_auto_categorizer(
         // cheap_worker. A high-water object must never be classified by the cloud
         // worker — the router additionally enforces local-only for local_private.
         let domain: Domain = obj.domain.parse().unwrap_or(Domain::Business);
-        let role = if domain.is_high_water() {
+        let mut role = if domain.is_high_water() {
             ModelRole::LocalPrivate
         } else {
             ModelRole::CheapWorker
         };
+
+        let title = obj.title.clone().unwrap_or_default();
+
+        // SI-7 DEFENSE-IN-DEPTH (content fail-safe): obj.domain is stamped upstream
+        // at ingest (template default_domain — e.g. the 'learning' builtin defaults
+        // to Business), so a genuinely personal/relationship/health thought captured
+        // under a generic object_type can carry domain=business and would otherwise
+        // route to the CLOUD cheap_worker. Before sending ANYTHING to the cloud, scan
+        // title+body with the SAME high-water keyword net the pre-write gate uses
+        // (altevra_secrets::content_is_high_water). If the content looks high-water
+        // but the domain stamp isn't, treat it as high-water → local_private. This
+        // makes the SI-7 guarantee independent of a possibly-wrong upstream domain.
+        // Conservative: a false positive only keeps something local (safe).
+        if role == ModelRole::CheapWorker {
+            let body = fetch_object_body(pool, &obj.object_type, &obj.id).await;
+            let scanned = format!("{title}\n{body}");
+            if altevra_secrets::content_is_high_water(&scanned) {
+                tracing::warn!(
+                    "auto-categorize: object {} has domain={} but high-water CONTENT — \
+                     keeping local (SI-7 content fail-safe), not sending to cloud",
+                    obj.id,
+                    obj.domain
+                );
+                role = ModelRole::LocalPrivate;
+            }
+        }
+
         let provider = ctx.router.resolve(role);
         if provider.id() == "noop" {
             // No model for this role → skip cleanly (no write).
@@ -702,7 +729,6 @@ pub async fn run_auto_categorizer(
             continue;
         }
 
-        let title = obj.title.clone().unwrap_or_default();
         let cat_list = if existing.is_empty() {
             "(none yet)".to_string()
         } else {
@@ -780,6 +806,23 @@ pub async fn run_auto_categorizer(
         ),
         items_processed: tagged + proposed,
     })
+}
+
+/// Fetch an object's indexed body from `object_fts` (where capture stores the full
+/// text). Used by the SI-7 content fail-safe to scan title+body before any cloud
+/// call. Returns an empty string if the row is absent or the query fails — a missing
+/// body just means the title-only scan still runs (fail-safe never errors the job).
+async fn fetch_object_body(pool: &SqlitePool, object_type: &str, id: &str) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT body FROM object_fts WHERE object_type = ? AND object_id = ? LIMIT 1",
+    )
+    .bind(object_type)
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// Normalize a model's category reply to a single short lowercase label: first
@@ -1428,6 +1471,16 @@ mod tests {
 
     /// Helper: index an object with empty categories (uncategorized) in a domain.
     async fn seed_uncategorized(pool: &SqlitePool, id: &str, domain: &str, title: &str) {
+        seed_uncategorized_with_body(pool, id, domain, title, "body").await;
+    }
+
+    async fn seed_uncategorized_with_body(
+        pool: &SqlitePool,
+        id: &str,
+        domain: &str,
+        title: &str,
+        body: &str,
+    ) {
         altevra_db::ObjectIndexRepository::new(pool)
             .index_object(
                 &altevra_db::ObjectIndexRow {
@@ -1443,7 +1496,7 @@ mod tests {
                     redaction_status: "clean".into(),
                     updated_at: Utc::now(),
                 },
-                "body",
+                body,
             )
             .await
             .unwrap();
@@ -1590,6 +1643,76 @@ mod tests {
             1,
             "non-high-water object IS classified by cheap_worker"
         );
+    }
+
+    /// SI-7 DEFENSE-IN-DEPTH: an object stamped domain='business' (e.g. a generic
+    /// 'learning' note whose template default_domain is Business) but whose CONTENT
+    /// is clearly relationship/personal must NOT be classified by a cloud-only
+    /// cheap_worker. The content fail-safe re-routes it to local_private; with only
+    /// a cloud cheap_worker configured, local_private is noop → it is SKIPPED, never
+    /// leaked. A genuinely-business control object IS classified by the cheap_worker.
+    #[tokio::test]
+    async fn auto_categorize_content_failsafe_keeps_high_water_local() {
+        use altevra_db::{ObjectIndexRepository, ProposalsRepository};
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pool = migrated_pool().await;
+
+        // domain='business' BUT body carries clear relationship content (the same SR
+        // keyword the high-water net detects: "moja devojka"). The obj.domain check
+        // alone (is_high_water()==false) would route this to the CLOUD worker.
+        seed_uncategorized_with_body(
+            &pool,
+            "obj-mislabeled",
+            "business",
+            "random thought",
+            "danas sam shvatio nesto vazno — moja devojka Elena me podrzava u svemu",
+        )
+        .await;
+        // A genuinely-business control object (no high-water content).
+        seed_uncategorized_with_body(
+            &pool,
+            "obj-clean-biz",
+            "business",
+            "ReVesta GTM",
+            "cold call list for surplus buyers in Florida",
+        )
+        .await;
+
+        // Only a CLOUD cheap_worker is configured; local_private stays noop.
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: router_with_stub(altevra_llm::ModelRole::CheapWorker, "stub-cheap", "outreach"),
+        };
+        let r = run_auto_categorizer(&pool, &ctx).await.unwrap();
+
+        let idx = ObjectIndexRepository::new(&pool);
+        // The mislabeled object was re-routed to local_private (noop) → SKIPPED, so
+        // the cloud worker never saw it: it stays uncategorized and proposes nothing.
+        assert!(
+            idx.get_categories_or_empty("learning", "obj-mislabeled")
+                .await
+                .is_empty(),
+            "content fail-safe must keep the relationship-content object OFF the cloud worker (SI-7)"
+        );
+        // The clean business object DID reach the cheap_worker → a category proposal.
+        let props = ProposalsRepository::new(&pool)
+            .list(None, Some("category"))
+            .await
+            .unwrap();
+        assert_eq!(
+            props.len(),
+            1,
+            "exactly the genuinely-business object is classified by the cloud worker: {r:?}"
+        );
+        assert!(
+            props[0]
+                .evidence_refs
+                .contains("obj-clean-biz"),
+            "the one cloud-classified object is the business control, not the mislabeled one"
+        );
+        assert!(r.summary.contains("skipped"));
     }
 
     #[tokio::test]

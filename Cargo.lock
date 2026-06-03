@@ -113,6 +113,7 @@ dependencies = [
  "altevra-llm",
  "altevra-memory",
  "altevra-research",
+ "altevra-secrets",
  "altevra-vault",
  "anyhow",
  "async-trait",

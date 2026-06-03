@@ -331,6 +331,26 @@ fn high_water_keywords(text: &str) -> Vec<RiskTag> {
     tags
 }
 
+/// Defense-in-depth predicate: does free text *look* high-water (personal/
+/// relationship/health/legal/financial) by the same coarse keyword net the
+/// pre-write gate uses? Reuses [`guard_text`] (the single source of truth for the
+/// EN+SR high-water markers + financial PII), so the net never drifts out of sync.
+///
+/// Callers use this to keep possibly-mislabeled content LOCAL even when an upstream
+/// `domain` stamp says otherwise (SI-7). Conservative by design: a false positive
+/// only keeps something on-device — never the reverse.
+pub fn content_is_high_water(text: &str) -> bool {
+    guard_text(text, Sensitivity::Internal)
+        .risk_tags
+        .iter()
+        .any(|t| {
+            matches!(
+                t,
+                RiskTag::Health | RiskTag::Relationship | RiskTag::Legal | RiskTag::Financial
+            )
+        })
+}
+
 /// The single pre-write guard for templated FACED objects. `body` is the markdown
 /// being written; `envelope` carries domain/categories/object_type;
 /// `present_frontmatter_keys` are the keys present (for TemplateGate). Composes
