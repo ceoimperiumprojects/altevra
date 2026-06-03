@@ -1,4 +1,5 @@
 pub mod capability;
+pub mod cursor_edits;
 pub mod domain_policy;
 pub mod events;
 pub mod exposure;
@@ -23,6 +24,7 @@ pub use capability::{
     CapabilityGrantRow, CapabilityGrantsRepository, CapabilityRecordRow,
     CapabilityRecordsRepository, SkillProposalsRepository,
 };
+pub use cursor_edits::{CursorEditRow, CursorEditsRepository};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
 pub use exposure::{ExposureAudit, ExposureDecisionsRepository};

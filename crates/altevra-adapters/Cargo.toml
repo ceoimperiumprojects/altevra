@@ -20,6 +20,7 @@ tracing = { workspace = true }
 toml_edit = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

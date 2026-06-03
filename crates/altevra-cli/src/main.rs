@@ -146,6 +146,11 @@ enum Commands {
     /// overwritten). Plan-only; no `apply` verb is exposed here.
     #[command(subcommand)]
     Mirror(commands::mirror::MirrorCommands),
+
+    /// Cursor CLI surfaces — `import` lifts the ai-tracking SQLite + plan
+    /// files (read-only; dry-run by default).
+    #[command(subcommand)]
+    Cursor(commands::cursor::CursorCommands),
 }
 
 #[tokio::main]
@@ -193,5 +198,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Control(cmd) => commands::control::run(cmd).await,
         Commands::Vault(cmd) => commands::vault::run(cmd).await,
         Commands::Mirror(cmd) => commands::mirror::run(cmd).await,
+        Commands::Cursor(cmd) => commands::cursor::run(cmd).await,
     }
 }
