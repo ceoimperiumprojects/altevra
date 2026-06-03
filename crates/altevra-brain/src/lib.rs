@@ -15,13 +15,15 @@
 //! block another. Time-of-day jobs (daily_summary) check on every tick and
 //! fire when the wall clock crosses the scheduled boundary.
 
+pub mod curator;
 pub mod jobs;
 pub mod lifecycle;
 pub mod resident;
 pub mod scheduler;
 pub mod selfimprove;
 
-pub use jobs::{JobKind, JobResult};
+pub use curator::{curator_digest_line, curate, run_curator, CuratorReport};
+pub use jobs::{all_kinds, run_all, JobKind, JobResult};
 pub use lifecycle::{lifecycle_sweep, LifecycleReport};
 pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};

@@ -82,20 +82,9 @@ impl BrainScheduler {
         };
         let now = Instant::now();
 
-        for kind in [
-            JobKind::EventClassifier,
-            JobKind::ObserverScan,
-            JobKind::VaultIndexer,
-            JobKind::InsightSynthesizer,
-            JobKind::ResearchFetcher,
-            JobKind::FeedDiscovery,
-            JobKind::GitHubTrendingFetch,
-            JobKind::ProjectResearchSweep,
-            JobKind::DailySummary,
-            JobKind::TaskGrooming,
-            JobKind::AutoCategorizer,
-            JobKind::SelfImproveOrchestrator,
-        ] {
+        // Source of truth = `jobs::all_kinds()` so a new JobKind variant
+        // automatically becomes schedulable without touching this loop.
+        for kind in crate::jobs::all_kinds() {
             if self.config.disabled.iter().any(|d| d == kind.as_str()) {
                 continue;
             }
@@ -314,6 +303,11 @@ mod tests {
                 "research_fetcher".into(),
                 "project_research_sweep".into(),
                 "self_improve_orchestrator".into(),
+                // C7 curator needs the proposals/skills schema (full migrations);
+                // these scheduler tests use a minimal hand-rolled schema, so the
+                // curator pass is opted out here. Curator is tested directly in
+                // `crate::curator::tests`.
+                "curator".into(),
             ],
             ..BrainConfig::default()
         };
@@ -338,6 +332,11 @@ mod tests {
                 "research_fetcher".into(),
                 "project_research_sweep".into(),
                 "self_improve_orchestrator".into(),
+                // C7 curator needs the proposals/skills schema (full migrations);
+                // these scheduler tests use a minimal hand-rolled schema, so the
+                // curator pass is opted out here. Curator is tested directly in
+                // `crate::curator::tests`.
+                "curator".into(),
             ],
             ..BrainConfig::default()
         };
@@ -371,6 +370,7 @@ mod tests {
                 "task_grooming".into(),
                 "auto_categorizer".into(),
                 "self_improve_orchestrator".into(),
+                "curator".into(),
             ],
             ..BrainConfig::default()
         };

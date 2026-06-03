@@ -21,6 +21,10 @@ pub enum JobKind {
     TaskGrooming,
     AutoCategorizer,
     SelfImproveOrchestrator,
+    /// C7 — DB-level skill/proposal curator (Hermes-borrowed). Status-only
+    /// transitions, never deletes; runs ~7 days (idle-gated by period). See
+    /// [`crate::curator`] for the policy.
+    Curator,
 }
 
 impl JobKind {
@@ -38,6 +42,7 @@ impl JobKind {
             Self::TaskGrooming => "task_grooming",
             Self::AutoCategorizer => "auto_categorizer",
             Self::SelfImproveOrchestrator => "self_improve_orchestrator",
+            Self::Curator => "curator",
         }
     }
 
@@ -55,6 +60,7 @@ impl JobKind {
             "task_grooming" => Self::TaskGrooming,
             "auto_categorizer" => Self::AutoCategorizer,
             "self_improve_orchestrator" => Self::SelfImproveOrchestrator,
+            "curator" => Self::Curator,
             _ => return None,
         })
     }
@@ -78,6 +84,10 @@ impl JobKind {
             // hook can invoke `run_self_improve`); this is the safety net so a missed
             // trigger still gets the 7-stage loop run within the window.
             Self::SelfImproveOrchestrator => 2700,
+            // C7: ~7 days. Mirrors Hermes' `DEFAULT_INTERVAL_HOURS = 24 * 7`. The
+            // curator is intentionally infrequent — it sweeps long-tail status
+            // staleness, not real-time signals.
+            Self::Curator => 7 * 24 * 60 * 60,
         }
     }
 }
@@ -599,6 +609,13 @@ pub async fn run_daily_summary(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
             structured.push_str(&format!("- {l}\n"));
         }
     }
+
+    // C7 — curator digest line (additive; never replaces other sections).
+    // Counts come from real `proposals` + `skills` rows, not a hard-coded zero.
+    // Format pinned by `curator::DIGEST_TAG` so dashboards can grep for it.
+    let digest = crate::curator::curator_digest_line(pool).await;
+    structured.push_str("\n## Self-improve\n\n");
+    structured.push_str(&format!("- {digest}\n"));
 
     // 4. If a StrongReasoner is configured, synthesize prose; else write bullets.
     //    StrongReasoner is a non-personal reasoning role (cloud-eligible, SI-7);
@@ -1148,7 +1165,52 @@ pub async fn dispatch(
         JobKind::TaskGrooming => run_task_grooming(pool, ctx).await,
         JobKind::AutoCategorizer => run_auto_categorizer(pool, ctx).await,
         JobKind::SelfImproveOrchestrator => crate::selfimprove::run_self_improve(pool, ctx).await,
+        JobKind::Curator => crate::curator::run_curator(pool, ctx).await,
     }
+}
+
+/// Iterate every job kind. Kept as a single source of truth so a new variant
+/// added to [`JobKind`] is automatically picked up by the scheduler loop AND
+/// by `roundtrip`-style tests.
+pub fn all_kinds() -> [JobKind; 13] {
+    [
+        JobKind::EventClassifier,
+        JobKind::ObserverScan,
+        JobKind::VaultIndexer,
+        JobKind::InsightSynthesizer,
+        JobKind::ResearchFetcher,
+        JobKind::FeedDiscovery,
+        JobKind::GitHubTrendingFetch,
+        JobKind::ProjectResearchSweep,
+        JobKind::DailySummary,
+        JobKind::TaskGrooming,
+        JobKind::AutoCategorizer,
+        JobKind::SelfImproveOrchestrator,
+        JobKind::Curator,
+    ]
+}
+
+/// Run every enabled job once, sequentially, returning per-kind results.
+/// Useful for `altevra brain run-all` style CLI calls and for tests that want
+/// a deterministic single pass without driving the scheduler loop.
+///
+/// The function never short-circuits on error: a failing job is logged and
+/// reported with `Err`, then the next kind runs. The scheduler uses the same
+/// per-kind dispatch + history pattern; this is the headless equivalent.
+pub async fn run_all(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+    disabled: &[String],
+) -> Vec<(JobKind, anyhow::Result<JobResult>)> {
+    let mut out = Vec::with_capacity(all_kinds().len());
+    for kind in all_kinds() {
+        if disabled.iter().any(|d| d == kind.as_str()) {
+            continue;
+        }
+        let r = dispatch(kind, pool, ctx).await;
+        out.push((kind, r));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1251,22 +1313,14 @@ mod tests {
 
     #[test]
     fn job_kind_roundtrip() {
-        for k in [
-            JobKind::EventClassifier,
-            JobKind::ObserverScan,
-            JobKind::VaultIndexer,
-            JobKind::InsightSynthesizer,
-            JobKind::ResearchFetcher,
-            JobKind::FeedDiscovery,
-            JobKind::GitHubTrendingFetch,
-            JobKind::ProjectResearchSweep,
-            JobKind::DailySummary,
-            JobKind::TaskGrooming,
-            JobKind::AutoCategorizer,
-            JobKind::SelfImproveOrchestrator,
-        ] {
+        // all_kinds() is the single source of truth — using it here means a
+        // new variant added to JobKind can't silently dodge the roundtrip test.
+        for k in all_kinds() {
             assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }
+        // Curator wiring spot-check (C7).
+        assert_eq!(JobKind::Curator.as_str(), "curator");
+        assert_eq!(JobKind::Curator.period_secs(), 7 * 24 * 60 * 60);
     }
 
     #[tokio::test]
