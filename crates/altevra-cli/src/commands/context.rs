@@ -437,11 +437,15 @@ mod tests {
         .unwrap();
     }
 
-    /// INV-14 parity: the gated packet the CLI compiles for a given DB + query +
-    /// ceiling + budget is byte-equal to the one the MCP handler compiles — they
-    /// call the SAME shared `compile_gated_packet`, so neither can drift. Also
-    /// asserts the work ceiling actually gates (a restricted/health object is
-    /// excluded; a business object is admitted).
+    /// INV-14 parity: the gated packet rendered by the ACTUAL CLI surface
+    /// (`build_gated_packet`, the wrapper `altevra context` calls) is structurally
+    /// equal to the one rendered by the ACTUAL MCP surface
+    /// (`altevra_mcp::tools_memory::handle_get_context_packet`, the `get_context_packet`
+    /// tool entrypoint) over the SAME seeded DB + work ceiling + budget. Driving
+    /// both real shapers (not `compile_gated_packet` twice) means a future
+    /// divergence in only ONE shaper's JSON shape WOULD fail this test. Also
+    /// asserts the work ceiling actually gates: a restricted health object is
+    /// excluded with no id leak, a business object is admitted.
     #[tokio::test]
     async fn context_packet_parity() {
         use altevra_db::{ObjectIndexRepository, ObjectIndexRow};
@@ -492,32 +496,76 @@ mod tests {
         )
         .await
         .unwrap();
+        // Release this pool's write handle before the two surfaces open their own
+        // pools by path (file-backed WAL DB — readers are fine, but be tidy). The
+        // `idx` borrow ends here, so `pool.close()` is free to consume the pool.
+        pool.close().await;
 
-        let terms = vec!["storage".to_string()];
+        let query = "storage";
+        let terms = vec![query.to_string()];
 
-        // The CLI path and the MCP path both go through the one shared builder
-        // with identical args (work ceiling, 8000 budget) → identical packets.
-        let cli_pkt = altevra_mcp::packet_build::compile_gated_packet(&pool, &terms, 8000)
-            .await
-            .unwrap();
-        let mcp_pkt = altevra_mcp::packet_build::compile_gated_packet(&pool, &terms, 8000)
-            .await
-            .unwrap();
+        // ---- CLI surface: the exact wrapper `altevra context --query` calls. ----
+        // It opens its own pool by path, runs migrations, compiles via the shared
+        // builder, and shapes the packet JSON the CLI prints/embeds.
+        let cli_packet: Value = build_gated_packet(&db, &terms, 8000).await;
 
-        let plan = |p: &altevra_core::packet::ContextPacket| -> Vec<(String, usize, String)> {
-            p.items
+        // ---- MCP surface: the exact `get_context_packet` tool entrypoint. ----
+        // It opens its own pool by path (on a dedicated runtime thread), runs
+        // migrations, compiles via the same shared builder, and shapes the packet
+        // JSON under `result.packet`.
+        let resp = altevra_mcp::tools_memory::handle_get_context_packet(
+            Value::from(1),
+            &serde_json::json!({
+                "vault": tmp.path().to_string_lossy(),
+                "db_path": db.to_string_lossy(),
+                "query": query,
+            }),
+        );
+        assert!(resp.error.is_none(), "MCP get_context_packet must not error");
+        let mcp_packet: Value = resp
+            .result
+            .expect("MCP response has a result")
+            .get("packet")
+            .cloned()
+            .expect("MCP result carries a `packet`");
+
+        // Structural / byte equality of the two real shapers' JSON. If either
+        // surface ever reshapes its packet independently, this assertion fails.
+        assert_eq!(
+            cli_packet, mcp_packet,
+            "CLI and MCP must render the SAME packet JSON for the same DB+ceiling+budget"
+        );
+
+        // The work ceiling gated correctly in BOTH renderings: business decision
+        // admitted, restricted health object excluded WITHOUT leaking its id.
+        let items = cli_packet
+            .get("items")
+            .and_then(|v| v.as_array())
+            .expect("packet has items");
+        assert!(
+            items
                 .iter()
-                .map(|i| (i.object_id.clone(), i.rank, i.why.rule.clone()))
-                .collect()
-        };
-        assert_eq!(plan(&cli_pkt), plan(&mcp_pkt), "CLI plan must equal MCP plan");
-
-        // The work ceiling gated correctly: business in, health out (no id leak).
-        assert!(cli_pkt.items.iter().any(|i| i.object_id == "d-storage"));
-        assert!(cli_pkt.items.iter().all(|i| i.object_id != "h-sleep"));
-        assert!(cli_pkt
-            .excluded
-            .iter()
-            .all(|e| e.object_id.as_deref() != Some("h-sleep")));
+                .any(|i| i.get("id").and_then(|v| v.as_str()) == Some("d-storage")),
+            "business decision is admitted"
+        );
+        // No item (in either surface — they're byte-equal) is the health object.
+        assert!(
+            items
+                .iter()
+                .all(|i| i.get("id").and_then(|v| v.as_str()) != Some("h-sleep")),
+            "restricted health object is excluded"
+        );
+        // The excluded restricted object never leaks its id ANYWHERE in the packet
+        // JSON (the shape carries only an aggregate `excluded` count, never ids).
+        assert!(
+            !cli_packet.to_string().contains("h-sleep"),
+            "no surface leaks the restricted object's id (existence-leak rule)"
+        );
+        // And the gate did exclude exactly one candidate (the health object).
+        assert_eq!(
+            cli_packet.get("excluded").and_then(|v| v.as_u64()),
+            Some(1),
+            "exactly one candidate excluded by the work ceiling"
+        );
     }
 }
