@@ -289,6 +289,47 @@ pub fn list_tools() -> Value {
             }),
         ),
     ));
+    // E3 (HP-1, write-proposal-only): an MCP/agent caller can REQUEST that an
+    // object be forgotten — never execute the forget. Lands as a proposed
+    // review_items row; only a presence-checked human path resolves it. The
+    // name deliberately uses `request` so the HP-1 lock regression test (which
+    // forbids approve|apply|grant|forget_execute|revoke|set_policy) keeps
+    // holding.
+    tools.push(tool(
+        "request_forget",
+        "Request that an object be forgotten — writes a 'forget_request' review item \
+         (status='proposed'). NEVER executes a forget; a human/presence-gated path \
+         is the only thing that may act on it.",
+        obj_schema(
+            &["object_type", "object_id"],
+            serde_json::json!({
+                "object_type": {"type": "string"},
+                "object_id": {"type": "string"},
+                "reason": {"type": "string"},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
+    // E3 (HP-1, write-proposal-only): MCP entrypoint for an AI tool to surface
+    // a learning to Altevra. Writes a proposals row via ProposalsRepository::insert
+    // — SI-9 (tier re-derive) and SI-13 (dedup_hash merge) fire automatically.
+    // Status is always `proposed`; this tool NEVER applies/approves.
+    tools.push(tool(
+        "propose_improvement",
+        "Propose an improvement / learning — writes a proposals row (status='proposed'). \
+         risk_tier is re-derived from `kind` (SI-9); a same-(kind,title) repeat merges \
+         (SI-13) rather than creating a 2nd row. NEVER auto-applies.",
+        obj_schema(
+            &["kind", "title"],
+            serde_json::json!({
+                "kind": {"type": "string"},
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+                "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                "db_path": {"type": "string"},
+            }),
+        ),
+    ));
 
     // Setup
     tools.push(tool(
@@ -631,6 +672,13 @@ impl McpServer {
                 crate::tools_capabilities::handle_report_capability_gap(id, args)
             }
             "create_review_item" => crate::tools_capabilities::handle_create_review_item(id, args),
+            // E3 (HP-1, write-proposal-only): two new MCP tools that write
+            // proposal/review rows but NEVER execute. Names deliberately avoid
+            // approve|apply|grant|forget_execute|revoke|set_policy.
+            "request_forget" => crate::tools_capabilities::handle_request_forget(id, args),
+            "propose_improvement" => {
+                crate::tools_capabilities::handle_propose_improvement(id, args)
+            }
             // Setup
             "get_setup_status" => crate::tools_setup::handle_get_setup_status(id, args),
             "run_hook" => crate::tools_setup::handle_run_hook(id, args),
