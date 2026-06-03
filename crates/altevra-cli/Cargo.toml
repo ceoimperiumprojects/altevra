@@ -25,6 +25,7 @@ altevra-watcher = { workspace = true }
 altevra-brain = { workspace = true }
 altevra-db = { workspace = true }
 altevra-llm = { workspace = true }
+reqwest = { workspace = true }
 sqlx = { workspace = true }
 indicatif = { workspace = true }
 rusqlite = { workspace = true }

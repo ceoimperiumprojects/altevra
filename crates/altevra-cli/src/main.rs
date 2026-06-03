@@ -58,6 +58,10 @@ enum Commands {
     #[command(subcommand)]
     Config(commands::config::ConfigCommands),
 
+    /// LLM presets — one-shot `altevra llm use <preset>` for Ollama / vLLM / codex / local-first
+    #[command(subcommand)]
+    Llm(commands::llm::LlmCommands),
+
     /// Memory ingest / search / context
     #[command(subcommand)]
     Memory(commands::memory::MemoryCommands),
@@ -175,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Serve(args) => commands::serve::run(args).await,
         Commands::Doctor(args) => commands::doctor::run(args).await,
         Commands::Config(cmd) => commands::config::run(cmd).await,
+        Commands::Llm(cmd) => commands::llm::run(cmd).await,
         Commands::Memory(cmd) => commands::memory::run(cmd).await,
         Commands::Prompt(cmd) => commands::prompt::run(cmd).await,
         Commands::Research(cmd) => commands::research::run(cmd).await,
