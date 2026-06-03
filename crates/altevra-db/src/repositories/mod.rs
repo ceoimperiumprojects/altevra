@@ -2,6 +2,7 @@ pub mod capability;
 pub mod domain_policy;
 pub mod events;
 pub mod exposure;
+pub mod firewall_state;
 pub mod fts;
 pub mod hooks;
 pub mod improvement_signals;
@@ -25,6 +26,7 @@ pub use capability::{
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
 pub use exposure::{ExposureAudit, ExposureDecisionsRepository};
+pub use firewall_state::FirewallStateRepository;
 pub use fts::{FtsHit, FtsRepository, ObjectHit};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use improvement_signals::{

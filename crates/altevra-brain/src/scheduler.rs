@@ -94,6 +94,7 @@ impl BrainScheduler {
             JobKind::DailySummary,
             JobKind::TaskGrooming,
             JobKind::AutoCategorizer,
+            JobKind::SelfImproveOrchestrator,
         ] {
             if self.config.disabled.iter().any(|d| d == kind.as_str()) {
                 continue;
@@ -303,14 +304,16 @@ mod tests {
         let cfg = BrainConfig {
             vault_path: tmp.path().to_path_buf(),
             db_path: tmp.path().join("altevra.db"),
-            // Disable network-dependent jobs (research/discovery/trending)
-            // and the daily-only gate. Leaves 5 deterministic jobs.
+            // Disable network-dependent jobs (research/discovery/trending), the
+            // daily-only gate, and self-improve (needs the full schema; tested
+            // directly in selfimprove.rs). Leaves 5 deterministic jobs.
             disabled: vec![
                 "daily_summary".into(),
                 "feed_discovery".into(),
                 "github_trending_fetch".into(),
                 "research_fetcher".into(),
                 "project_research_sweep".into(),
+                "self_improve_orchestrator".into(),
             ],
             ..BrainConfig::default()
         };
@@ -334,6 +337,7 @@ mod tests {
                 "github_trending_fetch".into(),
                 "research_fetcher".into(),
                 "project_research_sweep".into(),
+                "self_improve_orchestrator".into(),
             ],
             ..BrainConfig::default()
         };
@@ -366,6 +370,7 @@ mod tests {
                 "project_research_sweep".into(),
                 "task_grooming".into(),
                 "auto_categorizer".into(),
+                "self_improve_orchestrator".into(),
             ],
             ..BrainConfig::default()
         };

@@ -7,6 +7,7 @@ edition = "2021"
 altevra-core = { workspace = true }
 altevra-db = { workspace = true }
 altevra-llm = { workspace = true }
+altevra-mcp = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
 altevra-secrets = { workspace = true }

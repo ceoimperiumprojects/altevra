@@ -19,8 +19,10 @@ pub mod jobs;
 pub mod lifecycle;
 pub mod resident;
 pub mod scheduler;
+pub mod selfimprove;
 
 pub use jobs::{JobKind, JobResult};
 pub use lifecycle::{lifecycle_sweep, LifecycleReport};
 pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};
+pub use selfimprove::{resident_disabled, run_self_improve, ApplyOutcome, SelfImproveReport};

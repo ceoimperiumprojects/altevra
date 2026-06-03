@@ -20,6 +20,7 @@ pub enum JobKind {
     DailySummary,
     TaskGrooming,
     AutoCategorizer,
+    SelfImproveOrchestrator,
 }
 
 impl JobKind {
@@ -36,6 +37,7 @@ impl JobKind {
             Self::DailySummary => "daily_summary",
             Self::TaskGrooming => "task_grooming",
             Self::AutoCategorizer => "auto_categorizer",
+            Self::SelfImproveOrchestrator => "self_improve_orchestrator",
         }
     }
 
@@ -52,6 +54,7 @@ impl JobKind {
             "daily_summary" => Self::DailySummary,
             "task_grooming" => Self::TaskGrooming,
             "auto_categorizer" => Self::AutoCategorizer,
+            "self_improve_orchestrator" => Self::SelfImproveOrchestrator,
             _ => return None,
         })
     }
@@ -71,6 +74,10 @@ impl JobKind {
             Self::DailySummary => 3600,           // tick hourly, fire only at 23:00
             Self::TaskGrooming => 10_800,
             Self::AutoCategorizer => 1800, // 30 min — classify newly-indexed objects
+            // Periodic backstop (~45 min): the loop is ALSO triggered real-time (a
+            // hook can invoke `run_self_improve`); this is the safety net so a missed
+            // trigger still gets the 7-stage loop run within the window.
+            Self::SelfImproveOrchestrator => 2700,
         }
     }
 }
@@ -1140,6 +1147,7 @@ pub async fn dispatch(
         JobKind::DailySummary => run_daily_summary(pool, ctx).await,
         JobKind::TaskGrooming => run_task_grooming(pool, ctx).await,
         JobKind::AutoCategorizer => run_auto_categorizer(pool, ctx).await,
+        JobKind::SelfImproveOrchestrator => crate::selfimprove::run_self_improve(pool, ctx).await,
     }
 }
 
@@ -1255,6 +1263,7 @@ mod tests {
             JobKind::DailySummary,
             JobKind::TaskGrooming,
             JobKind::AutoCategorizer,
+            JobKind::SelfImproveOrchestrator,
         ] {
             assert_eq!(JobKind::parse(k.as_str()), Some(k));
         }

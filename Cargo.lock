@@ -111,6 +111,7 @@ dependencies = [
  "altevra-core",
  "altevra-db",
  "altevra-llm",
+ "altevra-mcp",
  "altevra-memory",
  "altevra-research",
  "altevra-secrets",
