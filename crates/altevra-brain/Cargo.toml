@@ -26,3 +26,6 @@ sqlx = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 async-trait = { workspace = true }
+# C8 adversarial vertical-loop test renders a triaged skill into a TempDir to
+# pin the TEMP-DIR-only external-effects boundary; needs the C4 factory.
+altevra-adapters = { workspace = true }
