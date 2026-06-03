@@ -10,10 +10,11 @@ use altevra_core::events::{ActorType, Event, EventStatus, EventType};
 use altevra_core::security::Sensitivity;
 use altevra_core::updates::{Importance, UpdateFeedItem, UpdatesQuery};
 use altevra_db::{
-    create_pool, run_migrations, DecisionRow, EventsRepository, GoalRow, HookRow, HookRunRow,
-    HooksRepository, InstallationsRepository, InstalledComponentRow, ReadStateRepository,
-    ReviewItemRow, SkillRow, SkillsRepository, TaskRow, TasksRepository, ToolInstallationRow,
-    UpdatesRepository,
+    create_pool, run_migrations, DecisionIndexEnvelope, DecisionRow, EventsRepository,
+    FtsRepository, GoalRow, HookRow, HookRunRow, HooksRepository, InstallationsRepository,
+    InstalledComponentRow, ObjectIndexRepository, ReadStateRepository, ReviewItemRow, SkillRow,
+    SkillsRepository, TaskRow, TasksRepository, ToolInstallationRow, UpdatesRepository,
+    WikiPagesRepository,
 };
 use chrono::{NaiveDate, Utc};
 use uuid::Uuid;
@@ -347,4 +348,94 @@ async fn file_backed_pool_creates_db_with_parent_dir() {
         "sqlite file should have been created on disk"
     );
     drop(pool);
+}
+
+/// T1.13: ALL durable writers (not just learnings) route through the single
+/// index-maintenance point — a written decision AND a written wiki page enter
+/// `object_index` (packet candidate) AND `object_fts` (full-text searchable).
+#[tokio::test]
+async fn t1_13_all_writers_indexed() {
+    let pool = fresh_pool().await;
+    let now = Utc::now();
+
+    // --- decision: save_decision_indexed carries a scanned verdict → indexed ---
+    let decision = DecisionRow {
+        id: Uuid::new_v4(),
+        project_id: None,
+        title: "Adopt FTS5 for keyless retrieval".to_string(),
+        rationale: Some("BM25 over object_fts; embeddings stay optional (R12)".to_string()),
+        decided_at: now,
+        decided_by: Some("pavle".to_string()),
+        metadata: serde_json::json!({}),
+    };
+    let dec_idx = DecisionIndexEnvelope {
+        status: "active".into(),
+        sensitivity: "internal".into(),
+        domain: "project".into(),
+        scope: None,
+        categories: "[\"retrieval\"]".into(),
+        tags: "[\"fts\",\"retrieval\"]".into(),
+        redaction_status: "clean".into(),
+    };
+    let tasks = TasksRepository::new(&pool);
+    tasks
+        .save_decision_indexed(&decision, &dec_idx)
+        .await
+        .unwrap();
+
+    // --- wiki page: upsert_indexed with a scanned verdict → indexed ---
+    let wiki = WikiPagesRepository::new(&pool);
+    let wiki_id = wiki
+        .upsert_indexed(
+            "context-packets",
+            "context-packets",
+            "wiki/concepts/context-packets.md",
+            "living",
+            "high",
+            "internal",
+            2,
+            Some(now),
+            Some("Context Packets"),
+            "sha-ctx",
+            "project",
+            "[\"architecture\"]",
+            "[\"packet\",\"retrieval\"]",
+            "Context packets turn broad capture into precise gated context.",
+            "clean",
+        )
+        .await
+        .unwrap();
+
+    // structured index: BOTH objects are packet candidates.
+    let idx = ObjectIndexRepository::new(&pool);
+    let candidates = idx.candidates(Some("project")).await.unwrap();
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.object_type == "decision" && c.id == decision.id.to_string()),
+        "decision must be a packet candidate in object_index"
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.object_type == "wiki" && c.id == wiki_id.to_string()),
+        "wiki page must be a packet candidate in object_index"
+    );
+
+    // full-text: BOTH objects are searchable via object_fts (bm25).
+    let fts = FtsRepository::new(&pool);
+    let dec_hits = fts.search("FTS5 keyless retrieval", 10).await.unwrap();
+    assert!(
+        dec_hits
+            .iter()
+            .any(|h| h.object_type == "decision" && h.object_id == decision.id.to_string()),
+        "decision must be full-text searchable"
+    );
+    let wiki_hits = fts.search("context packets capture", 10).await.unwrap();
+    assert!(
+        wiki_hits
+            .iter()
+            .any(|h| h.object_type == "wiki" && h.object_id == wiki_id.to_string()),
+        "wiki page must be full-text searchable"
+    );
 }

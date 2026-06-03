@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::repositories::objects::{ObjectIndexRepository, ObjectIndexRow};
 use crate::util::ts_to_text;
 
 #[derive(Debug, Clone)]
@@ -120,6 +121,74 @@ impl<'a> WikiPagesRepository<'a> {
                 id
             }
         };
+        Ok(id)
+    }
+
+    /// Upsert a wiki page AND route it into the retrieval substrate (T1.13): the
+    /// page becomes a packet candidate (`object_index`) + full-text searchable
+    /// (`object_fts`), the same single-maintenance-point contract the
+    /// `LearningsRepository` already honors. The page body lives on disk, so the
+    /// caller passes the (already-guarded) `body` text to index along with the
+    /// `domain`, `categories`/`tags`, and the `redaction_status` verdict.
+    ///
+    /// Fail-closed: if `redaction_status` is not a scanned verdict
+    /// (`clean`/`redacted`), the metadata row is still upserted but the page is
+    /// NOT indexed — un-guarded text must never enter the index (R11 / TAG-1).
+    /// The caller is responsible for having run `guard_text`/`ingest_guard`
+    /// upstream and passing the verdict (caller-guards, no double-guard).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_indexed(
+        &self,
+        topic: &str,
+        slug: &str,
+        path: &str,
+        status: &str,
+        confidence: &str,
+        sensitivity: &str,
+        source_count: i64,
+        last_synthesized_at: Option<DateTime<Utc>>,
+        title: Option<&str>,
+        checksum: &str,
+        domain: &str,
+        categories: &str,
+        tags: &str,
+        body: &str,
+        redaction_status: &str,
+    ) -> anyhow::Result<Uuid> {
+        let id = self
+            .upsert(
+                topic,
+                slug,
+                path,
+                status,
+                confidence,
+                sensitivity,
+                source_count,
+                last_synthesized_at,
+                title,
+                checksum,
+            )
+            .await?;
+        if matches!(redaction_status, "clean" | "redacted") {
+            ObjectIndexRepository::new(self.pool)
+                .index_object(
+                    &ObjectIndexRow {
+                        object_type: "wiki".into(),
+                        id: id.to_string(),
+                        status: status.into(),
+                        sensitivity: sensitivity.into(),
+                        domain: domain.into(),
+                        scope: None,
+                        title: title.map(|t| t.to_string()).or_else(|| Some(topic.into())),
+                        categories: categories.into(),
+                        tags: tags.into(),
+                        redaction_status: redaction_status.into(),
+                        updated_at: last_synthesized_at.unwrap_or_else(Utc::now),
+                    },
+                    body,
+                )
+                .await?;
+        }
         Ok(id)
     }
 

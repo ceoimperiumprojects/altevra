@@ -5,8 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+use altevra_core::security::Sensitivity;
+use altevra_secrets::guard_text;
 use anyhow::Context;
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 
 use crate::chunker::{chunk_markdown, Chunk, DEFAULT_CHUNK_SIZE};
 
@@ -83,6 +86,60 @@ pub fn ingest_url_content(
     let safe = sanitize_path_segment(url);
     let source = PathBuf::from(format!("<{source_tag}>/{safe}.md"));
     ingest_text(&body, Some(source), chunk_size)
+}
+
+/// Route every chunk's text through `altevra-secrets::guard_text` BEFORE it is
+/// persisted or indexed (T1.13 / R11). Secrets + PII are redacted in place; the
+/// chunk's `text` is replaced with the safe value and its `checksum` recomputed
+/// over the redacted bytes. Returns the most-restrictive sensitivity seen across
+/// the document (default-UP, fail-closed) so the caller can label the persisted
+/// document at the right ceiling.
+///
+/// This is the single pre-persist scrub for the memory lane — identical contract
+/// to the capture path's `guard_text`, applied per chunk so large documents are
+/// still cheap. NO embeddings happen here (R12: the vector lane is opt-in and
+/// downstream); guarding is a precondition for BOTH the FTS index and any later
+/// embed.
+pub fn guard_document(doc: &mut IngestedDocument, declared: Sensitivity) -> Sensitivity {
+    let mut ceiling = declared.clone();
+    for chunk in &mut doc.chunks {
+        let guarded = guard_text(&chunk.text, declared.clone());
+        if guarded.value != chunk.text {
+            chunk.text = guarded.value;
+            chunk.checksum = sha256_hex(chunk.text.as_bytes());
+        }
+        ceiling = ceiling.combine(&guarded.sensitivity);
+    }
+    ceiling
+}
+
+/// Index a single already-guarded chunk into the FTS5 substrate (`object_fts`,
+/// R12 — bm25, NO vectors). Mirrors `altevra_db::FtsRepository::index`: delete
+/// any prior row for this object then insert, so a re-index can't duplicate.
+/// `body` MUST be the redacted chunk text (run `guard_document` first) — un-
+/// guarded text must never reach the index.
+pub async fn fts_index_chunk(
+    pool: &SqlitePool,
+    chunk_id: &str,
+    title: &str,
+    body: &str,
+    tags: &str,
+) -> anyhow::Result<()> {
+    sqlx::query("DELETE FROM object_fts WHERE object_type = 'memory_chunk' AND object_id = ?")
+        .bind(chunk_id)
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO object_fts (object_type, object_id, title, body, tags) \
+         VALUES ('memory_chunk', ?, ?, ?, ?)",
+    )
+    .bind(chunk_id)
+    .bind(title)
+    .bind(body)
+    .bind(tags)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 fn sanitize_yaml_value(s: &str) -> String {
@@ -198,7 +255,91 @@ fn parse_yaml_to_json(raw: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
+
+    #[test]
+    fn guard_document_redacts_secret_and_pii_before_persist() {
+        // A chunk carrying a live key + an email must be scrubbed in place; the
+        // checksum re-derives over the redacted bytes (no plaintext survives).
+        let mut doc = ingest_text(
+            "Reach me at jane.doe@example.com with key sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.",
+            None,
+            DEFAULT_CHUNK_SIZE,
+        );
+        let before = doc.chunks[0].checksum.clone();
+        let ceiling = guard_document(&mut doc, Sensitivity::Internal);
+
+        let text = &doc.chunks[0].text;
+        assert!(
+            !text.contains("jane.doe@example.com"),
+            "email must be redacted"
+        );
+        assert!(!text.contains("sk-ant-api03-"), "secret must be redacted");
+        assert!(text.contains("[REDACTED"), "placeholder present");
+        assert_ne!(doc.chunks[0].checksum, before, "checksum re-derived");
+        // a credential present raises the ceiling above Internal (default-up).
+        assert!(matches!(
+            ceiling,
+            Sensitivity::Confidential | Sensitivity::Restricted | Sensitivity::Secret
+        ));
+    }
+
+    #[test]
+    fn guard_document_clean_text_unchanged() {
+        let mut doc = ingest_text("# Notes\n\nPlain prose, nothing sensitive.\n", None, 0);
+        let before = doc.chunks[0].text.clone();
+        let ceiling = guard_document(&mut doc, Sensitivity::Internal);
+        assert_eq!(doc.chunks[0].text, before, "clean text is left as-is");
+        assert!(matches!(ceiling, Sensitivity::Internal));
+    }
+
+    #[tokio::test]
+    async fn fts_index_chunk_makes_redacted_chunk_searchable() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Minimal object_fts (FTS5) — the same shape migration 030 creates.
+        sqlx::query(
+            "CREATE VIRTUAL TABLE object_fts USING fts5(object_type, object_id, title, body, tags)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut doc = ingest_text(
+            "The surplus pipeline targets Florida operators.",
+            None,
+            DEFAULT_CHUNK_SIZE,
+        );
+        guard_document(&mut doc, Sensitivity::Internal);
+        let chunk = &doc.chunks[0];
+        fts_index_chunk(&pool, &chunk.id.to_string(), "pipeline", &chunk.text, "")
+            .await
+            .unwrap();
+
+        // searchable by a body term, scoped to the memory_chunk object type.
+        let row: (String,) = sqlx::query_as(
+            "SELECT object_id FROM object_fts \
+             WHERE object_type = 'memory_chunk' AND object_fts MATCH 'Florida surplus'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, chunk.id.to_string());
+
+        // re-index must replace, not duplicate.
+        fts_index_chunk(&pool, &chunk.id.to_string(), "pipeline", &chunk.text, "")
+            .await
+            .unwrap();
+        let (cnt,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM object_fts WHERE object_type = 'memory_chunk'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cnt, 1, "re-index replaces the prior row");
+    }
 
     #[test]
     fn ingest_text_without_frontmatter() {

@@ -2,6 +2,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{sqlite::SqliteRow, Row, SqlitePool};
 use uuid::Uuid;
 
+use crate::repositories::objects::{ObjectIndexRepository, ObjectIndexRow};
 use crate::util::{
     date_to_text, opt_date_from_text, opt_ts_from_text, opt_uuid_from_text, ts_from_text,
     ts_to_text, uuid_from_text,
@@ -44,6 +45,32 @@ pub struct DecisionRow {
     pub decided_at: DateTime<Utc>,
     pub decided_by: Option<String>,
     pub metadata: serde_json::Value,
+}
+
+/// The retrieval-envelope a caller carries so a decision can enter the index +
+/// FTS substrate when it is written (T1.13). The `decisions` table itself stores
+/// no domain/sensitivity/redaction columns, so — exactly like the
+/// `LearningsRepository` contract (caller-guards) — the verdict travels here from
+/// the upstream `guard_text`/`ingest_guard` call. The write path indexes ONLY
+/// when `redaction_status` is a scanned verdict (`clean`/`redacted`); an
+/// `unscanned`/`quarantined`/`rejected` decision is persisted but NOT indexed
+/// (fail-closed — un-guarded text never becomes a recall/packet candidate).
+#[derive(Debug, Clone)]
+pub struct DecisionIndexEnvelope {
+    pub status: String,
+    pub sensitivity: String,
+    pub domain: String,
+    pub scope: Option<String>,
+    pub categories: String,       // JSON array
+    pub tags: String,             // JSON array
+    pub redaction_status: String, // result of guard_text/ingest_guard
+}
+
+impl DecisionIndexEnvelope {
+    /// True only for scanned verdicts that are safe to index (fail-closed).
+    fn is_indexable(&self) -> bool {
+        matches!(self.redaction_status.as_str(), "clean" | "redacted")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +177,51 @@ impl<'a> TasksRepository<'a> {
         .bind(d.metadata.to_string())
         .execute(self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Save a decision AND route it into the retrieval substrate (T1.13): the
+    /// decision becomes a packet candidate (`object_index`) + full-text searchable
+    /// (`object_fts`) immediately, the same single-maintenance-point contract the
+    /// `LearningsRepository` already honors. The indexed body is `title` + the
+    /// rationale (the searchable prose of a decision).
+    ///
+    /// Fail-closed: if `idx.redaction_status` is not a scanned verdict
+    /// (`clean`/`redacted`), the decision is still persisted but is NOT indexed —
+    /// un-guarded text must never enter the index (R11 / TAG-1). The caller is
+    /// responsible for having run `guard_text`/`ingest_guard` upstream and passing
+    /// the resulting verdict (caller-guards, no double-guard).
+    pub async fn save_decision_indexed(
+        &self,
+        d: &DecisionRow,
+        idx: &DecisionIndexEnvelope,
+    ) -> anyhow::Result<()> {
+        self.save_decision(d).await?;
+        if !idx.is_indexable() {
+            return Ok(());
+        }
+        let body = match &d.rationale {
+            Some(r) => format!("{}\n\n{}", d.title, r),
+            None => d.title.clone(),
+        };
+        ObjectIndexRepository::new(self.pool)
+            .index_object(
+                &ObjectIndexRow {
+                    object_type: "decision".into(),
+                    id: d.id.to_string(),
+                    status: idx.status.clone(),
+                    sensitivity: idx.sensitivity.clone(),
+                    domain: idx.domain.clone(),
+                    scope: idx.scope.clone(),
+                    title: Some(d.title.clone()),
+                    categories: idx.categories.clone(),
+                    tags: idx.tags.clone(),
+                    redaction_status: idx.redaction_status.clone(),
+                    updated_at: d.decided_at,
+                },
+                &body,
+            )
+            .await?;
         Ok(())
     }
 
