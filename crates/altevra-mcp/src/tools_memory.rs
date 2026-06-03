@@ -220,15 +220,14 @@ fn row_to_candidate(r: &altevra_db::ObjectIndexRow) -> PacketCandidate {
     e.sensitivity = r.sensitivity.parse::<Sensitivity>().unwrap();
     e.status = r.status.parse::<ObjectStatus>().unwrap();
     let categories: Vec<String> = serde_json::from_str(&r.categories).unwrap_or_default();
-    PacketCandidate {
-        envelope: e,
-        title: r.title.clone().unwrap_or_default(),
+    PacketCandidate::new(
+        e,
+        r.title.clone().unwrap_or_default(),
         categories,
-        redaction_status: r
-            .redaction_status
+        r.redaction_status
             .parse::<RedactionStatus>()
             .unwrap_or(RedactionStatus::Unscanned),
-    }
+    )
 }
 
 pub fn handle_get_source_of_truth(id: Value, args: &Value) -> McpResponse {

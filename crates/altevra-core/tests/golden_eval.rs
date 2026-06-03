@@ -36,12 +36,12 @@ fn cand(
     );
     e.domain = domain;
     e.sensitivity = sens;
-    PacketCandidate {
-        envelope: e,
-        title: title.to_string(),
-        categories: cats.iter().map(|s| s.to_string()).collect(),
-        redaction_status: redaction,
-    }
+    PacketCandidate::new(
+        e,
+        title,
+        cats.iter().map(|s| s.to_string()).collect(),
+        redaction,
+    )
 }
 
 fn work(terms: &[&str], budget: usize) -> PacketRequest {
