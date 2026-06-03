@@ -67,6 +67,16 @@ impl<'a> ExposureDecisionsRepository<'a> {
         // included_refs / excluded_refs: AGGREGATE counts only — never the
         // {type,id} of a candidate. Storing an id here would re-introduce the
         // existence leak the packet compiler already closes.
+        //
+        // NOTE (R5 / §2.13): the column comments in migration 021_safety.sql still
+        // advertise the OLD leaky shape (`[{type,id,rank,reason}]` /
+        // `[{type,id,reason}]`). That comment is STALE and must NOT be followed —
+        // it is left unedited only because sqlx 0.7 checksums the full migration
+        // file bytes, so changing the comment would `VersionMismatch` every DB that
+        // already applied 021. The authoritative, content-free contract is HERE:
+        //   * included_refs := {"count": <n>}
+        //   * excluded_refs := {"count": <n>, "by_reason": {<reason>: <n>}, "truncated": <bool>}
+        // No object id / title / body / rank ever enters these columns.
         let included_refs = serde_json::json!({ "count": audit.included_count }).to_string();
         let excluded_by_reason: serde_json::Map<String, serde_json::Value> = audit
             .excluded_by_reason
