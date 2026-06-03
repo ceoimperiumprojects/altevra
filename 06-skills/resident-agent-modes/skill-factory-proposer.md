@@ -5,7 +5,7 @@ mode: skill_factory_proposer
 version: 1.0.0
 status: active
 adopted: 2026-06-03
-output_schema: skill_factory_proposer_v1
+output_schema: proposals_v1
 source: ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md §12
 ---
 
@@ -34,27 +34,24 @@ Rules:
 - Deduplicate against existing skills: if a comparable skill already exists, propose a refinement to it or return no proposal rather than a duplicate.
 - Evidence-bound only: do not invent a workflow that is not present in the turns.
 - This mode NEVER installs or applies anything (HP-1, no approve/apply path). It is proposal-only (SI-1) and emits a skill manifest proposal routed to review.
-- Output must be schema-valid; on uncertainty, lower confidence and add a review item rather than overstating.
+- Output must be schema-valid; on uncertainty, return no proposal rather than overstating.
 
-Output JSON (schema: skill_factory_proposer_v1):
+Output JSON — the generic proposal envelope (schema: proposals_v1). Respond with
+ONLY this object, no prose and no markdown fences. Propose at most ONE skill:
+`kind` is `"skill"`; `title` is the skill name; `body` describes the purpose, the
+trigger, the concrete multi-step sequence, and the target agent(s); `evidence_refs`
+cites the turn ids that evidence the recurring workflow. If a comparable skill
+already exists or no workflow recurs ≥2 times, return an empty `proposals` array.
 
 ```json
 {
-  "summary": "",
-  "skill_proposals": [
+  "proposals": [
     {
-      "name": "",
-      "purpose": "",
-      "trigger": "",
-      "steps": [],
-      "target_agents": [],
-      "evidence_turn_ids": [],
-      "duplicate_of": "",
-      "confidence": 0.0
+      "kind": "skill",
+      "title": "",
+      "body": "",
+      "evidence_refs": []
     }
-  ],
-  "review_items": [],
-  "confidence": 0.0,
-  "events_to_emit": []
+  ]
 }
 ```

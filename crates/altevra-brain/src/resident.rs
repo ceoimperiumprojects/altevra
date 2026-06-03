@@ -15,6 +15,23 @@ use altevra_core::resident::{
 };
 use altevra_llm::{ChatMessage, ChatOpts, ModelRole, ModelRouter};
 
+/// Canonical generic-envelope OUTPUT CONTRACT appended to every mode's system
+/// prompt. It is the ONE output shape [`parse_resident_output`] accepts (R10/§4):
+/// a `{proposals:[{kind,title,body,evidence_refs}]}` envelope. Each mode's intent
+/// maps onto `kind` (insight/wiki/category/memory/skill/prompt/...) — the values
+/// `derive_risk_tier` understands. Modes that propose nothing return an empty list.
+///
+/// [`parse_resident_output`]: altevra_core::resident::parse_resident_output
+const GENERIC_OUTPUT_CONTRACT: &str = "OUTPUT CONTRACT (mandatory): \
+Respond with ONLY a single JSON object — no prose, no markdown fences — in EXACTLY \
+this shape: {\"proposals\":[{\"kind\":\"<kind>\",\"title\":\"<short title>\",\
+\"body\":\"<the full sourced reasoning>\",\"evidence_refs\":[\"<object/turn/run id>\"]}]}. \
+Emit one proposal per distilled item. Set \"kind\" to one of: insight, wiki, \
+category, memory, skill, prompt, person, relationship, improvement — choose the \
+kind that matches your mode's intent. Put your reasoning in \"body\" and cite the \
+ids of the evidence you used in \"evidence_refs\". If nothing in the packet \
+supports a real proposal, return {\"proposals\":[]}.";
+
 /// The outcome of one dry resident run.
 #[derive(Debug, Clone)]
 pub struct ResidentRunReport {
@@ -81,11 +98,14 @@ impl<'a> ResidentRunner<'a> {
         let provider_id = provider.id().to_string();
 
         // The mode's description is its (small, single-purpose) system prompt; the
-        // packet is the scoped input. One user message keeps the seam minimal.
-        let messages = vec![
-            ChatMessage::system(&mode.description),
-            ChatMessage::user(packet_text),
-        ];
+        // packet is the scoped input. We append the canonical generic-envelope
+        // OUTPUT CONTRACT so a real model emits the one shape the runtime validator
+        // ([`parse_resident_output`]) accepts across ALL modes (R10/§4). Without
+        // this a model freelances rich markdown/mode-specific JSON that can never
+        // pass schema → status stays failed_schema and no proposal ever lands.
+        // One user message keeps the seam minimal.
+        let system = format!("{}\n\n{}", mode.description.trim(), GENERIC_OUTPUT_CONTRACT);
+        let messages = vec![ChatMessage::system(&system), ChatMessage::user(packet_text)];
         let raw = match provider.complete(&messages, &ChatOpts::default()).await {
             Ok(s) => s,
             Err(_) => {

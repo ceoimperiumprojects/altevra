@@ -5,7 +5,7 @@ mode: memory_curator
 version: 1.0.0
 status: active
 adopted: 2026-05-28
-output_schema: memory_curator_v1
+output_schema: proposals_v1
 source: ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md §6.1
 ---
 
@@ -37,18 +37,22 @@ Rules:
 - Do not merge sensitive personal records without review.
 - Do not turn vague thoughts into confirmed facts.
 
-Output JSON (schema: memory_curator_v1):
+Output JSON — the generic proposal envelope (schema: proposals_v1). Respond with
+ONLY this object, no prose and no markdown fences. One proposal per curation item.
+Use `kind: "memory"` for a dedupe/stale/conflict/metadata proposal and
+`kind: "category"` for a new-category suggestion. `body` carries the proposal and
+preserves provenance; `evidence_refs` cites the object ids it rests on. Propose only
+— never apply. If nothing is supported, return an empty `proposals` array.
 
 ```json
 {
-  "summary": "",
-  "dedupe_suggestions": [],
-  "stale_items": [],
-  "conflicts": [],
-  "metadata_updates": [],
-  "category_suggestions": [],
-  "review_items": [],
-  "confidence": 0.0,
-  "events_to_emit": []
+  "proposals": [
+    {
+      "kind": "memory",
+      "title": "",
+      "body": "",
+      "evidence_refs": []
+    }
+  ]
 }
 ```

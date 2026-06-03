@@ -5,7 +5,7 @@ mode: wiki_curator
 version: 1.0.0
 status: active
 adopted: 2026-05-28
-output_schema: wiki_curator_v1
+output_schema: proposals_v1
 source: ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md §6.4
 ---
 
@@ -45,20 +45,23 @@ Do not dump raw logs into wiki pages.
 
 Do not rewrite the whole page unless the topic changed significantly.
 
-Output JSON (schema: wiki_curator_v1):
+Output JSON — the generic proposal envelope (schema: proposals_v1). Respond with
+ONLY this object, no prose and no markdown fences. Emit at most ONE proposal:
+`kind` is `"wiki"`; `title` is the topic; `body` carries the action
+(create/update/split/merge), the proposed page markdown, the sections changed, new
+`[[wiki-links]]`, and any open questions; `evidence_refs` cites the source object
+ids and related wiki pages. If the page should be left unchanged, return an empty
+`proposals` array.
 
 ```json
 {
-  "action": "create|update|split|merge|unchanged",
-  "topic": "",
-  "summary_of_change": "",
-  "sections_changed": [],
-  "new_links": [],
-  "open_questions": [],
-  "confidence": 0.0,
-  "proposed_page_markdown": "",
-  "review_required": false,
-  "review_reason": "",
-  "events_to_emit": []
+  "proposals": [
+    {
+      "kind": "wiki",
+      "title": "",
+      "body": "",
+      "evidence_refs": []
+    }
+  ]
 }
 ```

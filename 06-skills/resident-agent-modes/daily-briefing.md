@@ -5,7 +5,7 @@ mode: daily_briefing
 version: 1.0.0
 status: active
 adopted: 2026-05-28
-output_schema: daily_briefing_v1
+output_schema: proposals_v1
 source: ALTEVRA_NEXT_ARCHITECTURE_RESIDENT_AGENT_WIKI_PERSONAL_BRAIN.md §6.3
 ---
 
@@ -41,7 +41,14 @@ Sections:
 7. Personal signals if relevant
 8. Suggested focus today
 
-Output Markdown (template: daily_briefing_v1):
+Output JSON — the generic proposal envelope (schema: proposals_v1). Respond with
+ONLY this object, no prose and no markdown fences. Emit ONE proposal: `kind` is
+`"insight"`; `title` is `Daily Brief — {date}`; `body` is the brief itself as
+markdown using the sections below; `evidence_refs` cites the object/session/research
+ids the brief draws on. If there is nothing worth briefing, return an empty
+`proposals` array.
+
+Body sections (inside `body`):
 
 ```markdown
 # Daily Brief — {date}
@@ -61,4 +68,17 @@ Output Markdown (template: daily_briefing_v1):
 ## Personal Signals
 
 ## Suggested Focus
+```
+
+```json
+{
+  "proposals": [
+    {
+      "kind": "insight",
+      "title": "Daily Brief — {date}",
+      "body": "",
+      "evidence_refs": []
+    }
+  ]
+}
 ```
