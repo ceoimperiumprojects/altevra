@@ -311,11 +311,11 @@ Bug reports, documentation fixes, and small enhancements are always welcome.
 
 ## Credits
 
-Built by **[Pavle Anđelković](https://github.com/ceoimperiumprojects)**, with engineering assistance from **Claude Opus 4.7 / 4.8** and **Hermes**.
+Built by **[Pavle Anđelković](https://github.com/ceoimperiumprojects)**.
 
-> *"Ne pravim alat. Pravim mašinu koja pravi proizvode."*
+> *"I don't build tools. I build machines that build products."*
 
-> *"Bukvalno pravim kroz godine ću napraviti digitalnu verziju sebe."*
+> *"I'm literally building a digital version of myself, year over year."*
 
 ---
 
