@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./docs/branding/altevra-logo.png" alt="Altevra" width="220" />
+
 ```
     █████╗ ██╗  ████████╗███████╗██╗   ██╗██████╗  █████╗
    ██╔══██╗██║  ╚══██╔══╝██╔════╝██║   ██║██╔══██╗██╔══██╗
