@@ -114,6 +114,19 @@ enum Commands {
     /// Handle a tool hook event (reads JSON from stdin)
     HookHandle(commands::hook_handle::HookHandleArgs),
 
+    /// Wire Altevra into every AI tool's global config in one shot (Claude
+    /// Code, Codex, Cursor, Hermes). Additive: never deletes existing entries
+    /// (imperium-emit etc.). Backs up each config before writing. Idempotent
+    /// re-runs; drift on managed entries requires `--force`. After global wire,
+    /// smart-scope auto-detects high-value per-project repos.
+    InstallHooks(commands::install_hooks::InstallHooksArgs),
+
+    /// Backfill historical sessions from a tool's local storage.
+    /// Currently supports `--tool hermes` (reads `~/.hermes/sessions/*.jsonl`,
+    /// idempotent on `(tool, external_id)`, guard_text/guard_json applied
+    /// before persist).
+    Import(commands::import::ImportArgs),
+
     /// File watcher daemon — emits FileChanged events and queues for embedding
     #[command(subcommand)]
     Watch(commands::watch::WatchCommands),
@@ -194,6 +207,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::Capture(args) => commands::capture::run(args).await,
         Commands::Files(cmd) => commands::files::run(cmd).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,
+        Commands::InstallHooks(args) => commands::install_hooks::run(args).await,
+        Commands::Import(args) => commands::import::run(args).await,
         Commands::Watch(cmd) => commands::watch::run(cmd).await,
         Commands::Embed(cmd) => commands::embed::run(cmd).await,
         Commands::Brain(cmd) => commands::brain::run(cmd).await,
