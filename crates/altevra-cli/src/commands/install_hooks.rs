@@ -14,8 +14,23 @@
 //!    unconditionally, BEFORE parsing or modifying anything.
 //! 2. **Additive only** — never delete existing entries. We append Altevra entries
 //!    alongside whatever else is there (imperium-emit, herdr, gsd hooks, ...).
-//! 3. **Self-skip** — if the detected hermes/altevra path IS this repo itself,
-//!    skip (SI-6: never let Altevra feed its own output back into itself).
+//! 3. **Self-skip (SI-6 — two layers)** —
+//!    - **Global gate** — `run()` refuses entirely (with a `bail!`) when the
+//!      current working directory is inside the Altevra workspace. This stops
+//!      Pavle from accidentally wiring `$HOME/.claude/settings.json` (which
+//!      lives OUTSIDE the repo) while sitting in the repo: those global hooks
+//!      would fire during Altevra's own dev sessions and create a feedback
+//!      loop. Override with `ALTEVRA_BYPASS_SELF_SKIP=1` only if you really
+//!      mean it.
+//!    - **Per-target check** — `is_altevra_repo_target()` additionally refuses
+//!      when a *specific* target path is itself inside the Altevra workspace
+//!      (e.g. smart-scope landing on the repo's own `.claude/settings.json`).
+//!
+//!    Both layers detect Altevra by *parsing* `Cargo.toml` — `[package].name`
+//!    equals `altevra` or starts with `altevra-`, OR the file is a workspace
+//!    root listing `altevra-*` members. Substring matches on raw text are
+//!    forbidden because a downstream Cargo.toml may legitimately list
+//!    `altevra = "x.y"` as a dependency.
 //! 4. **Idempotent** — re-running with no changes does nothing; entries are
 //!    identified by the `_altevra_managed: true` marker.
 //! 5. **Drift = require --force** — if a managed entry exists with content that
@@ -57,6 +72,11 @@ pub const MANAGED_MARKER: &str = "_altevra_managed";
 /// Tools we support. The CLI's `--tool` flag accepts these strings (or `all`).
 const SUPPORTED_TOOLS: &[&str] = &["claude-code", "codex", "cursor", "hermes"];
 
+/// Set this to `1` to override the SI-6 global self-skip gate (run from inside
+/// the Altevra repo). Intended only for maintainers explicitly re-wiring after
+/// a clean state — normal users should never need it.
+const SELF_SKIP_BYPASS_ENV: &str = "ALTEVRA_BYPASS_SELF_SKIP";
+
 #[derive(Args, Clone, Debug)]
 pub struct InstallHooksArgs {
     /// Which tool to wire. Defaults to wiring all four.
@@ -80,6 +100,13 @@ pub struct InstallHooksArgs {
     /// Tests point this at a temp dir; real runs leave it None.
     #[arg(long, hide = true)]
     pub projects_root: Option<PathBuf>,
+
+    /// Bypass the SI-6 global self-skip gate (run from inside the altevra
+    /// repo). Equivalent to setting `ALTEVRA_BYPASS_SELF_SKIP=1`. Hidden flag
+    /// intended for in-process tests that already operate against a TempDir
+    /// HOME, so process-global env mutation isn't needed.
+    #[arg(long, hide = true)]
+    pub bypass_self_skip: bool,
 }
 
 /// Outcome of patching one tool's global config, returned for reporting.
@@ -98,6 +125,28 @@ pub struct PatchOutcome {
 pub async fn run(args: InstallHooksArgs) -> Result<()> {
     let home = resolve_home(&args)?;
     let tools = resolve_tool_set(args.tool.as_deref())?;
+
+    // SI-6 global self-skip gate: refuse the entire install when cwd is inside
+    // the Altevra workspace. The per-target check below catches the case where
+    // a *specific* target sits inside the repo, but the global config paths
+    // ($HOME/.claude/settings.json etc.) live OUTSIDE the repo — so without
+    // this gate, running `altevra install-hooks` from `~/projekti/.../altevra`
+    // would happily patch global configs and create a feedback loop in
+    // Altevra's own dev sessions.
+    let bypass_self_skip = args.bypass_self_skip
+        || std::env::var(SELF_SKIP_BYPASS_ENV).ok().as_deref() == Some("1");
+    if let Some(repo_root) = detect_altevra_workspace_from_cwd() {
+        let cwd = std::env::current_dir().ok();
+        log_self_skip_decision(&home, repo_root.as_path(), cwd.as_deref(), bypass_self_skip);
+        if !bypass_self_skip {
+            bail!(
+                "altevra install-hooks refuses to run from inside the altevra repo itself \
+                 (SI-6 self-write exclusion). Detected workspace at {}. Run it from another \
+                 directory or set {SELF_SKIP_BYPASS_ENV}=1 to override.",
+                repo_root.display()
+            );
+        }
+    }
 
     println!("altevra install-hooks");
     println!("  home: {}", home.display());
@@ -697,38 +746,128 @@ fn write_yaml(path: &Path, root: &serde_yaml::Value) -> Result<()> {
 // Self-skip — never wire Altevra into Altevra's own dev tree (SI-6)
 // ───────────────────────────────────────────────────────────────────────────
 
-/// True if the target config path is inside this very repo (so we're being
-/// asked to wire Altevra into itself — refused). We detect this by walking up
-/// from the target and looking for a `Cargo.toml` whose `[package].name`
-/// starts with `altevra`.
+/// True if the target config path lives inside the Altevra workspace. Used by
+/// the per-target self-skip (e.g. when smart-scope would patch the repo's own
+/// `.claude/settings.json`). The global-gate in `run()` handles the case where
+/// the *cwd* is inside the repo but the *target* is outside it.
 fn is_altevra_repo_target(target: &Path) -> bool {
-    // The real configs live under `$HOME/.<tool>/...`. The altevra repo lives
-    // somewhere like `$HOME/projekti/.../altevra/`. If the cwd resolves into a
-    // workspace whose Cargo.toml mentions altevra AND the target path is
-    // inside the same workspace, treat as self.
-    let Ok(cwd) = std::env::current_dir() else {
-        return false;
-    };
-    let mut probe = cwd.as_path();
+    // Walk up from the target itself, since the target is the path we'd write.
+    if let Some(root) = find_altevra_workspace_from(target) {
+        if target.starts_with(&root) {
+            return true;
+        }
+    }
+    // Belt-and-braces: also catch the case where cwd is in the altevra repo
+    // and the target sits within it (preserves prior behaviour for the
+    // existing `install_hooks_self_skip_altevra_repo` test where the target
+    // is inside cwd).
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(root) = find_altevra_workspace_from(&cwd) {
+            if target.starts_with(&root) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Walk up from `current_dir()` looking for the Altevra workspace root.
+/// Returns the deepest matching Cargo.toml directory, or None if cwd is not
+/// inside Altevra.
+fn detect_altevra_workspace_from_cwd() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    find_altevra_workspace_from(&cwd)
+}
+
+/// Walk up from `start` looking for a `Cargo.toml` that identifies as the
+/// Altevra workspace (real package name match — NOT a raw substring scan).
+/// Returns the directory containing that Cargo.toml.
+fn find_altevra_workspace_from(start: &Path) -> Option<PathBuf> {
+    let mut probe = start;
     loop {
-        if probe.join("Cargo.toml").exists() {
-            if let Ok(text) = fs::read_to_string(probe.join("Cargo.toml")) {
-                if text.contains("altevra") {
-                    // We're in the altevra repo. If the target is also inside
-                    // this tree, refuse.
-                    if target.starts_with(probe) {
-                        return true;
-                    }
-                    return false;
+        let cargo = probe.join("Cargo.toml");
+        if cargo.exists() {
+            if let Ok(text) = fs::read_to_string(&cargo) {
+                if cargo_toml_is_altevra_workspace(&text) {
+                    return Some(probe.to_path_buf());
                 }
             }
         }
         match probe.parent() {
             Some(p) if p != probe => probe = p,
-            _ => break,
+            _ => return None,
         }
     }
+}
+
+/// Decide whether a `Cargo.toml`'s content identifies it as an Altevra
+/// workspace/crate. Uses a real TOML parse — a downstream Cargo.toml that
+/// merely lists `altevra = "1.0"` as a dependency must NOT trigger self-skip.
+///
+/// Match criteria (any one is sufficient):
+/// 1. `[package].name` equals `altevra` or starts with `altevra-`.
+/// 2. `[workspace].members` contains any entry whose path segment starts
+///    with `altevra-` or equals `altevra`/`crates/altevra` (covers the
+///    workspace-root case where there is no `[package]`).
+fn cargo_toml_is_altevra_workspace(text: &str) -> bool {
+    let Ok(value) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+
+    if let Some(name) = value
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(toml::Value::as_str)
+    {
+        if name == "altevra" || name.starts_with("altevra-") {
+            return true;
+        }
+    }
+
+    if let Some(members) = value
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+    {
+        for m in members {
+            if let Some(s) = m.as_str() {
+                let last = s.rsplit('/').next().unwrap_or(s);
+                if last == "altevra" || last.starts_with("altevra-") {
+                    return true;
+                }
+            }
+        }
+    }
+
     false
+}
+
+/// Append a JSON-ish line to `~/.altevra/install-hooks-decisions.log` recording
+/// the global self-skip outcome. We use the same log file that smart-scope
+/// writes to so a single forensic record covers every refusal.
+fn log_self_skip_decision(home: &Path, repo_root: &Path, cwd: Option<&Path>, bypassed: bool) {
+    let log_dir = home.join(".altevra");
+    if let Err(_e) = fs::create_dir_all(&log_dir) {
+        return;
+    }
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let action = if bypassed { "ALLOW-BYPASS" } else { "DENY" };
+    let line = format!(
+        "{ts}\tSELF-SKIP-GLOBAL\trepo={}\tcwd={}\taction={action}\tenv={SELF_SKIP_BYPASS_ENV}={}\n",
+        repo_root.display(),
+        cwd.map(|p| p.display().to_string()).unwrap_or_default(),
+        if bypassed { "1" } else { "unset" }
+    );
+    let log_path = log_dir.join("install-hooks-decisions.log");
+    let mut prior = fs::read_to_string(&log_path).unwrap_or_default();
+    if !prior.is_empty() && !prior.ends_with('\n') {
+        prior.push('\n');
+    }
+    prior.push_str(&line);
+    let _ = fs::write(&log_path, prior);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -823,7 +962,7 @@ fn repo_is_altevra(repo: &Path) -> bool {
         return false;
     }
     fs::read_to_string(&cargo)
-        .map(|t| t.contains("altevra"))
+        .map(|t| cargo_toml_is_altevra_workspace(&t))
         .unwrap_or(false)
 }
 
@@ -937,10 +1076,26 @@ fn dir_writable(file: &Path) -> bool {
 // ───────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// `cwd_lock()` returns a `std::sync::MutexGuard` that intentionally lives
+// across `run(args).await` to serialize cwd + env var manipulation. This is
+// safe here because each `#[tokio::test]` builds its own current-thread
+// runtime, so the guard never travels between threads.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    /// Mutex guarding tests that touch process-global state (cwd or the
+    /// SELF_SKIP_BYPASS_ENV var). Without it, parallel test runs race on
+    /// `set_current_dir` and see another test's fake altevra workspace.
+    fn cwd_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Seed the existing imperium-emit entry so we can assert we preserved it.
     fn seed_claude_settings(home: &Path) -> PathBuf {
@@ -964,6 +1119,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_claude_code_additive() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         seed_claude_settings(tmp.path());
 
@@ -973,6 +1129,9 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            // `cargo test` runs from the altevra workspace dir, which would
+            // trip the SI-6 global gate. Bypass it for fixture-only tests.
+            bypass_self_skip: true,
         };
         run(args).await.unwrap();
 
@@ -1001,6 +1160,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_idempotent() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         seed_claude_settings(tmp.path());
 
@@ -1010,6 +1170,7 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            bypass_self_skip: true,
         };
         run(args.clone()).await.unwrap();
         // Capture entry count after first run.
@@ -1027,6 +1188,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_drift_requires_force() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         seed_claude_settings(tmp.path());
 
@@ -1036,6 +1198,7 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            bypass_self_skip: true,
         };
         run(args.clone()).await.unwrap();
 
@@ -1079,6 +1242,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_smart_scope_decides_per_project() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let projects = home.join("projekti");
@@ -1143,6 +1307,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_backup_always_written() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let path = seed_claude_settings(tmp.path());
 
@@ -1152,6 +1317,7 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            bypass_self_skip: true,
         };
         run(args).await.unwrap();
 
@@ -1175,9 +1341,11 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_self_skip_altevra_repo() {
-        // Build a fake "altevra repo" tree with a Cargo.toml mentioning altevra,
-        // and aim the install at a settings.json INSIDE that tree. We must
-        // refuse and write nothing.
+        let _guard = cwd_lock();
+        // Build a fake "altevra repo" tree with a Cargo.toml whose
+        // [package].name starts with `altevra-`, and aim the install at a
+        // settings.json INSIDE that tree. The global gate must bail() and
+        // nothing must be written.
         let tmp = TempDir::new().unwrap();
         let fake_repo = tmp.path().join("fake-altevra");
         fs::create_dir_all(&fake_repo).unwrap();
@@ -1186,9 +1354,10 @@ mod tests {
         let home_inside = fake_repo.join("home");
         fs::create_dir_all(&home_inside).unwrap();
 
-        // cd into fake repo so is_altevra_repo_target can find Cargo.toml.
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&fake_repo).unwrap();
+        // Ensure bypass is OFF for this test.
+        std::env::remove_var(SELF_SKIP_BYPASS_ENV);
 
         let args = InstallHooksArgs {
             tool: Some("claude-code".into()),
@@ -1196,10 +1365,17 @@ mod tests {
             dry_run: false,
             home: Some(home_inside.clone()),
             projects_root: None,
+            bypass_self_skip: false,
         };
         let res = run(args).await;
         std::env::set_current_dir(prev).unwrap();
-        res.unwrap();
+        let err = res.expect_err("global self-skip gate did not refuse");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("refuses to run from inside the altevra repo"),
+            "bail message wrong: {msg}"
+        );
+        assert!(msg.contains(SELF_SKIP_BYPASS_ENV), "missing bypass hint: {msg}");
 
         // No file should have been created.
         assert!(
@@ -1209,7 +1385,187 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn install_hooks_global_refuses_from_altevra_repo_cwd() {
+        let _guard = cwd_lock();
+        // The dangerous real-world scenario: cwd is inside the Altevra repo
+        // but the target is $HOME/.claude/settings.json which is OUTSIDE the
+        // repo. The pre-fix code returned Ok with self_skipped=false and
+        // happily patched the global config. The new global gate must bail.
+        let tmp = TempDir::new().unwrap();
+        let fake_repo = tmp.path().join("altevra-workspace");
+        fs::create_dir_all(fake_repo.join("crates/altevra-cli")).unwrap();
+        fs::write(
+            fake_repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/altevra-cli\", \"crates/altevra-core\"]\n",
+        )
+        .unwrap();
+
+        // HOME lives in a sibling dir — fully outside the repo.
+        let home_outside = tmp.path().join("user-home");
+        fs::create_dir_all(&home_outside).unwrap();
+        // Pre-create a settings.json so we can prove it was NOT mutated.
+        let target = home_outside.join(".claude/settings.json");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        let original = r#"{"hooks": {"SessionStart": []}}"#;
+        fs::write(&target, original).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&fake_repo).unwrap();
+        std::env::remove_var(SELF_SKIP_BYPASS_ENV);
+
+        let args = InstallHooksArgs {
+            tool: Some("claude-code".into()),
+            force: false,
+            dry_run: false,
+            home: Some(home_outside.clone()),
+            projects_root: None,
+            bypass_self_skip: false,
+        };
+        let res = run(args).await;
+        std::env::set_current_dir(prev).unwrap();
+        let err = res.expect_err("global gate did not refuse with cwd inside altevra");
+        let msg = format!("{err}");
+        assert!(msg.contains("SI-6") || msg.contains("self-write"), "msg: {msg}");
+
+        // Pre-existing settings.json must be untouched (byte-identical).
+        let after = fs::read_to_string(&target).unwrap();
+        assert_eq!(after, original, "global config was mutated despite refusal");
+
+        // Decisions log records a DENY line for the global self-skip.
+        let log_path = home_outside.join(".altevra/install-hooks-decisions.log");
+        assert!(log_path.exists(), "decisions log not written");
+        let log = fs::read_to_string(&log_path).unwrap();
+        assert!(log.contains("SELF-SKIP-GLOBAL"), "log line missing tag: {log}");
+        assert!(log.contains("action=DENY"), "log line missing action=DENY: {log}");
+        assert!(
+            log.contains("env=ALTEVRA_BYPASS_SELF_SKIP=unset"),
+            "log line missing env marker: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_hooks_self_skip_bypass_env_allows() {
+        let _guard = cwd_lock();
+        // Same setup as `install_hooks_global_refuses_from_altevra_repo_cwd`
+        // but with ALTEVRA_BYPASS_SELF_SKIP=1 — the gate logs ALLOW-BYPASS
+        // and proceeds with the install.
+        let tmp = TempDir::new().unwrap();
+        let fake_repo = tmp.path().join("altevra-workspace");
+        fs::create_dir_all(fake_repo.join("crates/altevra-cli")).unwrap();
+        fs::write(
+            fake_repo.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/altevra-cli\"]\n",
+        )
+        .unwrap();
+        let home_outside = tmp.path().join("user-home");
+        fs::create_dir_all(&home_outside).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&fake_repo).unwrap();
+        std::env::set_var(SELF_SKIP_BYPASS_ENV, "1");
+
+        let args = InstallHooksArgs {
+            tool: Some("claude-code".into()),
+            force: false,
+            dry_run: false,
+            home: Some(home_outside.clone()),
+            projects_root: None,
+            // Intentionally false — we want to confirm the *env* var alone
+            // bypasses the gate.
+            bypass_self_skip: false,
+        };
+        let res = run(args).await;
+        // Always clean up the env + cwd, even on failure.
+        std::env::set_current_dir(prev).unwrap();
+        std::env::remove_var(SELF_SKIP_BYPASS_ENV);
+        res.expect("bypass env should allow the install to proceed");
+
+        // Settings file was created (gate did not bail).
+        assert!(
+            home_outside.join(".claude/settings.json").exists(),
+            "bypass env failed: settings.json was not written"
+        );
+        // Log records the bypass.
+        let log = fs::read_to_string(home_outside.join(".altevra/install-hooks-decisions.log"))
+            .unwrap();
+        assert!(log.contains("action=ALLOW-BYPASS"), "log missing bypass: {log}");
+    }
+
+    #[tokio::test]
+    async fn install_hooks_downstream_cargo_dep_does_not_self_skip() {
+        let _guard = cwd_lock();
+        // Pavle ships a downstream project that lists altevra as a *dependency*.
+        // Running `altevra install-hooks` from that project's cwd MUST NOT
+        // refuse — only matching the altevra workspace/crate by package name
+        // counts.
+        let tmp = TempDir::new().unwrap();
+        let downstream = tmp.path().join("downstream-app");
+        fs::create_dir_all(&downstream).unwrap();
+        fs::write(
+            downstream.join("Cargo.toml"),
+            "[package]\nname = \"downstream-app\"\nversion = \"0.1.0\"\n\
+             [dependencies]\naltevra = \"1.0\"\nserde = \"1\"\n",
+        )
+        .unwrap();
+        let home_outside = tmp.path().join("user-home");
+        fs::create_dir_all(&home_outside).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&downstream).unwrap();
+        std::env::remove_var(SELF_SKIP_BYPASS_ENV);
+
+        let args = InstallHooksArgs {
+            tool: Some("claude-code".into()),
+            force: false,
+            dry_run: false,
+            home: Some(home_outside.clone()),
+            projects_root: None,
+            bypass_self_skip: false,
+        };
+        let res = run(args).await;
+        std::env::set_current_dir(prev).unwrap();
+        res.expect("downstream Cargo.toml with altevra dep must not trigger self-skip");
+
+        // And we DID write the settings.json (proof the gate didn't fire).
+        assert!(home_outside.join(".claude/settings.json").exists());
+    }
+
+    #[test]
+    fn cargo_toml_detects_real_altevra_workspace() {
+        // Package-name match.
+        assert!(cargo_toml_is_altevra_workspace(
+            "[package]\nname = \"altevra-cli\"\nversion = \"0.1\"\n"
+        ));
+        assert!(cargo_toml_is_altevra_workspace(
+            "[package]\nname = \"altevra\"\nversion = \"0.1\"\n"
+        ));
+        // Workspace-members match (the real altevra root Cargo.toml shape).
+        assert!(cargo_toml_is_altevra_workspace(
+            "[workspace]\nmembers = [\"crates/altevra-core\", \"crates/altevra-cli\"]\n"
+        ));
+    }
+
+    #[test]
+    fn cargo_toml_rejects_downstream_with_altevra_dep() {
+        // The whole point of the tighter check: a downstream Cargo.toml that
+        // merely depends on altevra must NOT be classified as altevra itself.
+        assert!(!cargo_toml_is_altevra_workspace(
+            "[package]\nname = \"customer-app\"\nversion = \"0.1\"\n\
+             [dependencies]\naltevra = \"1.0\"\n"
+        ));
+        // Also reject names that *contain* altevra but don't start with it.
+        assert!(!cargo_toml_is_altevra_workspace(
+            "[package]\nname = \"some-altevra-thing\"\nversion = \"0.1\"\n"
+        ));
+        // Unrelated workspace with no altevra members.
+        assert!(!cargo_toml_is_altevra_workspace(
+            "[workspace]\nmembers = [\"crates/foo\", \"crates/bar\"]\n"
+        ));
+    }
+
+    #[tokio::test]
     async fn install_hooks_cursor_v1_schema() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         let args = InstallHooksArgs {
             tool: Some("cursor".into()),
@@ -1217,6 +1573,7 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            bypass_self_skip: true,
         };
         run(args).await.unwrap();
         let text = fs::read_to_string(tmp.path().join(".cursor/hooks.json")).unwrap();
@@ -1236,6 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn install_hooks_hermes_writes_bridge_script() {
+        let _guard = cwd_lock();
         let tmp = TempDir::new().unwrap();
         // Seed a minimal hermes config with an existing imperium-emit hook to
         // confirm we preserve it.
@@ -1253,6 +1611,7 @@ mod tests {
             dry_run: false,
             home: Some(tmp.path().to_path_buf()),
             projects_root: None,
+            bypass_self_skip: true,
         };
         run(args).await.unwrap();
 
