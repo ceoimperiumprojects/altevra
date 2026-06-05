@@ -6,6 +6,7 @@ pub mod cursor;
 pub mod cursor_cli;
 pub mod factory;
 pub mod hermes;
+pub mod hermes_ingest_sh;
 
 pub use antigravity::AntigravityAdapter;
 pub use base::{

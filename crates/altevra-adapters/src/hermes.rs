@@ -173,10 +173,26 @@ impl ToolAdapter for HermesAdapter {
         Ok(files)
     }
 
-    /// Hermes has its own native hook/cron system — Altevra does not render hooks
-    /// for it (Hermes owns scheduling, per the Symbiosis split).
+    /// Render the Hermes → Altevra ingest bridge.
+    ///
+    /// Hermes owns its own native hook/cron lifecycle (scheduling, ordering,
+    /// gating), but its `shell_hooks.py` runner CAN invoke external scripts
+    /// with the hook payload piped to stdin and `HOOK_EVENT_NAME` in env.
+    /// We render exactly one such bridge — `hooks/altevra-ingest.sh` — which
+    /// maps Hermes event names (`pre_tool_call`, `post_tool_call`,
+    /// `session_start`, `session_end`, `post_llm_call`, `pre_llm_call`) to
+    /// the matching Altevra event names and forwards the payload to
+    /// `altevra hook-handle`. The script always exits 0 so Altevra never
+    /// blocks Hermes (sibling agent, not gate).
+    ///
+    /// Wiring the script into Hermes' `~/.hermes/config.yaml` is a separate,
+    /// additive step (next task) — this only places the bridge on disk.
     fn render_hooks(&self, _hooks: Vec<&UniversalHook>) -> anyhow::Result<Vec<GeneratedFile>> {
-        Ok(vec![])
+        let file = GeneratedFile::new(
+            "hooks/altevra-ingest.sh",
+            crate::hermes_ingest_sh::altevra_ingest_sh_content().to_string(),
+        );
+        Ok(vec![file])
     }
 
     fn build_install_plan(
@@ -335,6 +351,43 @@ mod tests {
         );
         let files = a.render_skills(vec![&leaky]).unwrap();
         assert!(files.is_empty(), "skill with a secret must be refused");
+    }
+
+    #[test]
+    fn render_hooks_emits_altevra_ingest_script() {
+        let a = HermesAdapter::new();
+        let files = a.render_hooks(vec![]).unwrap();
+        assert_eq!(files.len(), 1, "Hermes adapter must render exactly one hook bridge");
+        let f = &files[0];
+        assert_eq!(
+            f.path,
+            std::path::PathBuf::from("hooks/altevra-ingest.sh"),
+            "bridge path must be hooks/altevra-ingest.sh"
+        );
+        // Bash shebang on line 1.
+        assert!(
+            f.content.starts_with("#!/usr/bin/env bash"),
+            "script must start with bash shebang"
+        );
+        // Managed marker for drift detection.
+        assert!(
+            f.content.contains("# ALTEVRA_MANAGED: true"),
+            "script must carry the ALTEVRA_MANAGED marker"
+        );
+        // Forwards to altevra hook-handle with --tool hermes.
+        assert!(
+            f.content.contains("altevra hook-handle"),
+            "script must call altevra hook-handle"
+        );
+        assert!(
+            f.content.contains("--tool hermes"),
+            "script must identify source as --tool hermes"
+        );
+        // Always exits 0 (never blocks Hermes).
+        assert!(
+            f.content.contains("exit 0"),
+            "script must always exit 0"
+        );
     }
 
     #[test]
