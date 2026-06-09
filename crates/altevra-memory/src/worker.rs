@@ -130,9 +130,197 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
         Ok(n)
     }
 
+    /// Drain the `pending_indexing` file queue (fed by the vault watcher daemon
+    /// and the brain's `vault_indexer` job). For each pending path:
+    ///
+    ///   1. `ingest_file` → chunk the markdown,
+    ///   2. `guard_document` → redact secrets/PII BEFORE anything persists,
+    ///   3. upsert `memory_documents` + replace its `memory_chunks`,
+    ///   4. enqueue every chunk into `embedder_queue` (the lane `tick` embeds).
+    ///
+    /// Idempotency: a path whose raw-byte checksum matches the stored document
+    /// is marked `done` without re-chunking. A changed file replaces its old
+    /// chunks (their `embedder_queue`/vector rows are removed explicitly — no
+    /// reliance on FK cascades). Unreadable paths are marked `failed` with the
+    /// error preserved in the row.
+    ///
+    /// Returns the number of queue rows processed (done + failed).
+    pub async fn drain_pending_files(&self) -> anyhow::Result<usize> {
+        let rows = sqlx::query(
+            r#"SELECT id, path FROM pending_indexing
+               WHERE status = 'pending'
+               ORDER BY queued_at
+               LIMIT ?"#,
+        )
+        .bind(self.config.batch_size as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut processed = 0usize;
+        for row in rows {
+            let row_id: String = row.get("id");
+            let path: String = row.get("path");
+            match self.index_file(&path).await {
+                Ok(()) => {
+                    let _ = sqlx::query(
+                        r#"UPDATE pending_indexing
+                           SET status = 'done',
+                               last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                               error = NULL
+                           WHERE id = ?"#,
+                    )
+                    .bind(&row_id)
+                    .execute(&self.pool)
+                    .await;
+                }
+                Err(e) => {
+                    let _ = sqlx::query(
+                        r#"UPDATE pending_indexing
+                           SET status = 'failed',
+                               last_attempt_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                               error = ?,
+                               fail_count = fail_count + 1
+                           WHERE id = ?"#,
+                    )
+                    .bind(e.to_string())
+                    .bind(&row_id)
+                    .execute(&self.pool)
+                    .await;
+                }
+            }
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    /// Ingest ONE file into memory_documents/memory_chunks and enqueue its
+    /// chunks for embedding. No-op when the file is byte-identical to the
+    /// stored document (checksum match).
+    async fn index_file(&self, path: &str) -> anyhow::Result<()> {
+        use crate::chunker::DEFAULT_CHUNK_SIZE;
+        use crate::ingestion::{guard_document, ingest_file};
+        use altevra_core::security::Sensitivity;
+
+        let mut doc = ingest_file(std::path::Path::new(path), DEFAULT_CHUNK_SIZE)?;
+
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT id, checksum FROM memory_documents WHERE source_path = ?")
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some((_, ref checksum)) = existing {
+            if *checksum == doc.checksum {
+                return Ok(()); // unchanged — already indexed
+            }
+        }
+
+        // Redact secrets/PII in every chunk BEFORE persisting (same contract as
+        // the capture lane: unguarded text never reaches the DB or the embedder).
+        guard_document(&mut doc, Sensitivity::Internal);
+
+        let title = doc
+            .frontmatter
+            .as_ref()
+            .and_then(|f| f.get("title"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let body: String = doc
+            .chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let doc_id = match existing {
+            Some((id, _)) => {
+                sqlx::query(
+                    r#"UPDATE memory_documents
+                       SET title = ?, body = ?, checksum = ?,
+                           indexed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                       WHERE id = ?"#,
+                )
+                .bind(&title)
+                .bind(&body)
+                .bind(&doc.checksum)
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+                // Stale chunks die with their queue/vector rows. Explicit
+                // deletes — SQLite FK cascades only fire when the pragma is on.
+                sqlx::query(
+                    "DELETE FROM embedder_queue WHERE chunk_id IN \
+                     (SELECT id FROM memory_chunks WHERE document_id = ?)",
+                )
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM memory_chunk_vectors_v2 WHERE chunk_id IN \
+                     (SELECT id FROM memory_chunks WHERE document_id = ?)",
+                )
+                .bind(&id)
+                .execute(&self.pool)
+                .await?;
+                sqlx::query("DELETE FROM memory_chunks WHERE document_id = ?")
+                    .bind(&id)
+                    .execute(&self.pool)
+                    .await?;
+                id
+            }
+            None => {
+                let id = doc.document_id.to_string();
+                sqlx::query(
+                    "INSERT INTO memory_documents (id, source_path, title, body, checksum) \
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(&id)
+                .bind(path)
+                .bind(&title)
+                .bind(&body)
+                .bind(&doc.checksum)
+                .execute(&self.pool)
+                .await?;
+                id
+            }
+        };
+
+        for c in &doc.chunks {
+            let heading =
+                serde_json::to_string(&c.meta.heading_path).unwrap_or_else(|_| "[]".into());
+            sqlx::query(
+                r#"INSERT INTO memory_chunks
+                   (id, document_id, heading_path, text, checksum, start_byte, end_byte)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)"#,
+            )
+            .bind(c.id.to_string())
+            .bind(&doc_id)
+            .bind(heading)
+            .bind(&c.text)
+            .bind(&c.checksum)
+            .bind(c.meta.start_byte as i64)
+            .bind(c.meta.end_byte as i64)
+            .execute(&self.pool)
+            .await?;
+            sqlx::query(
+                r#"INSERT INTO embedder_queue (chunk_id, status) VALUES (?, 'pending')
+                   ON CONFLICT(chunk_id) DO NOTHING"#,
+            )
+            .bind(c.id.to_string())
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Run a single batch. Returns the number of chunks SUCCESSFULLY embedded.
     #[allow(clippy::await_holding_lock)]
     pub async fn tick(&self) -> anyhow::Result<usize> {
+        // Stage 0: drain the pending_indexing file queue into memory_chunks +
+        // embedder_queue so queued vault files actually reach the embed lane.
+        // Best-effort: a schema without 006/009 tables (minimal test pools)
+        // must not break embedding; per-file errors are persisted on the row.
+        let _ = self.drain_pending_files().await;
+
         // Claim a batch: read pending chunks, mark them in_progress in one query.
         let rows = sqlx::query(
             r#"SELECT eq.chunk_id, mc.text
@@ -392,7 +580,52 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // File-queue tables (009 + 006 shapes) for the drain_pending_files path.
+        sqlx::query(
+            r#"CREATE TABLE pending_indexing (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                queued_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                status TEXT NOT NULL DEFAULT 'pending',
+                last_attempt_at TEXT,
+                error TEXT,
+                fail_count INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (path)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"CREATE TABLE memory_documents (
+                id TEXT PRIMARY KEY,
+                project_id TEXT,
+                source_path TEXT NOT NULL,
+                title TEXT,
+                body TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                indexed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                UNIQUE (source_path)
+            )"#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         pool
+    }
+
+    async fn enqueue_path(pool: &SqlitePool, path: &std::path::Path) {
+        sqlx::query("INSERT INTO pending_indexing (id, path, status) VALUES (?, ?, 'pending')")
+            .bind(Uuid::new_v4().to_string())
+            .bind(path.to_string_lossy().to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn count(pool: &SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
     }
 
     async fn insert_chunks(pool: &SqlitePool, n: usize) -> Vec<Uuid> {
@@ -480,6 +713,185 @@ mod tests {
         );
         assert_eq!(worker.seed_queue().await.unwrap(), 3);
         assert_eq!(worker.seed_queue().await.unwrap(), 0);
+    }
+
+    // ---- pending_indexing drain (P0 §5: the file queue gets a consumer) ----
+
+    #[tokio::test]
+    async fn tick_drains_pending_indexing_through_to_vectors() {
+        // End-to-end over the previously-dead path: a queued FILE (not a chunk)
+        // is ingested → chunked → enqueued → embedded, all inside one tick.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("note.md");
+        std::fs::write(
+            &file,
+            "---\ntitle: Drain Test\n---\n\n# Heading\n\nA body paragraph about altevra.\n",
+        )
+        .unwrap();
+
+        let pool = setup_pool().await;
+        enqueue_path(&pool, &file).await;
+
+        let worker = EmbedderWorker::new(
+            MockEmbedder::new(),
+            pool.clone(),
+            EmbedderWorkerConfig {
+                rate_limit_rpm: 100_000,
+                ..EmbedderWorkerConfig::default()
+            },
+        );
+        let embedded = worker.tick().await.unwrap();
+        assert!(embedded >= 1, "drained chunks must be embedded in-tick");
+
+        // Document + chunks persisted.
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 1);
+        let chunks = count(&pool, "SELECT COUNT(*) FROM memory_chunks").await;
+        assert!(chunks >= 1, "ingested file must produce chunks");
+        // Every chunk got a vector (NoOp-free path: MockEmbedder).
+        assert_eq!(vector_store::vector_count(&pool).await.unwrap() as i64, chunks);
+        // Queue row is consumed.
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM pending_indexing WHERE status = 'done'"
+            )
+            .await,
+            1
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM pending_indexing WHERE status = 'pending'"
+            )
+            .await,
+            0
+        );
+        // Title came from frontmatter.
+        let title: Option<String> =
+            sqlx::query_scalar("SELECT title FROM memory_documents LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(title.as_deref(), Some("Drain Test"));
+    }
+
+    #[tokio::test]
+    async fn drain_marks_missing_file_failed_with_error() {
+        let pool = setup_pool().await;
+        enqueue_path(&pool, std::path::Path::new("/nonexistent/missing.md")).await;
+
+        let worker = EmbedderWorker::new(
+            MockEmbedder::new(),
+            pool.clone(),
+            EmbedderWorkerConfig::default(),
+        );
+        let processed = worker.drain_pending_files().await.unwrap();
+        assert_eq!(processed, 1);
+
+        let (status, fail_count, error): (String, i64, Option<String>) = sqlx::query_as(
+            "SELECT status, fail_count, error FROM pending_indexing LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(fail_count, 1);
+        assert!(error.is_some(), "the ingest error must be preserved");
+        // Nothing half-written.
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 0);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_chunks").await, 0);
+    }
+
+    #[tokio::test]
+    async fn drain_is_idempotent_and_reindexes_changed_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("doc.md");
+        std::fs::write(&file, "# V1\n\noriginal content.\n").unwrap();
+
+        let pool = setup_pool().await;
+        enqueue_path(&pool, &file).await;
+        let worker = EmbedderWorker::new(
+            MockEmbedder::new(),
+            pool.clone(),
+            EmbedderWorkerConfig {
+                rate_limit_rpm: 100_000,
+                ..EmbedderWorkerConfig::default()
+            },
+        );
+        worker.tick().await.unwrap();
+        let chunks_v1 = count(&pool, "SELECT COUNT(*) FROM memory_chunks").await;
+
+        // Re-queue the SAME unchanged file → checksum match → done, no dupes.
+        sqlx::query("UPDATE pending_indexing SET status = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM memory_chunks").await,
+            chunks_v1,
+            "unchanged file must not duplicate chunks"
+        );
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 1);
+
+        // Change the file, re-queue → old chunks replaced, doc stays single.
+        std::fs::write(&file, "# V2\n\ncompletely different body now.\n").unwrap();
+        sqlx::query("UPDATE pending_indexing SET status = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM memory_documents").await,
+            1,
+            "changed file updates its document in place"
+        );
+        let body: String = sqlx::query_scalar("SELECT body FROM memory_documents LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(body.contains("different body"), "body re-indexed: {body}");
+        // No orphaned queue rows for deleted chunks.
+        let orphans = count(
+            &pool,
+            "SELECT COUNT(*) FROM embedder_queue WHERE chunk_id NOT IN (SELECT id FROM memory_chunks)",
+        )
+        .await;
+        assert_eq!(orphans, 0, "stale chunks must leave no queue orphans");
+    }
+
+    #[tokio::test]
+    async fn drain_redacts_secrets_before_persisting() {
+        // The guard contract holds on the file lane too: a key in a vault file
+        // never reaches memory_chunks/documents in plaintext.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let file = tmp.path().join("leaky.md");
+        std::fs::write(
+            &file,
+            "# Note\n\nkey is sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA ok.\n",
+        )
+        .unwrap();
+
+        let pool = setup_pool().await;
+        enqueue_path(&pool, &file).await;
+        let worker = EmbedderWorker::new(
+            MockEmbedder::new(),
+            pool.clone(),
+            EmbedderWorkerConfig::default(),
+        );
+        worker.drain_pending_files().await.unwrap();
+
+        let body: String = sqlx::query_scalar("SELECT body FROM memory_documents LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!body.contains("sk-ant-api03-"), "secret leaked into body");
+        let leaked = count(
+            &pool,
+            "SELECT COUNT(*) FROM memory_chunks WHERE text LIKE '%sk-ant-api03-%'",
+        )
+        .await;
+        assert_eq!(leaked, 0, "secret leaked into chunks");
     }
 
     #[tokio::test]

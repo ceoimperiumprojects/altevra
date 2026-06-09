@@ -161,11 +161,11 @@ fn load_skills_for_prompt(vault: &Path) -> anyhow::Result<Vec<PromptSkill>> {
 }
 
 fn load_recent_updates_for_prompt(limit: usize) -> Vec<UpdateFeedItem> {
-    let path = Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if !path.exists() {
         return vec![];
     }
-    let content = match std::fs::read_to_string(path) {
+    let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return vec![],
     };

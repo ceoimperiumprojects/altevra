@@ -551,6 +551,7 @@ mod tests {
             metadata: serde_json::json!({}),
             external_id: None,
             imported_from: None,
+            working_dir: None,
         };
         repo.start_session(&s).await.unwrap();
         repo.record_turn(&TurnRow {
@@ -571,6 +572,7 @@ mod tests {
             sensitivity: "internal".into(),
             redaction_status: "clean".into(),
             created_at: Utc::now(),
+            working_dir: None,
         })
         .await
         .unwrap();
@@ -688,6 +690,7 @@ mod tests {
             sensitivity: sens.into(),
             redaction_status: red.into(),
             created_at: Utc::now(),
+            working_dir: None,
         };
         // R11 #4: an MCP caller gets a work ceiling.
         assert!(turn_exposable(&base("internal", "clean")));

@@ -37,14 +37,14 @@ pub fn handle_mark_updates_read(id: Value, args: &Value) -> McpResponse {
         .as_str()
         .and_then(|s| Uuid::parse_str(s).ok());
 
-    let path = std::path::Path::new(".altevra/state/read_state.json");
+    let path = altevra_core::home_dir().join(".altevra/state/read_state.json");
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             return McpResponse::error(id, -32000, format!("mkdir failed: {e}"));
         }
     }
     let mut map: serde_json::Map<String, Value> = if path.exists() {
-        std::fs::read_to_string(path)
+        std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
@@ -70,7 +70,7 @@ fn load_local(
     project: Option<&str>,
     importance_min: Option<&Importance>,
 ) -> Vec<UpdateFeedItem> {
-    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if !path.exists() {
         return vec![];
     }

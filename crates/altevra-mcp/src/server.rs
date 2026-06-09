@@ -568,6 +568,48 @@ pub fn list_tools() -> Value {
     serde_json::json!({"tools": tools})
 }
 
+/// MCP tools that WRITE to Altevra's canonical store (DB rows via repos, or
+/// the `$HOME/.altevra/state/*` task/decision/updates files). During an
+/// `altevra db unify` maintenance window (P0 contract — see
+/// `altevra_core::maintenance`) these must stand down; read tools keep serving.
+fn is_write_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "save_task"
+            | "update_task"
+            | "save_decision"
+            | "create_review_item"
+            | "request_forget"
+            | "propose_improvement"
+            | "mark_updates_read"
+            | "report_knowledge_gap"
+            | "report_capability_gap"
+    )
+}
+
+/// P0 db-unify contract for the MCP surface: if `tool_name` is a write tool
+/// and a live (non-stale) maintenance lock exists at `lock_path`, return a
+/// clean MCP error response (`Some(refusal)`) — never panic, never exit.
+/// Read tools (and an absent/stale lock) pass through (`None`).
+fn maintenance_refusal_at(
+    id: &Value,
+    tool_name: &str,
+    lock_path: &std::path::Path,
+) -> Option<McpResponse> {
+    if is_write_tool(tool_name) && altevra_core::maintenance::maintenance_locked(lock_path) {
+        return Some(McpResponse::error(
+            id.clone(),
+            -32000,
+            format!(
+                "maintenance lock held (altevra db unify in progress) — '{tool_name}' \
+                 refused non-fatally; retry after unify completes. Read tools remain \
+                 available."
+            ),
+        ));
+    }
+    None
+}
+
 pub struct McpServer {
     pub altevra_version: String,
     pub vault_path: std::path::PathBuf,
@@ -632,6 +674,16 @@ impl McpServer {
         let params = params.unwrap_or_default();
         let tool_name = params["name"].as_str().unwrap_or("");
         let args = &params["arguments"];
+
+        // Maintenance lock (db unify in progress): write tools refuse with a
+        // clean MCP error; read tools keep working. Non-fatal by design.
+        if let Some(refusal) = maintenance_refusal_at(
+            &id,
+            tool_name,
+            &altevra_core::maintenance::maintenance_lock_path(),
+        ) {
+            return refusal;
+        }
 
         match tool_name {
             // Bootstrap
@@ -788,6 +840,64 @@ mod tests {
         };
         let resp = server.handle(req);
         assert!(resp.error.is_some());
+    }
+
+    /// P0 db-unify contract on the MCP surface: while a live maintenance lock
+    /// is held, every write tool returns a clean MCP error (no panic/exit);
+    /// read tools pass the guard untouched. Uses a TempDir lock path — never
+    /// the real `~/.altevra/state/maintenance.lock`.
+    #[test]
+    fn maintenance_lock_refuses_write_tools_allows_reads() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lock = tmp.path().join("maintenance.lock");
+        std::fs::write(&lock, "pid=1\nreason=test\n").unwrap();
+
+        // Every write tool → refusal with a clean MCP error result.
+        for tool in [
+            "save_task",
+            "update_task",
+            "save_decision",
+            "create_review_item",
+            "request_forget",
+            "propose_improvement",
+            "mark_updates_read",
+            "report_knowledge_gap",
+            "report_capability_gap",
+        ] {
+            let resp = maintenance_refusal_at(&serde_json::json!(1), tool, &lock)
+                .unwrap_or_else(|| panic!("write tool '{tool}' must refuse under lock"));
+            assert!(resp.result.is_none());
+            let err = resp.error.expect("refusal carries an MCP error");
+            assert_eq!(err.code, -32000);
+            assert!(
+                err.message.contains("maintenance lock"),
+                "error message must name the lock: {}",
+                err.message
+            );
+        }
+
+        // Read tools pass through even while the lock is held.
+        for tool in [
+            "get_active_tasks",
+            "get_goals",
+            "get_last_updates",
+            "search_turns",
+            "search_memory",
+            "get_capabilities",
+            "recall_window",
+        ] {
+            assert!(
+                maintenance_refusal_at(&serde_json::json!(1), tool, &lock).is_none(),
+                "read tool '{tool}' must NOT be blocked by the maintenance lock"
+            );
+        }
+
+        // No lock file → writes pass through (normal operation).
+        let absent = tmp.path().join("absent.lock");
+        assert!(
+            maintenance_refusal_at(&serde_json::json!(1), "save_task", &absent).is_none(),
+            "no lock → write tools work normally"
+        );
     }
 
     #[test]

@@ -29,8 +29,9 @@ pub struct ContextArgs {
     #[arg(long)]
     pub project: Option<String>,
 
-    /// Vault root
-    #[arg(long, default_value = ".")]
+    /// Vault root. Defaults to config.toml `[vault].path`, then `ALTEVRA_VAULT`,
+    /// then `"."` (see `altevra_core::default_vault_path`).
+    #[arg(long, default_value_os_t = altevra_core::default_vault_path())]
     pub vault: PathBuf,
 
     /// Brain database (the gated PacketCompiler candidate source). Same default
@@ -305,11 +306,11 @@ fn load_section_entries(
 }
 
 fn load_local_tasks(project_filter: Option<&str>, limit: usize) -> Vec<RetrievalTask> {
-    let path = std::path::Path::new(".altevra/state/tasks.json");
+    let path = altevra_core::home_dir().join(".altevra/state/tasks.json");
     if !path.exists() {
         return vec![];
     }
-    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
     let arr: serde_json::Value =
         serde_json::from_str(&raw).unwrap_or(serde_json::Value::Array(vec![]));
     let active: Vec<RetrievalTask> = arr
@@ -341,11 +342,11 @@ fn load_local_tasks(project_filter: Option<&str>, limit: usize) -> Vec<Retrieval
 }
 
 fn load_recent_updates(limit: usize) -> Vec<UpdateFeedItem> {
-    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if !path.exists() {
         return vec![];
     }
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
     let mut items: Vec<UpdateFeedItem> = content
         .lines()
         .filter(|l| !l.trim().is_empty())

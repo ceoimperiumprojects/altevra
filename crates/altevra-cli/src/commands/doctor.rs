@@ -41,7 +41,10 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
         .canonicalize()
         .unwrap_or_else(|_| args.vault.clone());
 
-    let checks = run_checks(&repo, &vault);
+    let mut checks = run_checks(&repo, &vault);
+    // Environment-level check (reads $HOME, so it lives outside the hermetic
+    // `run_checks` set): a non-empty hook spool needs `altevra db replay-spool`.
+    checks.push(check_spool_empty());
 
     let ok = checks
         .iter()
@@ -111,6 +114,35 @@ pub fn run_checks(repo: &Path, vault: &Path) -> Vec<DoctorCheck> {
         check_skills_installed(repo),
         check_skills_parseable(vault),
     ]
+}
+
+/// A non-empty hook spool means events captured during a `db unify` were never
+/// replayed (or a replay failed) — recorded turns are sitting on disk instead
+/// of in the canonical DB.
+fn check_spool_empty() -> DoctorCheck {
+    let dir = altevra_core::maintenance::spool_dir();
+    let count = std::fs::read_dir(&dir)
+        .map(|d| {
+            d.flatten()
+                .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
+                .count()
+        })
+        .unwrap_or(0);
+    if count == 0 {
+        DoctorCheck {
+            name: "hook_spool_empty".into(),
+            status: CheckStatus::Ok,
+            message: "no spooled hook events pending replay".into(),
+            fix_hint: None,
+        }
+    } else {
+        DoctorCheck {
+            name: "hook_spool_empty".into(),
+            status: CheckStatus::Warn,
+            message: format!("{count} spooled hook event(s) pending in {}", dir.display()),
+            fix_hint: Some("Run: altevra db replay-spool".into()),
+        }
+    }
 }
 
 fn check_vault_initialized(vault: &Path) -> DoctorCheck {

@@ -31,6 +31,9 @@ pub struct SessionRow {
     pub external_id: Option<String>,
     /// Absolute path on disk we imported from (for debugging / incremental).
     pub imported_from: Option<String>,
+    /// Absolute working directory when this session was started.
+    /// Capture order: $CLAUDE_PROJECT_DIR → current_dir() → None.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +60,10 @@ pub struct TurnRow {
     /// clean/redacted (R11 #5).
     pub redaction_status: String,
     pub created_at: DateTime<Utc>,
+    /// Absolute working directory when this turn was recorded. Inherits the
+    /// session's working_dir unless the cwd differed (e.g. hook fired from a
+    /// subdir). None for imported turns where cwd is unavailable.
+    pub working_dir: Option<String>,
 }
 
 /// A turn returned by full-text search with the parent session's provenance
@@ -97,8 +104,8 @@ impl<'a> SessionsRepository<'a> {
         sqlx::query(
             r#"INSERT INTO sessions
                 (id, tool, project_id, project_name, started_at, metadata,
-                 external_id, imported_from)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 external_id, imported_from, working_dir)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(s.id.to_string())
         .bind(&s.tool)
@@ -108,6 +115,7 @@ impl<'a> SessionsRepository<'a> {
         .bind(s.metadata.to_string())
         .bind(s.external_id.as_deref())
         .bind(s.imported_from.as_deref())
+        .bind(s.working_dir.as_deref())
         .execute(self.pool)
         .await?;
         Ok(())
@@ -141,6 +149,7 @@ impl<'a> SessionsRepository<'a> {
                 .unwrap_or(serde_json::json!({})),
             external_id: r.get("external_id"),
             imported_from: r.get("imported_from"),
+            working_dir: r.get("working_dir"),
         }))
     }
 
@@ -197,8 +206,9 @@ impl<'a> SessionsRepository<'a> {
             r#"INSERT INTO turns
                 (id, session_id, turn_idx, role, content, tool_calls, tool_name,
                  model, tokens_in, tokens_out, latency_ms, file_changes,
-                 redacted_count, source_tool, sensitivity, redaction_status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                 redacted_count, source_tool, sensitivity, redaction_status,
+                 created_at, working_dir)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(t.id.to_string())
         .bind(t.session_id.to_string())
@@ -217,6 +227,7 @@ impl<'a> SessionsRepository<'a> {
         .bind(&t.sensitivity)
         .bind(&t.redaction_status)
         .bind(ts_to_text(&t.created_at))
+        .bind(t.working_dir.as_deref())
         .execute(self.pool)
         .await?;
 
@@ -330,6 +341,7 @@ impl<'a> SessionsRepository<'a> {
                     .unwrap_or(serde_json::json!({})),
                 external_id: r.get("external_id"),
                 imported_from: r.get("imported_from"),
+                working_dir: r.get("working_dir"),
             })
             .collect())
     }
@@ -355,6 +367,7 @@ impl<'a> SessionsRepository<'a> {
                 .unwrap_or(serde_json::json!({})),
             external_id: r.get("external_id"),
             imported_from: r.get("imported_from"),
+            working_dir: r.get("working_dir"),
         }))
     }
 
@@ -392,6 +405,7 @@ impl<'a> SessionsRepository<'a> {
                 sensitivity: r.get("sensitivity"),
                 redaction_status: r.get("redaction_status"),
                 created_at: ts_from_text(r.get::<String, _>("created_at")),
+                working_dir: r.get("working_dir"),
             })
             .collect())
     }
@@ -474,6 +488,7 @@ impl<'a> SessionsRepository<'a> {
                     .unwrap_or(serde_json::json!({})),
                 external_id: r.get("external_id"),
                 imported_from: r.get("imported_from"),
+                working_dir: r.get("working_dir"),
             })
             .collect())
     }
@@ -620,6 +635,7 @@ impl<'a> SessionsRepository<'a> {
                     sensitivity: r.get("sensitivity"),
                     redaction_status: r.get("redaction_status"),
                     created_at: ts_from_text(r.get::<String, _>("created_at")),
+                    working_dir: r.get("working_dir"),
                 };
                 TurnSearchHit {
                     row,
@@ -713,6 +729,7 @@ impl<'a> SessionsRepository<'a> {
                     sensitivity: r.get("sensitivity"),
                     redaction_status: r.get("redaction_status"),
                     created_at: ts_from_text(r.get::<String, _>("created_at")),
+                    working_dir: r.get("working_dir"),
                 };
                 TurnSearchHit {
                     row,
@@ -782,6 +799,7 @@ mod tests {
             metadata: serde_json::json!({}),
             external_id: None,
             imported_from: None,
+            working_dir: None,
         }
     }
 
@@ -875,6 +893,7 @@ mod tests {
             sensitivity: "internal".into(),
             redaction_status: "clean".into(),
             created_at: Utc::now(),
+            working_dir: None,
         };
         repo.record_turn(&turn).await.unwrap();
 
@@ -909,6 +928,7 @@ mod tests {
                 sensitivity: "internal".into(),
                 redaction_status: "clean".into(),
                 created_at: Utc::now(),
+                working_dir: None,
             };
             repo.record_turn(&turn).await.unwrap();
         }
@@ -1013,6 +1033,7 @@ mod tests {
                 sensitivity: "internal".into(),
                 redaction_status: "clean".into(),
                 created_at: Utc::now(),
+                working_dir: None,
             };
             repo.record_turn(&t).await.unwrap();
         }
@@ -1055,6 +1076,7 @@ mod tests {
                 sensitivity: "internal".into(),
                 redaction_status: "clean".into(),
                 created_at: Utc::now(),
+                working_dir: None,
             };
             repo.record_turn(&t).await.unwrap();
         }
@@ -1110,6 +1132,7 @@ mod tests {
             sensitivity: "internal".into(),
             redaction_status: "clean".into(),
             created_at: ts,
+            working_dir: None,
         };
         repo.record_turn(&mk(0, "called Americans about the deal", month_ago))
             .await
@@ -1170,6 +1193,7 @@ mod tests {
             sensitivity: "internal".into(),
             redaction_status: "clean".into(),
             created_at: ts,
+            working_dir: None,
         };
         repo.record_turn(&mk(0, "old thing", now - chrono::Duration::days(30)))
             .await
@@ -1200,5 +1224,226 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].row.content, "recent thing two");
+    }
+
+    // -----------------------------------------------------------------------
+    // A3 — working_dir roundtrip tests
+    // -----------------------------------------------------------------------
+
+    /// Session-level working_dir: a session started with a working_dir is
+    /// persisted and read back correctly. Sessions without a cwd have None.
+    #[tokio::test]
+    async fn session_working_dir_roundtrip() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+
+        // Session WITH a working_dir.
+        let mut s = sample_session();
+        s.working_dir = Some("/home/pavle/projekti/ai-tooling/altevra".into());
+        repo.start_session(&s).await.unwrap();
+
+        let fetched = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            fetched.working_dir.as_deref(),
+            Some("/home/pavle/projekti/ai-tooling/altevra"),
+            "session working_dir must round-trip"
+        );
+
+        // Session WITHOUT a working_dir — must be None, not empty string.
+        let s2 = sample_session();
+        repo.start_session(&s2).await.unwrap();
+        let fetched2 = repo.get_session(s2.id).await.unwrap().unwrap();
+        assert!(
+            fetched2.working_dir.is_none(),
+            "session without working_dir must return None"
+        );
+    }
+
+    /// Per-turn working_dir: a turn can record its own cwd (e.g. hook fired
+    /// from a subdir while the session cwd is the project root). Both the
+    /// session-level and the turn-level values are stored and read back
+    /// independently.
+    #[tokio::test]
+    async fn turn_working_dir_roundtrip() {
+        let pool = setup().await;
+        let repo = SessionsRepository::new(&pool);
+
+        let mut s = sample_session();
+        s.working_dir = Some("/home/pavle/projekti/ai-tooling/altevra".into());
+        repo.start_session(&s).await.unwrap();
+
+        // Turn with SAME cwd as session.
+        let t1 = TurnRow {
+            id: Uuid::new_v4(),
+            session_id: s.id,
+            turn_idx: 0,
+            role: "user".into(),
+            content: "turn from project root".into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: Some("claude-code".into()),
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
+            created_at: Utc::now(),
+            working_dir: Some("/home/pavle/projekti/ai-tooling/altevra".into()),
+        };
+
+        // Turn with DIFFERENT cwd (subdir scenario — "run from ~, project elsewhere").
+        let t2 = TurnRow {
+            id: Uuid::new_v4(),
+            session_id: s.id,
+            turn_idx: 1,
+            role: "assistant".into(),
+            content: "turn from home dir".into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: Some("claude-code".into()),
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
+            created_at: Utc::now(),
+            working_dir: Some("/home/pavle".into()),
+        };
+
+        // Turn WITHOUT cwd.
+        let t3 = TurnRow {
+            id: Uuid::new_v4(),
+            session_id: s.id,
+            turn_idx: 2,
+            role: "user".into(),
+            content: "turn with no cwd".into(),
+            tool_calls: None,
+            tool_name: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            latency_ms: None,
+            file_changes: None,
+            redacted_count: 0,
+            source_tool: Some("claude-code".into()),
+            sensitivity: "internal".into(),
+            redaction_status: "clean".into(),
+            created_at: Utc::now(),
+            working_dir: None,
+        };
+
+        repo.record_turn(&t1).await.unwrap();
+        repo.record_turn(&t2).await.unwrap();
+        repo.record_turn(&t3).await.unwrap();
+
+        let turns = repo.list_turns(s.id, 10).await.unwrap();
+        assert_eq!(turns.len(), 3);
+
+        assert_eq!(
+            turns[0].working_dir.as_deref(),
+            Some("/home/pavle/projekti/ai-tooling/altevra"),
+            "turn 0 working_dir must match"
+        );
+        assert_eq!(
+            turns[1].working_dir.as_deref(),
+            Some("/home/pavle"),
+            "turn 1 (different cwd) working_dir must match"
+        );
+        assert!(
+            turns[2].working_dir.is_none(),
+            "turn 2 (no cwd) working_dir must be None"
+        );
+
+        // Session working_dir is independent of per-turn values.
+        let sess = repo.get_session(s.id).await.unwrap().unwrap();
+        assert_eq!(
+            sess.working_dir.as_deref(),
+            Some("/home/pavle/projekti/ai-tooling/altevra"),
+            "session working_dir must be unchanged after turn inserts"
+        );
+    }
+
+    /// Backfill: existing turns (NULL working_dir) inherit the session's
+    /// working_dir when the migration UPDATE runs. Simulated here by inserting
+    /// a session+turn via direct SQL (mimicking pre-034 rows) then running the
+    /// backfill query and asserting the turn picks up the session's cwd.
+    #[tokio::test]
+    async fn turn_inherits_session_working_dir_on_backfill() {
+        let pool = setup().await;
+
+        // Insert a session with a known working_dir.
+        let sess_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO sessions (id, tool, started_at, metadata, working_dir)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(sess_id.to_string())
+        .bind("claude-code")
+        .bind("2026-01-01T00:00:00.000Z")
+        .bind("{}")
+        .bind("/home/pavle/projekti/altevra")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Insert a turn WITHOUT working_dir (NULL — simulates pre-034 row).
+        let turn_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO turns (id, session_id, turn_idx, role, content, redacted_count,
+                                sensitivity, redaction_status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(turn_id.to_string())
+        .bind(sess_id.to_string())
+        .bind(0_i64)
+        .bind("user")
+        .bind("old turn without cwd")
+        .bind(0_i64)
+        .bind("internal")
+        .bind("clean")
+        .bind("2026-01-01T00:00:00.000Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Confirm the turn has NULL working_dir before backfill.
+        let pre: Option<String> = sqlx::query_scalar(
+            "SELECT working_dir FROM turns WHERE id = ?",
+        )
+        .bind(turn_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(pre.is_none(), "pre-backfill: turn.working_dir must be NULL");
+
+        // Run the backfill query (same SQL as in migration 034).
+        sqlx::query(
+            "UPDATE turns
+             SET working_dir = (SELECT s.working_dir FROM sessions s WHERE s.id = turns.session_id)
+             WHERE working_dir IS NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // After backfill, the turn inherits the session's cwd.
+        let post: Option<String> = sqlx::query_scalar(
+            "SELECT working_dir FROM turns WHERE id = ?",
+        )
+        .bind(turn_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            post.as_deref(),
+            Some("/home/pavle/projekti/altevra"),
+            "after backfill: turn.working_dir must inherit session.working_dir"
+        );
     }
 }

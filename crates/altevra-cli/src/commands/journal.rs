@@ -50,11 +50,11 @@ fn parse_window(s: &str) -> chrono::Duration {
 }
 
 fn load_updates_since(window: Duration) -> Vec<UpdateFeedItem> {
-    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if !path.exists() {
         return vec![];
     }
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
     let since = Utc::now() - window;
     content
         .lines()

@@ -233,6 +233,44 @@ pub fn signal_for_session(
     })
 }
 
+/// Build a pointer-only skill-candidate signal for sessions that look like a
+/// repeatable workflow. This is intentionally a cheap local classifier, NOT the
+/// skill author: it never summarizes away the raw session. Codex/GPT-5.5 later
+/// follows `source_ref` / `raw_trace_ref` back to the preserved turns, prompts,
+/// tool calls, tool outputs, and file-change evidence before rendering a skill.
+pub fn signal_for_skill_candidate(
+    session_id: &str,
+    tool: &str,
+    project: Option<&str>,
+    turn_count: i64,
+    tool_call_count: i64,
+    file_change_count: i64,
+) -> Option<NewSignal> {
+    if is_resident_authored(tool) {
+        return None;
+    }
+    if !looks_skill_worthy(turn_count, tool_call_count, file_change_count) {
+        return None;
+    }
+    let raw_ref = format!("session:{session_id}");
+    let cluster_key = Some(match project {
+        Some(p) if !p.is_empty() => format!("skill:{tool}:{p}"),
+        _ => format!("skill:{tool}"),
+    });
+    Some(NewSignal {
+        kind: "skill_candidate".to_string(),
+        source_ref: raw_ref.clone(),
+        summary: format!(
+            "possible reusable workflow — raw_trace_ref={raw_ref}; tool={tool}; turns={turn_count}; tool_calls={tool_call_count}; file_changes={file_change_count}; route to skill factory renderer with raw prompts/tool outputs intact"
+        ),
+        cluster_key,
+    })
+}
+
+fn looks_skill_worthy(turn_count: i64, tool_call_count: i64, file_change_count: i64) -> bool {
+    tool_call_count >= 3 || file_change_count > 0 || (turn_count >= 8 && tool_call_count >= 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +411,36 @@ mod tests {
         // SI-6: a resident-authored session enqueues NOTHING.
         assert!(signal_for_session("ghi", "resident:observer", Some("altevra"), 5).is_none());
         assert!(signal_for_session("jkl", "memory_curator", None, 1).is_none());
+    }
+
+    #[test]
+    fn skill_candidate_signal_is_pointer_only_and_keeps_raw_trace_as_evidence() {
+        let s = signal_for_skill_candidate("abc", "claude-code", Some("altevra"), 9, 5, 2)
+            .expect("tool-heavy external session should become a skill candidate signal");
+
+        assert_eq!(s.kind, "skill_candidate");
+        assert_eq!(s.source_ref, "session:abc");
+        assert_eq!(s.cluster_key.as_deref(), Some("skill:claude-code:altevra"));
+        assert!(
+            s.summary.contains("raw_trace_ref=session:abc"),
+            "signal must point Codex/GPT back to the raw session, not replace it with a lossy score"
+        );
+        assert!(
+            s.summary.contains("tool_calls=5") && s.summary.contains("file_changes=2"),
+            "cheap classifier metadata should explain why this needs skill-factory review"
+        );
+
+        // A tiny chat with no tool/file evidence is noise, not a skill candidate.
+        assert!(signal_for_skill_candidate("def", "codex", Some("altevra"), 2, 0, 0).is_none());
+        // SI-6: resident output never feeds the skill factory back into itself.
+        assert!(signal_for_skill_candidate(
+            "ghi",
+            "skill_factory_proposer",
+            Some("altevra"),
+            9,
+            5,
+            1
+        )
+        .is_none());
     }
 }

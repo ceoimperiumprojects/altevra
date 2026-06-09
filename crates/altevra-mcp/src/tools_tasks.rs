@@ -1,16 +1,17 @@
 use serde_json::Value;
+use std::path::PathBuf;
 
 use crate::server::McpResponse;
 
-// In-memory task store using a local JSON file at .altevra/state/tasks.json.
+// In-memory task store using a local JSON file under $HOME/.altevra/state/.
 // Real DB-backed implementation lives in altevra-db.
 
-const STATE_PATH: &str = ".altevra/state/tasks.json";
-const DEC_PATH: &str = ".altevra/state/decisions.json";
-const GOAL_PATH: &str = ".altevra/state/goals.json";
+fn state_path(filename: &str) -> PathBuf {
+    altevra_core::home_dir().join(".altevra/state").join(filename)
+}
 
-fn load_json(path: &str) -> Value {
-    if std::path::Path::new(path).exists() {
+fn load_json(path: &PathBuf) -> Value {
+    if path.exists() {
         let raw = std::fs::read_to_string(path).unwrap_or_default();
         serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!([]))
     } else {
@@ -18,8 +19,8 @@ fn load_json(path: &str) -> Value {
     }
 }
 
-fn save_json(path: &str, value: &Value) -> std::io::Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
+fn save_json(path: &PathBuf, value: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, serde_json::to_string_pretty(value)?)?;
@@ -27,7 +28,7 @@ fn save_json(path: &str, value: &Value) -> std::io::Result<()> {
 }
 
 pub fn handle_get_active_tasks(id: Value, _args: &Value) -> McpResponse {
-    let tasks = load_json(STATE_PATH);
+    let tasks = load_json(&state_path("tasks.json"));
     let active: Vec<&Value> = tasks
         .as_array()
         .map(|arr| {
@@ -52,7 +53,8 @@ pub fn handle_save_task(id: Value, args: &Value) -> McpResponse {
         Some(t) => t.to_string(),
         None => return McpResponse::error(id, -32602, "missing 'title'"),
     };
-    let mut tasks = load_json(STATE_PATH);
+    let tasks_path = state_path("tasks.json");
+    let mut tasks = load_json(&tasks_path);
     let new_task = serde_json::json!({
         "id": uuid::Uuid::new_v4(),
         "title": title,
@@ -64,7 +66,7 @@ pub fn handle_save_task(id: Value, args: &Value) -> McpResponse {
     if let Some(arr) = tasks.as_array_mut() {
         arr.push(new_task.clone());
     }
-    if let Err(e) = save_json(STATE_PATH, &tasks) {
+    if let Err(e) = save_json(&tasks_path, &tasks) {
         return McpResponse::error(id, -32000, format!("save failed: {e}"));
     }
     McpResponse::ok(id, new_task)
@@ -75,7 +77,8 @@ pub fn handle_update_task(id: Value, args: &Value) -> McpResponse {
         Some(t) => t.to_string(),
         None => return McpResponse::error(id, -32602, "missing 'id'"),
     };
-    let mut tasks = load_json(STATE_PATH);
+    let tasks_path = state_path("tasks.json");
+    let mut tasks = load_json(&tasks_path);
     let arr = match tasks.as_array_mut() {
         Some(a) => a,
         None => return McpResponse::error(id, -32000, "tasks store malformed"),
@@ -96,12 +99,12 @@ pub fn handle_update_task(id: Value, args: &Value) -> McpResponse {
     if !updated {
         return McpResponse::error(id, -32000, format!("Task not found: {task_id}"));
     }
-    let _ = save_json(STATE_PATH, &tasks);
+    let _ = save_json(&tasks_path, &tasks);
     McpResponse::ok(id, serde_json::json!({"updated": true, "id": task_id}))
 }
 
 pub fn handle_get_goals(id: Value, _args: &Value) -> McpResponse {
-    let goals = load_json(GOAL_PATH);
+    let goals = load_json(&state_path("goals.json"));
     let count = goals.as_array().map(|a| a.len()).unwrap_or(0);
     McpResponse::ok(id, serde_json::json!({"goals": goals, "count": count}))
 }
@@ -111,7 +114,8 @@ pub fn handle_save_decision(id: Value, args: &Value) -> McpResponse {
         Some(t) => t.to_string(),
         None => return McpResponse::error(id, -32602, "missing 'title'"),
     };
-    let mut decisions = load_json(DEC_PATH);
+    let dec_path = state_path("decisions.json");
+    let mut decisions = load_json(&dec_path);
     let new = serde_json::json!({
         "id": uuid::Uuid::new_v4(),
         "title": title,
@@ -122,7 +126,7 @@ pub fn handle_save_decision(id: Value, args: &Value) -> McpResponse {
     if let Some(arr) = decisions.as_array_mut() {
         arr.push(new.clone());
     }
-    let _ = save_json(DEC_PATH, &decisions);
+    let _ = save_json(&dec_path, &decisions);
     McpResponse::ok(id, new)
 }
 

@@ -151,6 +151,9 @@ pub async fn run(args: TurnRecordArgs) -> anyhow::Result<()> {
         sensitivity,
         redaction_status,
         created_at: Utc::now(),
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
     };
 
     repo.record_turn(&turn).await?;
@@ -212,6 +215,7 @@ mod tests {
             metadata: serde_json::json!({}),
             external_id: None,
             imported_from: None,
+            working_dir: None,
         };
         repo.start_session(&row).await.unwrap();
         row.id

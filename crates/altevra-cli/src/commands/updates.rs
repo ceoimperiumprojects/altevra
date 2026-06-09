@@ -130,7 +130,7 @@ fn load_local_updates(
     since: chrono::DateTime<Utc>,
     importance_min: Option<&Importance>,
 ) -> Vec<UpdateFeedItem> {
-    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if !path.exists() {
         return vec![];
     }
@@ -163,7 +163,7 @@ fn load_local_updates(
 
 /// Append a single UpdateFeedItem as a JSONL line to the local events file.
 pub fn append_local_update(item: &UpdateFeedItem) {
-    let path = std::path::Path::new(".altevra/events/updates.jsonl");
+    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -172,7 +172,7 @@ pub fn append_local_update(item: &UpdateFeedItem) {
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(&path)
         {
             let _ = writeln!(file, "{line}");
         }
@@ -185,12 +185,12 @@ pub fn mark_read_local(
     actor_id: &str,
     last_event: Option<uuid::Uuid>,
 ) -> anyhow::Result<()> {
-    let path = std::path::Path::new(".altevra/state/read_state.json");
+    let path = altevra_core::home_dir().join(".altevra/state/read_state.json");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut map: serde_json::Map<String, serde_json::Value> = if path.exists() {
-        let raw = std::fs::read_to_string(path)?;
+        let raw = std::fs::read_to_string(&path)?;
         serde_json::from_str(&raw).unwrap_or_default()
     } else {
         Default::default()

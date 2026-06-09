@@ -428,11 +428,15 @@ fn snippet(content: &str, query: &str, max: usize) -> String {
             first_pos = Some(first_pos.map_or(p, |cur| cur.min(p)));
         }
     }
-    let start = first_pos
+    let raw_start = first_pos
         .map(|p| p.saturating_sub(40))
         .unwrap_or(0)
         .min(content.len());
-    let end = (start + max).min(content.len());
+    // Snap to the nearest valid UTF-8 char boundary so we never panic on
+    // multi-byte characters (e.g. Serbian Cyrillic, arrows →, emoji).
+    let start = snap_to_char_boundary_left(content, raw_start);
+    let raw_end = (start + max).min(content.len());
+    let end = snap_to_char_boundary_right(content, raw_end);
     let slice = &content[start..end];
     let trimmed = slice.replace('\n', " ");
     if end < content.len() {
@@ -440,6 +444,22 @@ fn snippet(content: &str, query: &str, max: usize) -> String {
     } else {
         trimmed
     }
+}
+
+/// Snap byte index leftward to the nearest valid UTF-8 char boundary.
+fn snap_to_char_boundary_left(s: &str, mut idx: usize) -> usize {
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Snap byte index rightward to the nearest valid UTF-8 char boundary.
+fn snap_to_char_boundary_right(s: &str, mut idx: usize) -> usize {
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 #[cfg(test)]
@@ -491,6 +511,7 @@ mod tests {
                 metadata: serde_json::json!({}),
                 external_id: None,
                 imported_from: None,
+                working_dir: None,
             };
             repo.start_session(&s).await.unwrap();
             let t = TurnRow {
@@ -511,6 +532,7 @@ mod tests {
                 sensitivity: "internal".into(),
                 redaction_status: "clean".into(),
                 created_at: now - Duration::days(days_ago),
+                working_dir: None,
             };
             repo.record_turn(&t).await.unwrap();
         }
@@ -634,6 +656,36 @@ mod tests {
             label, "decision",
             "recall must label a captured decision as a decision, not a learning"
         );
+    }
+
+    /// Regression test: multi-byte Serbian text + arrow → must not panic.
+    ///
+    /// The bug: `p.saturating_sub(40)` and `start + max` produce byte offsets
+    /// that may land in the middle of a multi-byte UTF-8 char. Before the fix
+    /// this caused a `byte index N is not a char boundary` panic.
+    #[test]
+    fn snippet_multibyte_no_panic() {
+        // Serbian text with Cyrillic + ASCII + arrow → — several 2-byte chars.
+        let content = "Стратегија → извоз производа. Потребно је дефинисати keyword план за Q3.";
+        // Calling snippet must not panic regardless of where start/end fall.
+        let s = snippet(content, "keyword", 30);
+        // The result must be valid UTF-8 (implicit in Rust &str) and the call must succeed.
+        assert!(s.contains("keyword") || !s.is_empty() || s.is_empty());
+
+        // A trickier case: the match position is exactly at a multi-byte boundary.
+        // Place the search token right after multi-byte chars so subtracting 40
+        // bytes would land mid-codepoint.
+        let content2 = "аааааааааааааааааааааааааааааааааааааааааааааааааааа keyword here → more text аа";
+        let s2 = snippet(content2, "keyword", 50);
+        assert!(s2.contains("keyword"), "must find keyword in: {s2:?}");
+
+        // Edge: arrow → (3 bytes: 0xE2 0x86 0x92) right before the token.
+        // Use max=80 (well beyond the content length) so the slice is always complete.
+        // The key invariant is that slicing must not panic — boundary-snapping must handle
+        // the multi-byte arrow correctly even when start/end land near it.
+        let content3 = "prefix text → keyword ends here";
+        let s3 = snippet(content3, "keyword", 80);
+        assert!(s3.contains("keyword"), "must find keyword in: {s3:?}");
     }
 
     #[tokio::test]

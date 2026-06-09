@@ -10,8 +10,18 @@
 .altevra/altevra.db
 .altevra/altevra.db-shm
 .altevra/altevra.db-wal
+.altevra/brain.pid
+.altevra/config.toml
 .altevra/events/
 **/.altevra/altevra.db
 **/.altevra/altevra.db-shm
 **/.altevra/altevra.db-wal
+**/.altevra/brain.pid
+**/.altevra/config.toml
 **/.altevra/events/
+
+# Generated local research briefs (source-specific runtime output)
+/05-research/
+
+# graphify generated knowledge graph (local tooling)
+graphify-out/

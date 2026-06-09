@@ -57,7 +57,8 @@ impl Default for WatcherConfig {
             repo_paths: vec![],
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             index_code_files: false,
-            event_log_path: PathBuf::from(".altevra/events/file_changes.jsonl"),
+            event_log_path: altevra_core::home_dir()
+                .join(".altevra/events/file_changes.jsonl"),
             db_path: None,
             ignore_patterns: DEFAULT_IGNORES.iter().map(|s| s.to_string()).collect(),
             primary_extensions: vec!["md".into(), "mdc".into(), "yaml".into(), "yml".into()],

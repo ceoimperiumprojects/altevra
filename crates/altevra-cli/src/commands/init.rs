@@ -180,8 +180,12 @@ url = "postgres://localhost/altevra"
 max_connections = 10
 
 [vault]
-# Path to the Altevra vault directory
-# Defaults to current directory (.)
+# Path to the Altevra vault directory. This is the default --vault for
+# `altevra context`, `altevra memory search`, and the brain daemon.
+# Set it to your knowledge vault root, e.g.:
+#   path = "~/Obsidian/Imperium"
+# "." is a placeholder meaning "unset" (commands fall back to ALTEVRA_VAULT,
+# then the current directory).
 path = "."
 
 [altevra]

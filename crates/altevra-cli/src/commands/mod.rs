@@ -9,6 +9,7 @@ pub mod connect;
 pub mod context;
 pub mod control;
 pub mod cursor;
+pub mod db;
 pub mod doctor;
 pub mod embed;
 pub mod entity_dict;

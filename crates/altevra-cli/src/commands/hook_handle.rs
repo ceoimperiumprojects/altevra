@@ -14,17 +14,15 @@
 //! `tool_name`, `command`, `content`) defensively.
 
 use altevra_db::{
-    create_pool, run_migrations, signal_for_session, ImprovementSignalsRepository, SessionRow,
-    SessionsRepository, TurnRow,
+    create_pool, run_migrations, signal_for_session, EventsRepository, ImprovementSignalsRepository,
+    SessionRow, SessionsRepository, TurnRow,
 };
 use altevra_secrets::{auto_capture, guard_text, SecretStore};
 use chrono::Utc;
 use clap::Args;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use uuid::Uuid;
-
-const CURRENT_SESSION_FILE: &str = ".altevra/state/current_session.txt";
 
 #[derive(Args)]
 pub struct HookHandleArgs {
@@ -59,12 +57,23 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
             .unwrap_or(serde_json::Value::Object(Default::default()))
     };
 
+    // Maintenance lock (db unify in progress): a hook must NEVER block the
+    // host tool and must NOT write the database mid-merge — spool the event
+    // (guard-redacted, one file per event) and exit 0. `altevra db
+    // replay-spool` drains it after unify. Spool errors are non-fatal too.
+    if altevra_core::maintenance::maintenance_locked_default() {
+        if let Err(e) = spool_during_maintenance(&args, &payload) {
+            eprintln!("[altevra] hook spool failed (non-fatal): {e}");
+        }
+        return Ok(());
+    }
+
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
     let repo = SessionsRepository::new(&pool);
 
     match args.event.as_str() {
-        "session_start" => handle_session_start(&repo, &args, &payload).await?,
+        "session_start" => handle_session_start(&pool, &repo, &args, &payload).await?,
         "session_end" | "stop" => handle_session_end(&pool, &repo, &args, &payload).await?,
         "user_prompt_submit" => handle_user_prompt(&repo, &args, &payload).await?,
         "post_tool_use" => handle_post_tool_use(&repo, &args, &payload).await?,
@@ -76,11 +85,106 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Spool path for hook events fired while `db unify` holds the maintenance
+/// lock. Mirrors the live handlers' event mapping, but writes ONE guarded
+/// JSON file per event (O_EXCL, 0600, $HOME-anchored) instead of touching
+/// the database. Session pointer files are still maintained (they are plain
+/// files, not DB rows) so turn events can resolve their session id, and the
+/// stdout contract (`{"session_id": …}`) is preserved for the host tool.
+fn spool_during_maintenance(
+    args: &HookHandleArgs,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    use crate::commands::db::{build_spool_turn, write_spool_entry, SpoolEntry};
+    use altevra_core::security::Sensitivity;
+
+    let dir = altevra_core::maintenance::spool_dir();
+    match args.event.as_str() {
+        "session_start" => {
+            let id = Uuid::new_v4();
+            write_spool_entry(
+                &dir,
+                &args.tool,
+                &SpoolEntry::SessionStart {
+                    tool: args.tool.clone(),
+                    session_id: id,
+                    project_name: args.project.clone(),
+                    started_at: Utc::now(),
+                    working_dir: resolve_working_dir(),
+                },
+            )?;
+            write_current_session(&id, &args.tool)?;
+            println!("{{\"session_id\":\"{id}\"}}");
+        }
+        "session_end" | "stop" => {
+            if let Some(id) = read_current_session(&args.tool)? {
+                // Guard the summary BEFORE it reaches disk.
+                let summary = payload
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| guard_text(s, Sensitivity::Internal).value);
+                write_spool_entry(
+                    &dir,
+                    &args.tool,
+                    &SpoolEntry::SessionEnd {
+                        tool: args.tool.clone(),
+                        session_id: id,
+                        summary,
+                        ended_at: Utc::now(),
+                    },
+                )?;
+                clear_current_session(&args.tool)?;
+                println!("{{\"closed_session\":\"{id}\"}}");
+            }
+        }
+        ev @ ("user_prompt_submit" | "post_tool_use" | "pre_tool_use") => {
+            // No active session → same silent skip as the live path.
+            if let Some(session_id) = read_current_session(&args.tool)? {
+                if let Some(entry) =
+                    build_spool_turn(&args.tool, session_id, ev, payload, resolve_working_dir())
+                {
+                    write_spool_entry(&dir, &args.tool, &entry)?;
+                }
+            }
+        }
+        other => {
+            eprintln!("[altevra] unknown hook event (not spooled): {other}");
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the working directory for the current hook invocation.
+///
+/// Priority:
+///   1. `$CLAUDE_PROJECT_DIR` env var (set by Claude Code ≥1.x for the project root).
+///   2. `std::env::current_dir()` — the directory the hook was invoked from.
+///   3. `None` if neither is available (sandboxed / unavailable env).
+///
+/// The result is always an absolute path string, or None.
+fn resolve_working_dir() -> Option<String> {
+    // Prefer the project-level dir set by the host tool.
+    if let Ok(p) = std::env::var("CLAUDE_PROJECT_DIR") {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    // Fall back to the process cwd at hook-fire time.
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 async fn handle_session_start(
+    pool: &sqlx::SqlitePool,
     repo: &SessionsRepository<'_>,
     args: &HookHandleArgs,
     _payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    use altevra_core::events::{ActorType, Event, EventType};
+
+    let working_dir = resolve_working_dir();
     let row = SessionRow {
         id: Uuid::new_v4(),
         tool: args.tool.clone(),
@@ -96,9 +200,23 @@ async fn handle_session_start(
         metadata: serde_json::json!({"started_via": "hook"}),
         external_id: None,
         imported_from: None,
+        working_dir: working_dir.clone(),
     };
     repo.start_session(&row).await?;
-    write_current_session(&row.id)?;
+
+    // Populate the events table so the observer pipeline has data to detect patterns.
+    // Best-effort: a failure here must NOT block the session start.
+    let ev = Event::new(
+        EventType::SessionStarted,
+        &format!("{} session started", args.tool),
+        "hook_handle",
+        ActorType::System,
+    );
+    if let Err(e) = EventsRepository::new(pool).insert(&ev).await {
+        eprintln!("[altevra] events insert failed (non-fatal): {e}");
+    }
+
+    write_current_session(&row.id, &args.tool)?;
     println!("{{\"session_id\":\"{}\"}}", row.id);
     Ok(())
 }
@@ -106,15 +224,29 @@ async fn handle_session_start(
 async fn handle_session_end(
     pool: &sqlx::SqlitePool,
     repo: &SessionsRepository<'_>,
-    _args: &HookHandleArgs,
+    args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
+    use altevra_core::events::{ActorType, Event, EventType};
+
     let summary = payload
         .get("summary")
         .and_then(serde_json::Value::as_str)
         .map(String::from);
-    if let Some(id) = read_current_session()? {
+    if let Some(id) = read_current_session(&args.tool)? {
         repo.end_session(id, summary.as_deref()).await?;
+
+        // Populate events table with SessionEnded (best-effort, non-fatal).
+        let ev = Event::new(
+            EventType::SessionEnded,
+            &format!("{} session ended", args.tool),
+            "hook_handle",
+            ActorType::System,
+        );
+        if let Err(e) = EventsRepository::new(pool).insert(&ev).await {
+            eprintln!("[altevra] events insert failed (non-fatal): {e}");
+        }
+
         // Real-time self-improve producer (C1): one cheap improvement_signal per
         // session ingest — the orchestrator (a later seam) clusters open signals
         // into proposals. SI-6 self-write exclusion: a resident-mode-authored
@@ -122,7 +254,7 @@ async fn handle_session_end(
         // Altevra's own output never feeds the loop back into itself. Best-effort:
         // a signal-enqueue failure must NOT block closing the session.
         enqueue_session_signal(pool, repo, id).await;
-        clear_current_session()?;
+        clear_current_session(&args.tool)?;
         println!("{{\"closed_session\":\"{id}\"}}");
     }
     Ok(())
@@ -254,7 +386,9 @@ async fn record_turn(
     source_tool: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
-    let session_id = match read_current_session()? {
+    // Key session lookup by tool so concurrent Claude/Codex sessions from
+    // different projects never share the same pointer file.
+    let session_id = match read_current_session(source_tool)? {
         Some(id) => id,
         None => {
             // No active session — silently skip so the agent isn't blocked
@@ -319,6 +453,11 @@ async fn record_turn(
         })
         .collect();
 
+    // Capture the turn's own working_dir. If it differs from the session's
+    // (Pavle's "run from ~, project elsewhere" case), record it explicitly so
+    // the turn reflects where the hook actually fired.
+    let turn_working_dir = resolve_working_dir();
+
     let turn_idx = repo.next_turn_idx(session_id).await?;
     let turn = TurnRow {
         id: Uuid::new_v4(),
@@ -352,8 +491,20 @@ async fn record_turn(
         sensitivity: turn_sensitivity.to_string(),
         redaction_status: turn_redaction.to_string(),
         created_at: Utc::now(),
+        working_dir: turn_working_dir,
     };
-    repo.record_turn(&turn).await?;
+    // FK robustness: a FOREIGN KEY constraint error means the session_id in
+    // the pointer file doesn't exist in *this* DB (path mismatch or leftover
+    // stale pointer). Treat as a warning — the hook must NEVER exit non-zero
+    // and block the host tool. Any other DB error is also downgraded.
+    if let Err(e) = repo.record_turn(&turn).await {
+        let msg = e.to_string();
+        if msg.contains("FOREIGN KEY") || msg.contains("foreign key") {
+            eprintln!("[altevra] turn not recorded (FK mismatch — stale session pointer?): {msg}");
+        } else {
+            eprintln!("[altevra] turn record failed (non-fatal): {msg}");
+        }
+    }
     Ok(())
 }
 
@@ -386,28 +537,31 @@ fn first_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn write_current_session(id: &Uuid) -> anyhow::Result<()> {
-    let path = Path::new(CURRENT_SESSION_FILE);
+fn write_current_session(id: &Uuid, tool: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path = altevra_core::current_session_path(tool, &cwd);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, id.to_string())?;
+    std::fs::write(&path, id.to_string())?;
     Ok(())
 }
 
-fn read_current_session() -> anyhow::Result<Option<Uuid>> {
-    let path = Path::new(CURRENT_SESSION_FILE);
+fn read_current_session(tool: &str) -> anyhow::Result<Option<Uuid>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path = altevra_core::current_session_path(tool, &cwd);
     if !path.exists() {
         return Ok(None);
     }
-    let s = std::fs::read_to_string(path)?;
+    let s = std::fs::read_to_string(&path)?;
     Ok(Uuid::parse_str(s.trim()).ok())
 }
 
-fn clear_current_session() -> anyhow::Result<()> {
-    let path = Path::new(CURRENT_SESSION_FILE);
+fn clear_current_session(tool: &str) -> anyhow::Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path = altevra_core::current_session_path(tool, &cwd);
     if path.exists() {
-        std::fs::remove_file(path)?;
+        std::fs::remove_file(&path)?;
     }
     Ok(())
 }
@@ -441,6 +595,7 @@ mod tests {
             metadata: serde_json::json!({}),
             external_id: None,
             imported_from: None,
+            working_dir: None,
         })
         .await
         .unwrap();
@@ -463,6 +618,7 @@ mod tests {
                 sensitivity: altevra_core::Sensitivity::Internal.to_string(),
                 redaction_status: altevra_core::status::RedactionStatus::Clean.to_string(),
                 created_at: Utc::now(),
+                working_dir: None,
             })
             .await
             .unwrap();
@@ -525,32 +681,69 @@ mod tests {
         );
     }
 
+    /// Panic-safe HOME override: restores the previous HOME on drop so a
+    /// failing assertion can't leak a TempDir HOME into sibling tests.
+    struct HomeGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(home: &std::path::Path) -> Self {
+            let prev = std::env::var_os("HOME");
+            std::env::set_var("HOME", home);
+            Self { prev }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn session_start_writes_pointer_file() {
         let tmp = TempDir::new().unwrap();
+        // The session pointer anchors at $HOME (`current_session_path`), so
+        // override HOME to the TempDir — this test must NEVER write/remove
+        // files under the real ~/.altevra/state/.
+        let _home = HomeGuard::set(tmp.path());
         let cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmp.path()).unwrap();
 
+        let tool = "claude-code";
         let args = HookHandleArgs {
             event: "session_start".into(),
-            tool: "claude-code".into(),
+            tool: tool.to_string(),
             project: Some("altevra".into()),
             db: tmp.path().join("altevra.db"),
             no_stdin: true,
         };
         run(args).await.unwrap();
-        assert!(tmp.path().join(CURRENT_SESSION_FILE).exists());
+        // The session pointer is now $HOME/.altevra/state/session-<tool>-<cwd_hash>.txt
+        let ptr = altevra_core::current_session_path(tool, tmp.path());
+        assert!(ptr.exists(), "session pointer file must exist after session_start");
 
         // session_end clears pointer
         let args = HookHandleArgs {
             event: "session_end".into(),
-            tool: "claude-code".into(),
+            tool: tool.to_string(),
             project: None,
             db: tmp.path().join("altevra.db"),
             no_stdin: true,
         };
         run(args).await.unwrap();
-        assert!(!tmp.path().join(CURRENT_SESSION_FILE).exists());
+        assert!(!ptr.exists(), "session pointer file must be removed after session_end");
+
+        // Prove isolation: everything the run produced lives under the TempDir.
+        assert!(
+            ptr.starts_with(tmp.path()),
+            "session pointer must be anchored under the overridden HOME, got {}",
+            ptr.display()
+        );
 
         std::env::set_current_dir(cwd).unwrap();
     }

@@ -32,8 +32,8 @@ pub use firewall_state::FirewallStateRepository;
 pub use fts::{FtsHit, FtsRepository, ObjectHit};
 pub use hooks::{HookRow, HookRunRow, HooksRepository};
 pub use improvement_signals::{
-    is_resident_authored, signal_for_session, ImprovementSignalsRepository, NewSignal,
-    SignalCluster, SignalRow,
+    is_resident_authored, signal_for_session, signal_for_skill_candidate,
+    ImprovementSignalsRepository, NewSignal, SignalCluster, SignalRow,
 };
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
 pub use mentions::{MentionEdge, MentionsRepository};
@@ -42,9 +42,7 @@ pub use objects::{
     ObjectIndexRepository, ObjectIndexRow,
 };
 pub use prompts::PromptsRepository;
-pub use proposals::{
-    write_resident_proposals, NewProposal, ProposalRow, ProposalsRepository,
-};
+pub use proposals::{write_resident_proposals, NewProposal, ProposalRow, ProposalsRepository};
 pub use read_state::{ReadStateRepository, UpdateReadState};
 pub use resident::ResidentRepository;
 pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow, TurnSearchHit};

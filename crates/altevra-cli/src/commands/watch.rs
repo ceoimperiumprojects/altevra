@@ -37,23 +37,23 @@ pub struct WatchStartArgs {
     pub db: PathBuf,
 
     /// JSONL event log path.
-    #[arg(long, default_value = ".altevra/events/file_changes.jsonl")]
+    #[arg(long, default_value_os_t = altevra_core::home_dir().join(".altevra/events/file_changes.jsonl"))]
     pub event_log: PathBuf,
 
     /// PID file location.
-    #[arg(long, default_value = ".altevra/watcher.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_watcher_pid_path())]
     pub pid_file: PathBuf,
 }
 
 #[derive(Args)]
 pub struct WatchStatusArgs {
-    #[arg(long, default_value = ".altevra/watcher.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_watcher_pid_path())]
     pub pid_file: PathBuf,
 }
 
 #[derive(Args)]
 pub struct WatchStopArgs {
-    #[arg(long, default_value = ".altevra/watcher.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_watcher_pid_path())]
     pub pid_file: PathBuf,
 }
 

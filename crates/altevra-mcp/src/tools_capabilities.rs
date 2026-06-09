@@ -3,10 +3,9 @@ use std::path::PathBuf;
 
 use crate::server::McpResponse;
 
-const CAP_PATH: &str = ".altevra/state/capabilities.json";
-const KGAP_PATH: &str = ".altevra/state/knowledge_gaps.jsonl";
-const CGAP_PATH: &str = ".altevra/state/capability_gaps.jsonl";
-const REVIEW_PATH: &str = ".altevra/state/review_items.jsonl";
+fn state_path(filename: &str) -> PathBuf {
+    altevra_core::home_dir().join(".altevra/state").join(filename)
+}
 
 /// Resolve the SQLite path for DB-backed handlers: explicit `db_path` arg wins,
 /// otherwise fall back to the core default. Mirrors `tools_sessions`.
@@ -17,8 +16,8 @@ fn db_path_from_args(args: &Value) -> PathBuf {
         .unwrap_or_else(altevra_core::default_db_path)
 }
 
-fn append_jsonl(path: &str, value: &Value) -> std::io::Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
+fn append_jsonl(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     use std::io::Write;
@@ -31,8 +30,8 @@ fn append_jsonl(path: &str, value: &Value) -> std::io::Result<()> {
 }
 
 #[allow(dead_code)]
-fn load_jsonl(path: &str) -> Vec<Value> {
-    if !std::path::Path::new(path).exists() {
+fn load_jsonl(path: &std::path::Path) -> Vec<Value> {
+    if !path.exists() {
         return vec![];
     }
     std::fs::read_to_string(path)
@@ -44,8 +43,9 @@ fn load_jsonl(path: &str) -> Vec<Value> {
 }
 
 pub fn handle_get_capabilities(id: Value, _args: &Value) -> McpResponse {
-    let caps = if std::path::Path::new(CAP_PATH).exists() {
-        std::fs::read_to_string(CAP_PATH)
+    let cap_path = state_path("capabilities.json");
+    let caps = if cap_path.exists() {
+        std::fs::read_to_string(&cap_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| serde_json::json!({"adapters": [], "skills": [], "hooks": []}))
@@ -74,7 +74,7 @@ pub fn handle_report_knowledge_gap(id: Value, args: &Value) -> McpResponse {
         "reported_at": chrono::Utc::now(),
         "reporter": args["reporter"],
     });
-    if let Err(e) = append_jsonl(KGAP_PATH, &entry) {
+    if let Err(e) = append_jsonl(&state_path("knowledge_gaps.jsonl"), &entry) {
         return McpResponse::error(id, -32000, format!("save failed: {e}"));
     }
     McpResponse::ok(id, entry)
@@ -91,7 +91,7 @@ pub fn handle_report_capability_gap(id: Value, args: &Value) -> McpResponse {
         "context": args["context"],
         "reported_at": chrono::Utc::now(),
     });
-    if let Err(e) = append_jsonl(CGAP_PATH, &entry) {
+    if let Err(e) = append_jsonl(&state_path("capability_gaps.jsonl"), &entry) {
         return McpResponse::error(id, -32000, format!("save failed: {e}"));
     }
     McpResponse::ok(id, entry)
@@ -110,7 +110,7 @@ pub fn handle_create_review_item(id: Value, args: &Value) -> McpResponse {
         "status": "open",
         "created_at": chrono::Utc::now(),
     });
-    if let Err(e) = append_jsonl(REVIEW_PATH, &entry) {
+    if let Err(e) = append_jsonl(&state_path("review_items.jsonl"), &entry) {
         return McpResponse::error(id, -32000, format!("save failed: {e}"));
     }
     McpResponse::ok(id, entry)
@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn jsonl_load_empty() {
-        let v = load_jsonl("/tmp/this-should-not-exist-altevra.jsonl");
+        let v = load_jsonl(std::path::Path::new("/tmp/this-should-not-exist-altevra.jsonl"));
         assert!(v.is_empty());
     }
 

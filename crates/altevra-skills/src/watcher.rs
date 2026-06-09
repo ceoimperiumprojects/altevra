@@ -207,6 +207,24 @@ pub fn watch_loop<F: FnMut(&CycleReport) -> bool>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    // HOME is process-global; keep env-mutating watcher tests deterministic.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_home<F: FnOnce() -> R, R>(home: &std::path::Path, f: F) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", home);
+        let result = f();
+        match prev {
+            Some(p) => std::env::set_var("HOME", p),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
 
     #[test]
     fn temp_files_and_hidden_files_are_filtered() {
@@ -227,18 +245,38 @@ mod tests {
 
     #[test]
     fn run_one_cycle_dry_never_writes() {
-        // A WatchConfig with no vault and no real homedir scan can still produce a
-        // report; the test we care about is that DRY-RUN never writes regardless of
-        // plan size. (We don't assert plan counts because real `~/` content varies
-        // by machine — that's exactly why the inventory test owns that contract.)
-        let cfg = WatchConfig {
-            targets: vec![SourceTool::Claude],
-            vault_skills_dir: None,
-            apply: false,
-            ..Default::default()
-        };
-        let report = run_one_cycle(&cfg, vec![]);
-        assert_eq!(report.result.created, 0, "dry-run never writes");
-        assert_eq!(report.result.refreshed, 0);
+        // `apply_plan(false)` intentionally reports the planned create/refresh
+        // counts so `--dry-run` can show the full sync plan. The invariant here
+        // is filesystem safety: even with a real planned Create, no target file
+        // is written. Isolate HOME so the test never depends on Pavle's live
+        // ~/.claude / ~/.hermes skill inventory.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude_skill = home.join(".claude/skills/demo/SKILL.md");
+        fs::create_dir_all(claude_skill.parent().unwrap()).unwrap();
+        fs::write(&claude_skill, "---\nname: demo\n---\nbody\n").unwrap();
+
+        with_home(home, || {
+            let cfg = WatchConfig {
+                targets: vec![SourceTool::Hermes],
+                vault_skills_dir: None,
+                apply: false,
+                ..Default::default()
+            };
+            let report = run_one_cycle(&cfg, vec![]);
+            assert_eq!(
+                report.plan_creates, 1,
+                "dry-run should still report planned creates"
+            );
+            assert_eq!(
+                report.result.created, 1,
+                "dry-run result reports planned creates"
+            );
+            assert_eq!(report.result.errors.len(), 0);
+            assert!(
+                !home.join(".hermes/skills/demo/SKILL.md").exists(),
+                "dry-run must never write the planned target file"
+            );
+        });
     }
 }

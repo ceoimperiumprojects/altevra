@@ -27,8 +27,8 @@
 //! [`analyze`]: super::analyze
 
 use altevra_db::{
-    create_pool, run_migrations, signal_for_session, ImprovementSignalsRepository, SessionRow,
-    SessionsRepository, TurnRow,
+    create_pool, run_migrations, signal_for_session, signal_for_skill_candidate,
+    ImprovementSignalsRepository, SessionRow, SessionsRepository, TurnRow,
 };
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::Args;
@@ -81,6 +81,11 @@ pub struct ImportStats {
 }
 
 pub async fn run(args: ImportArgs) -> anyhow::Result<()> {
+    // Maintenance lock (db unify): import is a batch writer — refuse
+    // non-fatally unless this is a read-only dry run.
+    if !args.dry_run && crate::commands::brain::refuse_if_maintenance_locked("import") {
+        return Ok(());
+    }
     let since = match args.since.as_deref() {
         Some(s) => Some(parse_since(s)?),
         None => None,
@@ -186,9 +191,7 @@ async fn run_hermes(
             Ok(None) => {
                 stats.sessions_skipped_empty += 1;
             }
-            Err(e) => stats
-                .errors
-                .push(format!("parse {}: {e}", path.display())),
+            Err(e) => stats.errors.push(format!("parse {}: {e}", path.display())),
         }
 
         if (idx + 1) % 50 == 0 {
@@ -231,6 +234,8 @@ async fn import_one_hermes(
         }),
         external_id: Some(sess.external_id.clone()),
         imported_from: Some(sess.imported_from.to_string_lossy().to_string()),
+        // Hermes-imported sessions have no cwd context — leave null per PLAN.md.
+        working_dir: None,
     };
 
     let actual_id = match repo.upsert_imported(&row).await? {
@@ -243,14 +248,18 @@ async fn import_one_hermes(
         }
     };
 
+    let mut tool_evidence_count = 0_i64;
+    let file_change_count = 0_i64;
+
     for turn in &sess.turns {
+        if matches!(turn.role.as_str(), "tool_call" | "tool_result") {
+            tool_evidence_count += 1;
+        }
         // R11 / SI-7: guard BEFORE persist. Same pipeline the live hook
         // handler uses — secrets + PII are scrubbed, sensitivity bumped,
         // tool_calls JSON walked leaf-by-leaf via guard_json.
-        let guarded = altevra_secrets::guard_text(
-            &turn.content,
-            altevra_core::Sensitivity::Internal,
-        );
+        let guarded =
+            altevra_secrets::guard_text(&turn.content, altevra_core::Sensitivity::Internal);
         let mut sensitivity = guarded.sensitivity.clone();
         let mut redaction = guarded.redaction_status.clone();
         let mut redacted_count = guarded.sightings.len() as i64
@@ -261,6 +270,7 @@ async fn import_one_hermes(
             );
 
         let scrubbed_tool_calls = if let Some(tc) = turn.tool_calls.as_ref() {
+            tool_evidence_count += 1;
             let (v, c, s) = crate::commands::hook_handle::guard_json(tc);
             redacted_count += c;
             sensitivity = sensitivity.combine(&s);
@@ -290,6 +300,8 @@ async fn import_one_hermes(
             sensitivity: sensitivity.to_string(),
             redaction_status: redaction.to_string(),
             created_at: turn.created_at,
+            // Hermes-imported turns have no cwd context.
+            working_dir: None,
         };
         repo.record_turn(&trow).await?;
         stats.turns_imported += 1;
@@ -311,6 +323,26 @@ async fn import_one_hermes(
             Err(e) => stats
                 .errors
                 .push(format!("signal enqueue {actual_id}: {e}")),
+        }
+    }
+
+    // C1.1 / Skill-factory candidate producer — still pointer-only. Local
+    // heuristics may say "this session is worth skill review", but Codex/GPT
+    // must follow the raw session ref before drafting SKILL.md.
+    if let Some(new_signal) = signal_for_skill_candidate(
+        &actual_id.to_string(),
+        &sess.tool_id,
+        sess.project_name.as_deref(),
+        sess.turns.len() as i64,
+        tool_evidence_count,
+        file_change_count,
+    ) {
+        match signals.insert(&new_signal).await {
+            Ok((_, true)) => stats.signals_enqueued += 1,
+            Ok((_, false)) => { /* dedup hit — already counted on a previous run */ }
+            Err(e) => stats
+                .errors
+                .push(format!("skill signal enqueue {actual_id}: {e}")),
         }
     }
 
@@ -481,6 +513,56 @@ mod tests {
             any_redacted,
             "expected at least one redacted_count >= 1 from the credential line"
         );
+    }
+
+    #[tokio::test]
+    async fn import_hermes_enqueues_pointer_only_skill_candidate_signal_for_tool_heavy_session() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("sessions");
+        fs::create_dir_all(&src).unwrap();
+        write_fixture(
+            &src,
+            "20260602_120000_skill.jsonl",
+            &[
+                r#"{"role":"session_meta","model":"gpt-5.5","timestamp":"2026-06-02T12:00:00.000000"}"#,
+                r#"{"role":"user","content":"debug this workflow","timestamp":"2026-06-02T12:00:01.000000"}"#,
+                r#"{"role":"assistant","content":"I'll inspect","timestamp":"2026-06-02T12:00:02.000000","tool_calls":[{"id":"tc1","function":{"name":"read_file","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","tool_call_id":"tc1","content":"file content","timestamp":"2026-06-02T12:00:03.000000"}"#,
+                r#"{"role":"assistant","content":"I'll test","timestamp":"2026-06-02T12:00:04.000000","tool_calls":[{"id":"tc2","function":{"name":"terminal","arguments":"{}"}}]}"#,
+                r#"{"role":"tool","tool_call_id":"tc2","content":"tests pass","timestamp":"2026-06-02T12:00:05.000000"}"#,
+            ],
+        );
+        let db = tmp.path().join("skill.db");
+
+        let stats = run_hermes(&src, None, &db, false).await.unwrap();
+        assert_eq!(stats.sessions_imported, 1);
+        assert_eq!(
+            stats.signals_enqueued, 2,
+            "session_ingest + pointer-only skill_candidate"
+        );
+
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        let session_id: String = sqlx::query_scalar(
+            "SELECT id FROM sessions WHERE external_id = '20260602_120000_skill'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let raw_ref = format!("session:{session_id}");
+        let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT kind, source_ref, summary, cluster_key FROM improvement_signals ORDER BY kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let skill = rows
+            .iter()
+            .find(|(kind, _, _, _)| kind == "skill_candidate")
+            .expect("missing skill_candidate signal");
+        assert_eq!(skill.1, raw_ref);
+        assert!(skill.2.contains(&format!("raw_trace_ref={raw_ref}")));
+        assert!(skill.2.contains("tool_calls=4"));
+        assert_eq!(skill.3, "skill:hermes");
     }
 
     #[tokio::test]

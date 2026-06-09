@@ -19,7 +19,9 @@ pub enum BrainCommands {
 
 #[derive(Args)]
 pub struct BrainStartArgs {
-    #[arg(long, default_value = ".")]
+    /// Vault root the brain jobs scan. Defaults to config.toml `[vault].path`
+    /// (e.g. ~/Obsidian/Imperium), then `ALTEVRA_VAULT`, then `"."`.
+    #[arg(long, default_value_os_t = altevra_core::default_vault_path())]
     pub vault: PathBuf,
     #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
@@ -30,7 +32,7 @@ pub struct BrainStartArgs {
     /// Comma-separated job kinds to disable.
     #[arg(long, default_value = "")]
     pub disabled: String,
-    #[arg(long, default_value = ".altevra/brain.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_brain_pid_path())]
     pub pid_file: PathBuf,
 }
 
@@ -38,7 +40,7 @@ pub struct BrainStartArgs {
 pub struct BrainStatusArgs {
     #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
-    #[arg(long, default_value = ".altevra/brain.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_brain_pid_path())]
     pub pid_file: PathBuf,
     #[arg(long)]
     pub json: bool,
@@ -46,13 +48,15 @@ pub struct BrainStatusArgs {
 
 #[derive(Args)]
 pub struct BrainStopArgs {
-    #[arg(long, default_value = ".altevra/brain.pid")]
+    #[arg(long, default_value_os_t = altevra_core::default_brain_pid_path())]
     pub pid_file: PathBuf,
 }
 
 #[derive(Args)]
 pub struct BrainTickArgs {
-    #[arg(long, default_value = ".")]
+    /// Vault root the brain jobs scan. Defaults to config.toml `[vault].path`
+    /// (e.g. ~/Obsidian/Imperium), then `ALTEVRA_VAULT`, then `"."`.
+    #[arg(long, default_value_os_t = altevra_core::default_vault_path())]
     pub vault: PathBuf,
     #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
@@ -84,7 +88,23 @@ async fn open_pool(path: &std::path::Path) -> anyhow::Result<sqlx::SqlitePool> {
     Ok(pool)
 }
 
+/// Non-fatal maintenance-lock refusal (P0 db unify contract): batch writers
+/// stand down while a unify rewrites the canonical DB. Exit 0 — never an error.
+pub(crate) fn refuse_if_maintenance_locked(what: &str) -> bool {
+    if altevra_core::maintenance::maintenance_locked_default() {
+        eprintln!(
+            "[altevra] maintenance lock held (db unify in progress) — {what} refused \
+             (non-fatal); retry after unify completes."
+        );
+        return true;
+    }
+    false
+}
+
 async fn run_start(args: BrainStartArgs) -> anyhow::Result<()> {
+    if refuse_if_maintenance_locked("brain start") {
+        return Ok(());
+    }
     let pool = open_pool(&args.db).await?;
     let cfg = BrainConfig {
         vault_path: args.vault,
@@ -161,6 +181,9 @@ async fn run_stop(args: BrainStopArgs) -> anyhow::Result<()> {
 }
 
 async fn run_tick(args: BrainTickArgs) -> anyhow::Result<()> {
+    if refuse_if_maintenance_locked("brain tick") {
+        return Ok(());
+    }
     let pool = open_pool(&args.db).await?;
     let cfg = BrainConfig {
         vault_path: args.vault,

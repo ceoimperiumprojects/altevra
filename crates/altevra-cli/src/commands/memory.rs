@@ -31,8 +31,9 @@ pub struct MemoryIngestArgs {
 pub struct MemorySearchArgs {
     /// Query string
     pub query: String,
-    /// Vault root to index (defaults to ".")
-    #[arg(long, default_value = ".")]
+    /// Vault root to index. Defaults to config.toml `[vault].path`, then
+    /// `ALTEVRA_VAULT`, then `"."` (see `altevra_core::default_vault_path`).
+    #[arg(long, default_value_os_t = altevra_core::default_vault_path())]
     pub vault: PathBuf,
     /// Result limit
     #[arg(long, default_value_t = 5)]

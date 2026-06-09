@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod errors;
 pub mod events;
 pub mod lifecycle;
+pub mod maintenance;
 pub mod mirror;
 pub mod observer;
 pub mod packet;
@@ -34,6 +35,10 @@ pub use entity::{
 pub use envelope::{Confidence, Envelope, HasEnvelope, Provenance, ProvenanceOrigin};
 pub use errors::AltevraError;
 pub use lifecycle::derive_lifecycle_state;
+pub use maintenance::{
+    maintenance_lock_path, maintenance_locked, maintenance_locked_default, spool_dir,
+    MaintenanceLock, MAINTENANCE_LOCK_TTL_SECS,
+};
 pub use mirror::{render_mirror, MirrorDoc};
 pub use observer::{
     detect_decision_conflict, detect_high_session_volume, detect_low_task_velocity,
@@ -44,7 +49,10 @@ pub use packet::{
     ContextPacket, ContextPacketItem, ExclusionRecord, PacketCandidate, PacketCompiler,
     PacketRequest, WhyIncluded,
 };
-pub use paths::{default_db_path, DEFAULT_DB_PATH};
+pub use paths::{
+    current_session_path, default_brain_pid_path, default_db_path, default_vault_path,
+    default_watcher_pid_path, home_dir, DEFAULT_BRAIN_PID, DEFAULT_DB_PATH, DEFAULT_WATCHER_PID,
+};
 pub use presence::{require_human_presence, PresenceError, PresenceMethod, PresenceProof};
 pub use prompt_registry::{
     assert_one_active_per_slug, checksum_body, detect_drift, mint_plan, render, try_auto_activate,

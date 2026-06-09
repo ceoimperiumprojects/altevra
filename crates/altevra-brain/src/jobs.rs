@@ -129,11 +129,15 @@ pub struct JobContext {
 /// last marker file at .altevra/state/last_classified_offset.
 pub async fn run_event_classifier(
     _pool: &SqlitePool,
-    _ctx: &JobContext,
+    ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
-    let events_path = std::path::Path::new(".altevra/events/file_changes.jsonl");
-    let updates_path = std::path::Path::new(".altevra/events/updates.jsonl");
-    let marker_path = std::path::Path::new(".altevra/state/last_classified_offset");
+    let events_path = ctx.vault_path.join(".altevra/events/file_changes.jsonl");
+    let updates_path = ctx.vault_path.join(".altevra/events/updates.jsonl");
+    let marker_path = ctx.vault_path.join(".altevra/state/last_classified_offset");
+    // Borrow as &Path for the remainder of the function.
+    let events_path = events_path.as_path();
+    let updates_path = updates_path.as_path();
+    let marker_path = marker_path.as_path();
     if !events_path.exists() {
         return Ok(JobResult {
             summary: "no file_changes.jsonl yet".into(),
@@ -199,35 +203,97 @@ pub async fn run_event_classifier(
     })
 }
 
-/// Run pattern detection across recent events + updates. For now we just count
-/// updates in the local JSONL — full observer wiring lives in altevra-core.
-pub async fn run_observer_scan(_pool: &SqlitePool, _ctx: &JobContext) -> anyhow::Result<JobResult> {
-    let updates_path = std::path::Path::new(".altevra/events/updates.jsonl");
-    if !updates_path.exists() {
+/// Run pattern detection across recent events via SQLite + `detect_patterns`.
+///
+/// Queries `EventsRepository` for the last 30 days of events, calls
+/// `detect_patterns`, and persists each insight as a `kind="improvement"` proposal
+/// (deduped by title). Returns the count of insights detected (not line counts).
+pub async fn run_observer_scan(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_core::observer::detect_patterns;
+    use altevra_db::{EventsRepository, NewProposal, ProposalsRepository};
+
+    let window_days = 30i64;
+    let since = ctx.now - chrono::Duration::days(window_days);
+    let events = EventsRepository::new(pool)
+        .list_since(since, None, 5000)
+        .await
+        .unwrap_or_default();
+
+    let insights = detect_patterns(&events, &[]);
+    let insight_count = insights.len();
+
+    if insight_count == 0 {
         return Ok(JobResult {
-            summary: "no updates to scan".into(),
+            summary: format!(
+                "observer scan: {} events checked, no patterns detected",
+                events.len()
+            ),
             items_processed: 0,
         });
     }
-    let content = std::fs::read_to_string(updates_path).unwrap_or_default();
-    let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+
+    // Persist each insight as a proposal (idempotent via dedup_hash).
+    let proposals = ProposalsRepository::new(pool);
+    let mut new_proposals = 0usize;
+    for ins in &insights {
+        let np = NewProposal {
+            kind: "improvement".into(),
+            title: ins.title.clone(),
+            body: ins.summary.clone(),
+            source_mode: Some("observer".into()),
+            dedup_hash: format!("observer:insight:{}", ins.title),
+            evidence_refs: ins
+                .evidence
+                .iter()
+                .filter_map(|e| e.event_id.map(|id| format!("event:{id}")))
+                .collect(),
+            touches_sensitive: false,
+            touches_constitutional: false,
+        };
+        if let Ok((_, is_new)) = proposals.insert(&np).await {
+            if is_new {
+                new_proposals += 1;
+            }
+        }
+    }
+
     Ok(JobResult {
-        summary: format!("scanned {count} updates"),
-        items_processed: count,
+        summary: format!(
+            "observer scan: {} event(s), {} insight(s) detected, {} new proposal(s)",
+            events.len(),
+            insight_count,
+            new_proposals
+        ),
+        items_processed: insight_count,
     })
 }
 
-/// Scan the vault and queue any missing memory_chunks for embedding. Reuses
-/// altevra-vault scanner + altevra-memory ingestion.
+/// Scan the vault and queue files into `pending_indexing` for the embed worker.
+///
+/// `pending_indexing` is consumed by `EmbedderWorker::drain_pending_files`
+/// (called at the start of every `altevra embed tick`/`run` tick): each path is
+/// ingested → guarded → persisted as memory_documents/memory_chunks → enqueued
+/// into `embedder_queue` for vectors.
+///
+/// The ON CONFLICT clause only resets `failed` rows (giving them another chance)
+/// — rows already `pending` or `done` are left untouched so the queue doesn't
+/// grow unboundedly on every vault-indexer tick. (NOTE: inside DO UPDATE,
+/// unqualified columns refer to the EXISTING row; `excluded.*` is the row we
+/// tried to insert, whose status is always 'pending' — the old
+/// `excluded.status = 'failed'` condition could never fire.)
 pub async fn run_vault_indexer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
     let files = altevra_vault::scan_vault(&ctx.vault_path).unwrap_or_default();
     let mut queued = 0;
     for f in files.iter().take(50) {
-        // queue path for indexing — uses pending_indexing table
+        // Insert new rows; on conflict only reset failed rows back to pending
+        // (never disturb already-pending rows — they await the embed worker).
         let id = uuid::Uuid::new_v4().to_string();
         let _ = sqlx::query(
             r#"INSERT INTO pending_indexing (id, path, status) VALUES (?, ?, 'pending')
-               ON CONFLICT (path) DO UPDATE SET status = 'pending'"#,
+               ON CONFLICT (path) DO UPDATE SET
+                   status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END,
+                   queued_at = CASE WHEN status = 'failed'
+                       THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE queued_at END"#,
         )
         .bind(id)
         .bind(f.path.to_string_lossy().to_string())
@@ -236,7 +302,7 @@ pub async fn run_vault_indexer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
         queued += 1;
     }
     Ok(JobResult {
-        summary: format!("queued {queued} vault files"),
+        summary: format!("queued {queued} vault files for embed worker"),
         items_processed: queued,
     })
 }
@@ -1359,11 +1425,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observer_scan_handles_missing_file() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
+    async fn vault_indexer_requeues_failed_but_preserves_pending_and_done() {
+        // P0 §5 — pending_indexing requeue semantics. The old SQL compared
+        // `excluded.status` (always 'pending') so failed rows were NEVER
+        // requeued. This drives the fixed path: failed → pending again,
+        // pending stays pending, done stays done.
+        let pool = migrated_pool().await;
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.md"), "# Note\n\nbody.\n").unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: noop_router(),
+        };
+
+        // First run queues the file as pending.
+        run_vault_indexer(&pool, &ctx).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_indexing LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending");
+
+        // Second run must NOT disturb a pending row.
+        run_vault_indexer(&pool, &ctx).await.unwrap();
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_indexing")
+            .fetch_one(&pool)
             .await
             .unwrap();
+        assert_eq!(n, 1, "re-scan must not duplicate queue rows");
+
+        // A failed row gets another chance on the next scan.
+        sqlx::query("UPDATE pending_indexing SET status = 'failed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_vault_indexer(&pool, &ctx).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_indexing LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "pending", "failed rows must be requeued");
+
+        // A done row stays done (the embed worker already consumed it).
+        sqlx::query("UPDATE pending_indexing SET status = 'done'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        run_vault_indexer(&pool, &ctx).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM pending_indexing LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "done", "done rows must not be requeued");
+    }
+
+    #[tokio::test]
+    async fn observer_scan_returns_zero_on_empty_events_table() {
+        // migrated pool: events table exists but is empty → 0 patterns, 0 proposals.
+        let pool = migrated_pool().await;
         let ctx = JobContext {
             vault_path: std::path::PathBuf::from("/nonexistent"),
             now: Utc::now(),
@@ -1371,6 +1494,55 @@ mod tests {
         };
         let r = run_observer_scan(&pool, &ctx).await.unwrap();
         assert_eq!(r.items_processed, 0);
+        assert!(r.summary.contains("no patterns") || r.summary.contains("0 event"));
+    }
+
+    /// Fixture test: seed SQLite events → observer scan returns >=1 insight/proposal.
+    #[tokio::test]
+    async fn observer_scan_detects_pattern_from_seeded_events() {
+        use altevra_core::events::{ActorType, Event, EventType};
+        use altevra_db::{EventsRepository, ProposalsRepository};
+
+        let pool = migrated_pool().await;
+        let events_repo = EventsRepository::new(&pool);
+
+        // 3 SkillDriftDetected for the same entity → RecurringDrift insight.
+        for h in [2i64, 4, 6] {
+            let mut ev = Event::new(
+                EventType::SkillDriftDetected,
+                "drift altevra-core",
+                "test",
+                ActorType::System,
+            )
+            .with_entity("skill", "altevra-core");
+            ev.created_at = Utc::now() - chrono::Duration::hours(h);
+            events_repo.insert(&ev).await.unwrap();
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = JobContext {
+            vault_path: tmp.path().to_path_buf(),
+            now: Utc::now(),
+            router: noop_router(),
+        };
+        let r = run_observer_scan(&pool, &ctx).await.unwrap();
+        assert!(
+            r.items_processed >= 1,
+            "expected >=1 insight from seeded events, got: {r:?}"
+        );
+        // The insight should also be persisted as a proposal.
+        let proposals = ProposalsRepository::new(&pool)
+            .list(None, Some("improvement"))
+            .await
+            .unwrap();
+        assert!(
+            !proposals.is_empty(),
+            "observer scan must persist insights as proposals"
+        );
+        assert!(
+            proposals.iter().any(|p| p.source_mode.as_deref() == Some("observer")),
+            "proposal source_mode must be 'observer'"
+        );
     }
 
     #[tokio::test]

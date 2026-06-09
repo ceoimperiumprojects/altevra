@@ -38,13 +38,13 @@
 
 use altevra_core::observer::detect_patterns;
 use altevra_core::selfimprove::{
-    derive_risk_tier, firewall_check, FirewallLimits, FirewallState, FirewallVerdict, ProposedAction,
-    RiskTier,
+    derive_risk_tier, firewall_check, FirewallLimits, FirewallState, FirewallVerdict,
+    ProposedAction, RiskTier,
 };
 use altevra_core::status::ProposalStatus;
 use altevra_db::{
     EventsRepository, FirewallStateRepository, ImprovementSignalsRepository, NewProposal,
-    ProposalRow, ProposalsRepository, PromptsRepository, ReviewItemRow, TasksRepository,
+    PromptsRepository, ProposalRow, ProposalsRepository, ReviewItemRow, TasksRepository,
 };
 use altevra_mcp::packet_build::compile_gated_packet;
 use sqlx::SqlitePool;
@@ -265,7 +265,10 @@ fn is_constitutional_kind(kind: &str) -> bool {
 
 /// Kinds that touch sensitive identity/relationship surfaces → at least review.
 fn is_sensitive_kind(kind: &str) -> bool {
-    matches!(kind, "persona" | "source_of_truth" | "person" | "relationship")
+    matches!(
+        kind,
+        "persona" | "source_of_truth" | "person" | "relationship"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -279,9 +282,7 @@ pub async fn run_self_improve(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Re
     let report = run_self_improve_report(pool, ctx).await?;
     Ok(JobResult {
         summary: report.one_line(),
-        items_processed: report.auto_applied
-            + report.prompts_activated
-            + report.marked_for_render,
+        items_processed: report.auto_applied + report.prompts_activated + report.marked_for_render,
     })
 }
 
@@ -344,8 +345,11 @@ pub async fn run_self_improve_report(
         report.clusters_actionable += 1;
 
         let key = cluster.cluster_key.as_deref().unwrap_or("ungrouped");
-        let evidence_refs: Vec<String> =
-            cluster.signals.iter().map(|s| s.source_ref.clone()).collect();
+        let evidence_refs: Vec<String> = cluster
+            .signals
+            .iter()
+            .map(|s| s.source_ref.clone())
+            .collect();
 
         // The DETECT input is the WHOLE base, not a skill-only view: compile the
         // gated context packet over the cluster's terms (R12 retrieval — ExposureGate
@@ -359,19 +363,46 @@ pub async fn run_self_improve_report(
             Err(_) => "context: (packet compile unavailable)".to_string(),
         };
 
-        // A clustered session-ingest pattern → a Tier-0 `improvement` proposal for
-        // review/auto-apply. The repo re-derives the tier (SI-9); the dedup_hash keys
-        // on the cluster so repeated runs MERGE rather than flood (SI-13).
+        // Clustered `skill_candidate` signals are ONLY a pointer bundle for the
+        // skill-factory renderer. The cheap classifier never writes SKILL.md and
+        // never replaces the raw trace; the proposal body carries evidence refs so
+        // Codex/GPT can replay the preserved prompts/tool calls/outputs first.
+        let is_skill_cluster = cluster.signals.iter().any(|s| s.kind == "skill_candidate")
+            || key.starts_with("skill:");
+        let (kind, title, body, dedup_hash) = if is_skill_cluster {
+            (
+                "skill".to_string(),
+                format!("Skill candidate from {key}"),
+                format!(
+                    "{} skill-candidate signal(s) clustered under `{key}`.\n\n\
+                     Preserve raw trace: renderer must inspect evidence_refs via replay/search before drafting SKILL.md.\n\
+                     Evidence refs: {}\n\n{context_note}",
+                    cluster.signals.len(),
+                    evidence_refs.join(", ")
+                ),
+                format!("skillfactory:cluster:{key}"),
+            )
+        } else {
+            (
+                "improvement".to_string(),
+                format!("Recurring pattern in {key}"),
+                format!(
+                    "{} signal(s) clustered under `{key}` — review for a memory/learning/skill \
+                     improvement.\n\n{context_note}",
+                    cluster.signals.len()
+                ),
+                format!("selfimprove:cluster:{key}"),
+            )
+        };
+
+        // The repo re-derives the tier (SI-9); the dedup_hash keys on the
+        // cluster so repeated runs MERGE rather than flood (SI-13).
         let np = NewProposal {
-            kind: "improvement".into(),
-            title: format!("Recurring pattern in {key}"),
-            body: format!(
-                "{} signal(s) clustered under `{key}` — review for a memory/learning/skill \
-                 improvement.\n\n{context_note}",
-                cluster.signals.len()
-            ),
+            kind,
+            title,
+            body,
             source_mode: Some("self_improve".into()),
-            dedup_hash: format!("selfimprove:cluster:{key}"),
+            dedup_hash,
             evidence_refs,
             touches_sensitive: false,
             touches_constitutional: false,
@@ -405,7 +436,9 @@ pub async fn run_self_improve_report(
     }
 
     // ---- STAGE 4 GATE + STAGE 5 APPLY ----  over EVERY open (proposed) proposal.
-    let open = proposals.list(Some(ProposalStatus::Proposed.to_string().as_str()), None).await?;
+    let open = proposals
+        .list(Some(ProposalStatus::Proposed.to_string().as_str()), None)
+        .await?;
     for row in &open {
         report.candidates_gated += 1;
         // STAGE 6 (partial): every gated candidate counts as a run against the
@@ -719,6 +752,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn self_improve_skill_candidate_cluster_becomes_skill_proposal_with_raw_refs() {
+        let _g = LOOP_LOCK.lock().await;
+        let pool = migrated_pool().await;
+        let signals = ImprovementSignalsRepository::new(&pool);
+        for id in ["a", "b"] {
+            signals
+                .insert(&altevra_db::NewSignal {
+                    kind: "skill_candidate".into(),
+                    source_ref: format!("session:{id}"),
+                    summary: format!(
+                        "possible reusable workflow — raw_trace_ref=session:{id}; tool_calls=5"
+                    ),
+                    cluster_key: Some("skill:claude-code:altevra".into()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let report = run_self_improve_report(&pool, &ctx_for(chrono::Utc::now()))
+            .await
+            .unwrap();
+
+        assert_eq!(report.clusters_actionable, 1);
+        assert_eq!(report.proposals_created, 1);
+        assert_eq!(
+            report.marked_for_render, 1,
+            "skill proposals are triaged for renderer, not auto-written"
+        );
+
+        let proposals = ProposalsRepository::new(&pool)
+            .list(Some("triaged"), Some("skill"))
+            .await
+            .unwrap();
+        assert_eq!(proposals.len(), 1);
+        assert!(proposals[0].body.contains("Preserve raw trace"));
+        assert!(proposals[0].body.contains("session:a"));
+        assert!(proposals[0].body.contains("session:b"));
+        assert_eq!(
+            proposals[0].dedup_hash,
+            "skillfactory:cluster:skill:claude-code:altevra"
+        );
+    }
+
+    #[tokio::test]
     async fn self_improve_self_prompt_needs_shadow_eval() {
         let _g = LOOP_LOCK.lock().await;
         let pool = migrated_pool().await;
@@ -743,7 +820,12 @@ mod tests {
         assert_eq!(report1.prompts_activated, 0);
         assert_eq!(status_of(&pool, &prop).await, "proposed");
         assert_eq!(
-            prompts.active("resident_mode:observer").await.unwrap().unwrap().version,
+            prompts
+                .active("resident_mode:observer")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
             1,
             "without a passing eval the candidate must not self-activate"
         );
@@ -765,7 +847,12 @@ mod tests {
         assert_eq!(report2.prompts_activated, 1);
         assert_eq!(status_of(&pool, &prop).await, "applied");
         assert_eq!(
-            prompts.active("resident_mode:observer").await.unwrap().unwrap().version,
+            prompts
+                .active("resident_mode:observer")
+                .await
+                .unwrap()
+                .unwrap()
+                .version,
             2,
             "a passing shadow eval lets the prompt self-modify (SI-10)"
         );
@@ -814,7 +901,11 @@ mod tests {
         // version: `safety` stays at its seeded v1, still active, still locked.
         assert_eq!(status_of(&pool, &locked_prompt).await, "proposed");
         let snap = prompts.snapshot_for("safety").await.unwrap();
-        assert_eq!(snap.len(), 1, "no candidate version was ever minted/activated");
+        assert_eq!(
+            snap.len(),
+            1,
+            "no candidate version was ever minted/activated"
+        );
         assert_eq!(snap[0].version, 1);
         assert!(snap[0].locked);
         assert!(snap[0].active);

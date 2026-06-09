@@ -5,6 +5,8 @@ Rule: workers edit only their assigned section between SECTION markers.
 
 ## Editing Protocol
 
+Runtime/skill-factory correction (2026-06-06): read `ALTEVRA_RUNTIME_MODEL_AND_SKILL_FACTORY_DOCTRINE.md` before interpreting model-routing or self-improvement sections. Altevra's intended runtime includes cheap_worker, strong_reasoner, local_private, embedding_model, and an attached Codex/GPT renderer. Skill factory is Altevra-native: cheap/local modes propose pointer-only candidates, strong reasoning triages, and Codex/GPT replays raw trace before rendering final `SKILL.md`.
+
 1. Edit only the section where OWNER matches your worker name.
 2. Do not edit another worker’s section.
 3. Do not edit this protocol/header unless you are Hermes.

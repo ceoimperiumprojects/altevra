@@ -137,6 +137,9 @@ async fn run_start(args: SessionStartArgs) -> anyhow::Result<()> {
         metadata: serde_json::json!({}),
         external_id: None,
         imported_from: None,
+        working_dir: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
     };
     repo.start_session(&row).await?;
 

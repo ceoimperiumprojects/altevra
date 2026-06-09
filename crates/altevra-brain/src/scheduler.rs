@@ -26,7 +26,9 @@ pub struct BrainConfig {
 impl Default for BrainConfig {
     fn default() -> Self {
         Self {
-            vault_path: PathBuf::from("."),
+            // Same resolution as the CLI: config.toml [vault].path →
+            // ALTEVRA_VAULT → "." — the brain must never hardcode a vault.
+            vault_path: altevra_core::default_vault_path(),
             db_path: altevra_core::default_db_path(),
             daily_summary_hour: 23,
             tick_interval_secs: 30,

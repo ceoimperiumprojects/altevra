@@ -1,21 +1,25 @@
-use altevra_core::events::{ActorType, Event, EventStatus, EventType};
 use altevra_core::observer::{detect_patterns, writer};
-use altevra_core::security::Sensitivity;
 use altevra_core::updates::UpdateFeedItem;
 use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use std::path::Path;
-use std::str::FromStr;
 
 use crate::server::McpResponse;
 
 pub fn handle_get_observer_insights(id: Value, args: &Value, vault_root: &Path) -> McpResponse {
     let since_str = args["since"].as_str().unwrap_or("7d").to_string();
     let write_file = args["write_file"].as_bool().unwrap_or(false);
+    // Optional explicit db_path; falls back to default_db_path().
+    let db_path = args
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(altevra_core::default_db_path);
 
     let since = Utc::now() - parse_window(&since_str);
-    let events = load_events_for_observer(vault_root, since);
-    let updates = load_updates(vault_root, since);
+
+    // Query SQLite first; fall back to flat JSONL if unreachable or empty.
+    let (events, updates) = load_events_from_db_sync(&db_path, vault_root, since);
 
     let insights = detect_patterns(&events, &updates);
 
@@ -62,35 +66,99 @@ fn parse_window(s: &str) -> Duration {
     }
 }
 
-fn load_updates(vault: &Path, since: DateTime<Utc>) -> Vec<UpdateFeedItem> {
-    let path = vault.join(".altevra/events/updates.jsonl");
-    if !path.exists() {
-        return vec![];
+/// Load events from SQLite (primary) with flat-JSONL fallback.
+///
+/// Runs synchronously via a fresh single-threaded tokio runtime so this can be
+/// called from the MCP server's sync handler context.
+fn load_events_from_db_sync(
+    db_path: &std::path::Path,
+    vault: &Path,
+    since: DateTime<Utc>,
+) -> (Vec<altevra_core::events::Event>, Vec<UpdateFeedItem>) {
+    // Attempt SQLite via a temporary single-thread runtime.
+    if db_path.exists() {
+        let result = std::thread::spawn({
+            let db_path = db_path.to_path_buf();
+            let since = since;
+            move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok()?
+                    .block_on(async {
+                        let pool =
+                            altevra_db::create_pool(&db_path.to_string_lossy()).await.ok()?;
+                        let _ = altevra_db::run_migrations(&pool).await;
+                        let events = altevra_db::EventsRepository::new(&pool)
+                            .list_since(since, None, 5000)
+                            .await
+                            .ok()?;
+                        Some(events)
+                    })
+            }
+        })
+        .join()
+        .ok()
+        .flatten();
+
+        if let Some(events) = result {
+            if !events.is_empty() {
+                return (events, vec![]);
+            }
+        }
     }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<UpdateFeedItem>(l).ok())
-        .filter(|u| u.created_at >= since)
-        .collect()
+
+    // Fallback: flat JSONL (dev/test/pre-hook environments).
+    load_events_from_jsonl(vault, since)
 }
 
-fn load_events_for_observer(vault: &Path, since: DateTime<Utc>) -> Vec<Event> {
+/// Flat-JSONL loader — kept for dev/test use and backwards compat.
+fn load_events_from_jsonl(
+    vault: &Path,
+    since: DateTime<Utc>,
+) -> (Vec<altevra_core::events::Event>, Vec<UpdateFeedItem>) {
+    use altevra_core::events::{ActorType, Event, EventStatus, EventType};
+    use altevra_core::security::Sensitivity;
+    use std::str::FromStr;
+
+    fn load_updates(vault: &Path, since: DateTime<Utc>) -> Vec<UpdateFeedItem> {
+        let path = vault.join(".altevra/events/updates.jsonl");
+        if !path.exists() {
+            return vec![];
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str::<UpdateFeedItem>(l).ok())
+            .filter(|u| u.created_at >= since)
+            .collect()
+    }
+
+    fn extract_entity_id(v: &Value) -> Option<String> {
+        v.as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|first| first.get("id"))
+            .and_then(|id| id.as_str())
+            .map(|s| s.to_string())
+    }
+
     let events_path = vault.join(".altevra/events/events.jsonl");
     if events_path.exists() {
         let content = std::fs::read_to_string(&events_path).unwrap_or_default();
-        return content
+        let events: Vec<Event> = content
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<Event>(l).ok())
             .filter(|e| e.created_at >= since)
             .collect();
+        return (events, vec![]);
     }
-    // Fallback: derive minimal Events from updates.
+
+    // Last-resort: synthesize Events from updates.jsonl stream.
     let updates = load_updates(vault, since);
-    updates
-        .into_iter()
+    let events: Vec<Event> = updates
+        .iter()
         .filter_map(|u| {
             let et = EventType::from_str(&u.update_type).ok()?;
             Some(Event {
@@ -102,8 +170,8 @@ fn load_events_for_observer(vault: &Path, since: DateTime<Utc>) -> Vec<Event> {
                 source: u.update_type.clone(),
                 entity_type: None,
                 entity_id: extract_entity_id(&u.affected_entities),
-                title: u.title,
-                summary: Some(u.short_summary),
+                title: u.title.clone(),
+                summary: Some(u.short_summary.clone()),
                 payload: serde_json::Value::Object(Default::default()),
                 sensitivity: Sensitivity::Internal,
                 created_at: u.created_at,
@@ -111,20 +179,14 @@ fn load_events_for_observer(vault: &Path, since: DateTime<Utc>) -> Vec<Event> {
                 status: EventStatus::Processed,
             })
         })
-        .collect()
-}
-
-fn extract_entity_id(v: &Value) -> Option<String> {
-    v.as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|first| first.get("id"))
-        .and_then(|id| id.as_str())
-        .map(|s| s.to_string())
+        .collect();
+    (events, updates)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use altevra_core::security::Sensitivity;
     use altevra_core::updates::Importance;
     use uuid::Uuid;
 
@@ -132,7 +194,11 @@ mod tests {
     fn handles_empty_vault() {
         let tmp = tempfile::tempdir().unwrap();
         let id = serde_json::json!(1);
-        let args = serde_json::json!({"since": "7d"});
+        // Point db_path at a non-existent file → JSONL fallback → empty → count 0.
+        let args = serde_json::json!({
+            "since": "7d",
+            "db_path": tmp.path().join("nonexistent.db").to_str().unwrap(),
+        });
         let resp = handle_get_observer_insights(id, &args, tmp.path());
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -170,7 +236,12 @@ mod tests {
         }
         std::fs::write(events_dir.join("updates.jsonl"), lines).unwrap();
 
-        let args = serde_json::json!({"since": "7d", "write_file": true});
+        // Point db_path at nonexistent → falls back to JSONL (updates.jsonl seeded above).
+        let args = serde_json::json!({
+            "since": "7d",
+            "write_file": true,
+            "db_path": tmp.path().join("nonexistent.db").to_str().unwrap(),
+        });
         let resp = handle_get_observer_insights(serde_json::json!(2), &args, tmp.path());
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
@@ -179,6 +250,54 @@ mod tests {
         // File should exist.
         let written = result["written_path"].as_str().unwrap();
         assert!(std::path::Path::new(written).exists());
+    }
+
+    /// Fixture test: seed SQLite events → MCP observer returns >=1 insight (via db_path arg).
+    #[test]
+    fn mcp_observer_returns_insight_from_seeded_sqlite_events() {
+        use altevra_core::events::{ActorType, Event, EventType};
+        use altevra_db::{EventsRepository, create_pool, run_migrations};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("test.db");
+
+        // Seed 3 SkillDriftDetected events → RecurringDrift insight.
+        let pool = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let pool = create_pool(&db_path.to_string_lossy()).await.unwrap();
+                run_migrations(&pool).await.unwrap();
+                let repo = EventsRepository::new(&pool);
+                for h in [2i64, 4, 6] {
+                    let mut ev = Event::new(
+                        EventType::SkillDriftDetected,
+                        "drift altevra-core",
+                        "test",
+                        ActorType::System,
+                    )
+                    .with_entity("skill", "altevra-core");
+                    ev.created_at = Utc::now() - Duration::hours(h);
+                    repo.insert(&ev).await.unwrap();
+                }
+                pool
+            });
+        drop(pool); // release connections before sync handler spawns its own
+
+        let args = serde_json::json!({
+            "since": "7d",
+            "db_path": db_path.to_str().unwrap(),
+        });
+        let resp =
+            handle_get_observer_insights(serde_json::json!(3), &args, tmp.path());
+        assert!(resp.error.is_none(), "observer returned error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        let count = result["count"].as_u64().unwrap_or(0);
+        assert!(
+            count >= 1,
+            "expected >=1 insight from seeded SQLite events, got {count}"
+        );
     }
 
     #[test]

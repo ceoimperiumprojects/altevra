@@ -168,6 +168,12 @@ enum Commands {
     /// files (read-only; dry-run by default).
     #[command(subcommand)]
     Cursor(commands::cursor::CursorCommands),
+
+    /// Database maintenance — `unify` merges shadow DBs into the canonical
+    /// store (preview with --dry-run, real run requires --apply);
+    /// `replay-spool` drains hook events spooled during maintenance.
+    #[command(subcommand)]
+    Db(commands::db::DbCommands),
 }
 
 #[tokio::main]
@@ -219,5 +225,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Vault(cmd) => commands::vault::run(cmd).await,
         Commands::Mirror(cmd) => commands::mirror::run(cmd).await,
         Commands::Cursor(cmd) => commands::cursor::run(cmd).await,
+        Commands::Db(cmd) => commands::db::run(cmd).await,
     }
 }

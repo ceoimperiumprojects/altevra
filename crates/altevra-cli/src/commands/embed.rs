@@ -71,6 +71,13 @@ pub struct EmbedStatusArgs {
 }
 
 pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
+    // Maintenance lock (db unify): the embedder is a batch writer — refuse
+    // non-fatally for every write mode; `status` stays read-only and allowed.
+    if !matches!(cmd, EmbedCommands::Status(_))
+        && crate::commands::brain::refuse_if_maintenance_locked("embedder")
+    {
+        return Ok(());
+    }
     match cmd {
         EmbedCommands::Seed(args) => run_seed(args).await,
         EmbedCommands::Tick(args) => run_tick(args).await,
