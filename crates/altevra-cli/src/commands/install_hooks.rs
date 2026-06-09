@@ -384,6 +384,26 @@ fn patch_claude_style(
                 outcome.added_events.push((*event).to_string());
             }
         }
+        // Dedup: exactly ONE altevra entry per event. Legacy installs +
+        // marker-blind re-installs leave variants behind, and each extra
+        // double-fires the hook (double capture). Keep the canonical entry,
+        // drop every other altevra-invoking entry; non-altevra entries
+        // (imperium-emit etc.) are never touched — the additive contract
+        // applies to foreign hooks, not our own duplicates.
+        if !outcome.drifted_events.contains(&(*event).to_string()) {
+            if let Some(keep) = find_managed_index(arr) {
+                let mut i = arr.len();
+                while i > 0 {
+                    i -= 1;
+                    if i != keep && entry_invokes_altevra_hook_handle(&arr[i]) {
+                        arr.remove(i);
+                        outcome
+                            .added_events
+                            .push(format!("{event} (deduped extra entry)"));
+                    }
+                }
+            }
+        }
     }
 
     if !outcome.drifted_events.is_empty() && !force {
@@ -418,13 +438,19 @@ fn patch_claude_style(
 
 /// Build the Claude/Codex hook entry we want to write for `event`. The entry
 /// carries `_altevra_managed: true` so future runs recognise it.
+///
+/// P0 hardening (PLAN-ALIVE.md): bake the absolute `--db` path resolved on
+/// the installing machine so a hook can never resolve a CWD-relative shadow
+/// DB. Project/working_dir are derived inside hook-handle from
+/// `$CLAUDE_PROJECT_DIR`/cwd — no `$ALTEVRA_PROJECT`.
 fn claude_style_altevra_entry(_tool: &str, altevra_arg: &str) -> Value {
+    let db = altevra_core::paths::default_db_path().display().to_string();
     json!({
         "matcher": "*",
         "_altevra_managed": true,
         "hooks": [{
             "type": "command",
-            "command": format!("altevra hook-handle {altevra_arg} --tool {_tool}"),
+            "command": format!("altevra hook-handle {altevra_arg} --tool {_tool} --db {db}"),
             "timeout": 5
         }]
     })
@@ -677,11 +703,33 @@ fn hermes_managed_entry(bridge_cmd: &str) -> serde_yaml::Value {
 // ───────────────────────────────────────────────────────────────────────────
 
 fn find_managed_index(arr: &[Value]) -> Option<usize> {
-    arr.iter().position(|v| {
-        v.get(MANAGED_MARKER)
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    })
+    // Primary identification: the explicit marker. Fallback: any entry whose
+    // command invokes `altevra hook-handle` is ours regardless of marker —
+    // legacy installs (adapter `connect` template, pre-marker versions) wrote
+    // unmarked entries; without this fallback a re-install APPENDS a duplicate
+    // and every hook event fires twice (double capture).
+    arr.iter()
+        .position(|v| {
+            v.get(MANAGED_MARKER)
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .or_else(|| arr.iter().position(entry_invokes_altevra_hook_handle))
+}
+
+/// True when any nested hook command in this entry calls `altevra hook-handle`.
+fn entry_invokes_altevra_hook_handle(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .map(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("altevra hook-handle"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn find_managed_index_yaml(arr: &[serde_yaml::Value]) -> Option<usize> {
