@@ -10,11 +10,17 @@ pub enum ObserverCommands {
     Scan(ScanArgs),
     /// List previously-written insight files in <vault>/10-insights/.
     Insights(InsightsArgs),
+    /// One-time cold-start backfill (P4): synthesize METADATA-ONLY events
+    /// (counts, turn/session IDs, tool names — never turn body) from the
+    /// turns corpus. Deterministic ids + watermark = idempotent re-runs.
+    Backfill(BackfillArgs),
 }
 
 #[derive(Args)]
 pub struct ScanArgs {
-    /// Time window to consider (e.g. 24h, 7d, 30d).
+    /// Time window to consider (e.g. 24h, 7d, 30d) or an absolute epoch
+    /// (`@<unix-seconds>`) for the one-shot cold-start scan over backfilled
+    /// (historically-stamped) events.
     #[arg(long, default_value = "7d")]
     pub since: String,
 
@@ -50,15 +56,59 @@ pub struct InsightsArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct BackfillArgs {
+    /// SQLite database path.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+
+    /// Output as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: ObserverCommands) -> anyhow::Result<()> {
     match cmd {
         ObserverCommands::Scan(args) => run_scan(args).await,
         ObserverCommands::Insights(args) => run_insights(args).await,
+        ObserverCommands::Backfill(args) => run_backfill(args).await,
     }
 }
 
+async fn run_backfill(args: BackfillArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let report = altevra_brain::run_observer_backfill(&pool).await?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "turns_seen": report.turns_seen,
+                "events_inserted": report.events_inserted,
+                "duplicates_skipped": report.duplicates_skipped,
+                "watermark": report.watermark.map(|t| t.to_rfc3339()),
+                "earliest_event_at": report.earliest_event_at.map(|t| t.to_rfc3339()),
+                "scan_since_hint": report.scan_since_hint(),
+            }))?
+        );
+    } else {
+        println!(
+            "Observer backfill: {} turn(s) swept, {} event(s) inserted, {} duplicate(s) skipped.",
+            report.turns_seen, report.events_inserted, report.duplicates_skipped
+        );
+        if let Some(hint) = report.scan_since_hint() {
+            println!(
+                "Backfilled events carry HISTORICAL timestamps — surface the cold-start \
+                 insights once with:\n  altevra observer scan --since {hint}"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_scan(args: ScanArgs) -> anyhow::Result<()> {
-    let since = Utc::now() - parse_window(&args.since);
+    let since = parse_since(&args.since, Utc::now());
     // Primary: query SQLite EventsRepository (the canonical, always-populated store).
     // Fallback: flat JSONL (legacy path — kept for dev/test convenience when db is absent).
     let (events, updates) = load_events_from_db(&args.db, &args.vault, since).await;
@@ -147,6 +197,18 @@ fn print_insight(ins: &Insight) {
         println!("    → {a}");
     }
     println!("    evidence: {} item(s)\n", ins.evidence.len());
+}
+
+/// `--since` → absolute instant: `@<unix-seconds>` is an absolute epoch (the
+/// one-shot backfill cold-start scan); anything else is a rolling window
+/// subtracted from `now`.
+fn parse_since(s: &str, now: DateTime<Utc>) -> DateTime<Utc> {
+    if let Some(epoch) = s.strip_prefix('@').and_then(|e| e.trim().parse::<i64>().ok()) {
+        if let Some(t) = DateTime::from_timestamp(epoch, 0) {
+            return t;
+        }
+    }
+    now - parse_window(s)
 }
 
 fn parse_window(s: &str) -> Duration {

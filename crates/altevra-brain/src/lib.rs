@@ -15,16 +15,19 @@
 //! block another. Time-of-day jobs (daily_summary) check on every tick and
 //! fire when the wall clock crosses the scheduled boundary.
 
+pub mod backfill;
 pub mod curator;
 pub mod jobs;
 pub mod lifecycle;
+pub mod notify;
 pub mod resident;
 pub mod routing;
 pub mod scheduler;
 pub mod selfimprove;
 
+pub use backfill::{run_observer_backfill, BackfillReport, BACKFILL_SOURCE};
 pub use curator::{curator_digest_line, curate, run_curator, CuratorReport};
-pub use jobs::{all_kinds, run_all, JobKind, JobResult};
+pub use jobs::{all_kinds, load_relevance_gate, run_all, JobKind, JobResult};
 pub use lifecycle::{
     lifecycle_archive, lifecycle_sweep, LifecycleArchiveReport, LifecycleReport,
     CONTEXT_PACKET_RETENTION_DAYS, PENDING_DELETE_MARKER,

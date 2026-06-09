@@ -391,14 +391,20 @@ pub async fn run_research_fetcher(
         briefs::{write_daily_brief, write_project_brief, ScoredItem},
         feeds::FeedConfig,
         fetcher::fetch_feed,
+        interests::gate_allows_item,
         relevance::{default_imperium_projects_path, load_imperium_projects, matching_projects},
     };
 
     let cfg = FeedConfig::load_or_default();
     let projects_path = default_imperium_projects_path();
     let projects = load_imperium_projects(&projects_path).unwrap_or_default();
+    // P4 relevance gate — stated interests + active goals. Create-if-absent
+    // (commented template). Inactive gate (no stated interests) preserves the
+    // legacy project-keyword behavior.
+    let gate = load_relevance_gate(pool).await;
 
     let mut new_items = 0usize;
+    let mut gated_out = 0usize;
     let mut scored_items: Vec<ScoredItem> = Vec::new();
     let mut feeds_touched = 0usize;
 
@@ -428,6 +434,13 @@ pub async fn run_research_fetcher(
         for item in outcome.items {
             // Idempotent insert — UNIQUE(feed_id, guid) prevents dupes.
             let (max_score, matched) = matching_projects(&item, &projects, cfg.relevance_threshold);
+            // P4 relevance gate: an ACTIVE gate drops off-interest candidates
+            // (no project match AND no stated-interest match) before they
+            // ever land in research_items. Debug-logged inside the gate.
+            if !gate_allows_item(&gate, &item.title, &item.summary, &matched) {
+                gated_out += 1;
+                continue;
+            }
             let id = uuid::Uuid::new_v4().to_string();
             let project_json = serde_json::to_string(&matched).unwrap_or_else(|_| "[]".into());
             let published = item.published_at.map(|d| d.to_rfc3339());
@@ -491,10 +504,35 @@ pub async fn run_research_fetcher(
 
     Ok(JobResult {
         summary: format!(
-            "fetched {feeds_touched} feeds, {new_items} new items, {briefs_written} brief(s) written"
+            "fetched {feeds_touched} feeds, {new_items} new items ({gated_out} gated off-interest), {briefs_written} brief(s) written"
         ),
         items_processed: new_items,
     })
+}
+
+/// Resolve + load the P4 relevance gate for runtime jobs: interests.yaml at
+/// `ALTEVRA_INTERESTS_PATH` (tests) or `~/.altevra/interests.yaml`
+/// (create-if-absent with the commented template), merged with ACTIVE goal
+/// titles from the goals table. Failures degrade to an inactive gate — a
+/// broken interests file must never kill the research pipeline.
+pub async fn load_relevance_gate(pool: &SqlitePool) -> altevra_research::RelevanceGate {
+    use altevra_research::{default_interests_path, RelevanceGate};
+
+    let path = std::env::var("ALTEVRA_INTERESTS_PATH")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_interests_path);
+    let gate = RelevanceGate::load_or_create(&path).unwrap_or_else(|e| {
+        tracing::warn!("relevance gate load failed ({e}); gate inactive");
+        RelevanceGate::default()
+    });
+    let goal_titles: Vec<String> =
+        sqlx::query_scalar("SELECT title FROM goals WHERE status = 'active' LIMIT 200")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    gate.with_goals(&goal_titles)
 }
 
 async fn last_fetched_at(pool: &SqlitePool, feed_id: &str) -> Option<DateTime<Utc>> {
@@ -674,13 +712,19 @@ pub async fn run_daily_summary(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
             structured.push_str(&format!("- {l}\n"));
         }
     }
+    // P4 policy gate: contact gaps are RELATIONSHIP-domain data and
+    // `dp_relationship` is seeded `obsidian_mirror = 'never'` — names must
+    // never land in this (syncable) vault file, nor reach the cloud
+    // StrongReasoner below. COUNT + CLI pointer only; the full lines live in
+    // `altevra brief --private` (terminal-only).
     structured.push_str("\n## People — last contact\n\n");
     if contact_lines.is_empty() {
         structured.push_str("- _No overdue reach-outs._\n");
     } else {
-        for l in &contact_lines {
-            structured.push_str(&format!("- {l}\n"));
-        }
+        structured.push_str(&format!(
+            "- {} overdue reach-out(s) withheld by domain policy — view: `altevra brief --private`\n",
+            contact_lines.len()
+        ));
     }
     structured.push_str("\n## Decisions to re-check\n\n");
     if decision_lines.is_empty() {
@@ -739,6 +783,20 @@ pub async fn run_daily_summary(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
     body.push_str(&structured);
 
     std::fs::write(&path, body)?;
+
+    // P4 brief delivery — the policy-gated daily brief into <vault>/Daily/.
+    // Claims (O_EXCL dedup) are taken: this is THE once-a-day notify pass.
+    // Fail-soft: a brief failure never aborts the daily summary.
+    let gate = load_relevance_gate(pool).await;
+    let claims_dir = crate::notify::delivery::default_claims_dir();
+    match crate::notify::write_vault_brief(pool, &ctx.vault_path, &claims_dir, true, &gate, ctx.now)
+        .await
+    {
+        Ok(Some(p)) => tracing::info!("daily brief written: {}", p.display()),
+        Ok(None) => tracing::debug!("daily brief already exists for {date}"),
+        Err(e) => tracing::warn!("daily brief delivery failed: {e}"),
+    }
+
     Ok(JobResult {
         summary: format!(
             "daily summary for {date}: {} pattern(s), {} contact gap(s), {} stale decision(s)",
@@ -1545,9 +1603,41 @@ mod tests {
         );
     }
 
+    /// The two daily-summary tests mutate process-global env vars
+    /// (interests + notify-claims paths) so the P4 brief step inside
+    /// `run_daily_summary` stays inside the TempDir — never the real
+    /// `~/.altevra`. Serialized so the env window cannot race.
+    static DAILY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Point the P4 brief step's filesystem side-effects at `tmp`. Returns a
+    /// guard that restores the prior values on drop.
+    fn hermetic_brief_env(tmp: &tempfile::TempDir) -> impl Drop {
+        struct Restore(Vec<(&'static str, Option<String>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (k, v) in &self.0 {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+        let keys = ["ALTEVRA_INTERESTS_PATH", "ALTEVRA_NOTIFY_CLAIMS_DIR"];
+        let prior = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        std::env::set_var(
+            "ALTEVRA_INTERESTS_PATH",
+            tmp.path().join("interests.yaml"),
+        );
+        std::env::set_var("ALTEVRA_NOTIFY_CLAIMS_DIR", tmp.path().join("claims"));
+        Restore(prior)
+    }
+
     #[tokio::test]
     async fn daily_summary_writes_file() {
+        let _serial = DAILY_ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
+        let _env = hermetic_brief_env(&tmp);
         let pool = migrated_pool().await;
         let ctx = JobContext {
             vault_path: tmp.path().to_path_buf(),
@@ -1566,7 +1656,9 @@ mod tests {
         use altevra_core::events::{ActorType, Event, EventType};
         use altevra_db::{DecisionRow, EventsRepository, MentionsRepository, TasksRepository};
 
+        let _serial = DAILY_ENV_LOCK.lock().await;
         let tmp = tempfile::TempDir::new().unwrap();
+        let _env = hermetic_brief_env(&tmp);
         let pool = migrated_pool().await;
         // Fixed clock so the date math is deterministic.
         let now: chrono::DateTime<Utc> = "2026-06-03T23:30:00Z".parse().unwrap();
@@ -1650,10 +1742,20 @@ mod tests {
             content.contains("Recurring drift: altevra-core"),
             "must surface the detected pattern:\n{content}"
         );
-        // a "haven't talked to X" line (Đorđe, 6 weeks ago)...
+        // The contact gap surfaces as a COUNT + CLI pointer only (P4):
+        // relationship data is `obsidian_mirror = 'never'` — a name must
+        // never land in this (syncable) vault file.
         assert!(
-            content.contains("haven't talked to Đorđe"),
-            "must surface the last-contact gap:\n{content}"
+            content.contains("1 overdue reach-out(s) withheld by domain policy"),
+            "must surface the contact-gap count:\n{content}"
+        );
+        assert!(
+            content.contains("altevra brief --private"),
+            "must point at the private CLI view:\n{content}"
+        );
+        assert!(
+            !content.contains("haven't talked to Đorđe"),
+            "person names must NOT land in the vault file (dp_relationship policy):\n{content}"
         );
         // ...and the stale-decision line.
         assert!(
@@ -1663,6 +1765,17 @@ mod tests {
         );
         // noop path → no LLM attribution in frontmatter.
         assert!(content.contains("generated_by: altevra-brain\n"));
+
+        // P4 integration: the daily job also delivers the policy-gated brief
+        // into <vault>/Daily/ — and it carries no person name either.
+        let brief = tmp.path().join("Daily").join("2026-06-03-altevra-brief.md");
+        assert!(brief.exists(), "daily job must write the P4 brief");
+        let brief_md = std::fs::read_to_string(&brief).unwrap();
+        assert!(brief_md.contains("kind: altevra-daily-brief"));
+        assert!(
+            !brief_md.contains("Đorđe"),
+            "vault brief must never carry a relationship name:\n{brief_md}"
+        );
     }
 
     #[tokio::test]

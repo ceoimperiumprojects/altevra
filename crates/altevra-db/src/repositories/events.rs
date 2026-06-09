@@ -43,6 +43,39 @@ impl<'a> EventsRepository<'a> {
         Ok(())
     }
 
+    /// Idempotent insert — `INSERT OR IGNORE` keyed on the event id. Returns
+    /// `true` when a row was actually written, `false` when the id already
+    /// existed. Used by the observer backfill (P4), whose deterministic
+    /// UUIDv5 ids make re-runs produce zero duplicate rows.
+    pub async fn insert_or_ignore(&self, event: &Event) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO events (id, event_type, project_id, actor_type, actor_id,
+                source, entity_type, entity_id, title, summary, payload, sensitivity,
+                created_at, processed_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(event.id.to_string())
+        .bind(event.event_type.to_string())
+        .bind(event.project_id.map(|u| u.to_string()))
+        .bind(event.actor_type.to_string())
+        .bind(event.actor_id.as_deref())
+        .bind(&event.source)
+        .bind(event.entity_type.as_deref())
+        .bind(event.entity_id.as_deref())
+        .bind(&event.title)
+        .bind(event.summary.as_deref())
+        .bind(event.payload.to_string())
+        .bind(event.sensitivity.to_string())
+        .bind(ts_to_text(&event.created_at))
+        .bind(event.processed_at.as_ref().map(ts_to_text))
+        .bind(event.status.to_string())
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn list_since(
         &self,
         since: DateTime<Utc>,

@@ -22,6 +22,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 sqlx = { workspace = true }
+# P4 notify delivery — claim-file names hash the dedup key (never a name in a filename).
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -33,6 +33,12 @@ enum Commands {
     #[command(subcommand)]
     Skill(commands::skill::SkillCommands),
 
+    /// Skill factory (P3a) — deterministic SkillOpt edit engine. `edits-preview`
+    /// applies bounded edits (budget + protected slow-update regions) to a
+    /// skill file in memory and prints the outcome; never writes.
+    #[command(subcommand, name = "skill-factory")]
+    SkillFactory(commands::skill_factory::SkillFactoryCommands),
+
     /// Manage hooks
     #[command(subcommand)]
     Hook(commands::hook::HookCommands),
@@ -88,6 +94,10 @@ enum Commands {
     /// Observer brain — detect patterns and emit insights
     #[command(subcommand)]
     Observer(commands::observer::ObserverCommands),
+
+    /// Proactive daily brief (P4) — policy-gated render by default;
+    /// `--private` prints withheld relationship/personal signals (terminal only)
+    Brief(commands::brief::BriefArgs),
 
     /// Manage agent sessions (v0.3 omniscient recorder)
     #[command(subcommand)]
@@ -203,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Init(args) => commands::init::run(args).await,
         Commands::Updates(args) => commands::updates::run(args).await,
         Commands::Skill(cmd) => commands::skill::run(cmd).await,
+        Commands::SkillFactory(cmd) => commands::skill_factory::run(cmd).await,
         Commands::Hook(cmd) => commands::hook::run(cmd).await,
         Commands::Connect(args) => commands::connect::run(args).await,
         Commands::Setup(cmd) => commands::setup::run(cmd).await,
@@ -218,6 +229,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Context(args) => commands::context::run(args).await,
         Commands::Journal(cmd) => commands::journal::run(cmd).await,
         Commands::Observer(cmd) => commands::observer::run(cmd).await,
+        Commands::Brief(args) => commands::brief::run(args).await,
         Commands::Session(cmd) => commands::session::run(cmd).await,
         Commands::Turn(args) => commands::turn::run(args).await,
         Commands::TurnSearch(args) => commands::turn_search::run(args).await,

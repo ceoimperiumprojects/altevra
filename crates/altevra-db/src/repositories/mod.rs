@@ -15,6 +15,7 @@ pub mod proposals;
 pub mod read_state;
 pub mod resident;
 pub mod sessions;
+pub mod skillopt_meta;
 pub mod skills;
 pub mod tasks;
 pub mod tool_records;
@@ -47,6 +48,7 @@ pub use proposals::{write_resident_proposals, NewProposal, ProposalRow, Proposal
 pub use read_state::{ReadStateRepository, UpdateReadState};
 pub use resident::ResidentRepository;
 pub use sessions::{FileChangeRow, SessionRow, SessionsRepository, TurnRow, TurnSearchHit};
+pub use skillopt_meta::{SkilloptMetaRepository, SkilloptMetaRow, SKILLOPT_OUTCOMES};
 pub use skills::{SkillRow, SkillsRepository};
 pub use tasks::{
     DecisionDueForReview, DecisionIndexEnvelope, DecisionRow, GoalRow, ReviewItemRow, TaskRow,

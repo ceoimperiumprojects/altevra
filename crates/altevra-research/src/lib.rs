@@ -3,6 +3,7 @@ pub mod crawl_bridge;
 pub mod discover;
 pub mod feeds;
 pub mod fetcher;
+pub mod interests;
 pub mod pipeline;
 pub mod projects;
 pub mod relevance;
@@ -26,6 +27,9 @@ pub use feeds::{
     default_feeds, BriefPaths, FeedConfig, FeedKind, FeedSource, ProjectKeywordsSource,
 };
 pub use fetcher::{fetch_feed, FeedItem, FetchCacheHints, FetchOutcome};
+pub use interests::{
+    default_interests_path, gate_allows_item, Interest, RelevanceGate, INTERESTS_TEMPLATE,
+};
 pub use pipeline::{ResearchPipeline, ResearchResult};
 pub use projects::ProjectAgent;
 pub use relevance::{
