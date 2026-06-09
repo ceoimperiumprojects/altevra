@@ -39,6 +39,24 @@ impl ExposureRequest {
             include_history: false,
         }
     }
+
+    /// The EXTERNAL-ROUTE profile (PLAN-ALIVE §P3b): content that will leave the
+    /// machine for a CLOUD reasoner (Codex raw-replay packets). Denies on
+    /// sensitivity ≥ Confidential and on `redaction_status ∉ {Clean, Redacted}`
+    /// (the gate's fail-closed redaction check). The caller MUST additionally
+    /// apply the high-water session check (working_dir/project mapped to a
+    /// personal/relationship/health domain — Pavle's 2026-06 policy: work-session
+    /// data flows externally freely; personal high-water never does); that check
+    /// needs session context the envelope doesn't carry, so it lives in the
+    /// packet builder, not here.
+    pub fn external_route() -> Self {
+        Self {
+            sensitivity_ceiling: Sensitivity::Internal,
+            domain_scope: vec![Domain::Business, Domain::Project, Domain::Public],
+            min_redaction: RedactionStatus::Clean,
+            include_history: false,
+        }
+    }
 }
 
 /// The gate's verdict.

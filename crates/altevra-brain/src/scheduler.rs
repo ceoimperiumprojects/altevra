@@ -384,6 +384,7 @@ mod tests {
                 "self_improve_orchestrator".into(),
                 "curator".into(),
                 "lifecycle_archiver".into(),
+                "skill_reaction_judge".into(),
             ],
             ..BrainConfig::default()
         };

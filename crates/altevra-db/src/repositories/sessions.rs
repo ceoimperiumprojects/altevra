@@ -410,6 +410,38 @@ impl<'a> SessionsRepository<'a> {
             .collect())
     }
 
+    /// Fetch ONE turn by id (P3b evidence resolution: `turn:<uuid>` refs).
+    pub async fn get_turn(&self, id: Uuid) -> anyhow::Result<Option<TurnRow>> {
+        let row = sqlx::query("SELECT * FROM turns WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(self.pool)
+            .await?;
+        Ok(row.map(|r| TurnRow {
+            id: uuid_from_text(r.get::<String, _>("id")),
+            session_id: uuid_from_text(r.get::<String, _>("session_id")),
+            turn_idx: r.get("turn_idx"),
+            role: r.get("role"),
+            content: r.get("content"),
+            tool_calls: r
+                .get::<Option<String>, _>("tool_calls")
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            tool_name: r.get("tool_name"),
+            model: r.get("model"),
+            tokens_in: r.get("tokens_in"),
+            tokens_out: r.get("tokens_out"),
+            latency_ms: r.get("latency_ms"),
+            file_changes: r
+                .get::<Option<String>, _>("file_changes")
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            redacted_count: r.get("redacted_count"),
+            source_tool: r.get("source_tool"),
+            sensitivity: r.get("sensitivity"),
+            redaction_status: r.get("redaction_status"),
+            created_at: ts_from_text(r.get::<String, _>("created_at")),
+            working_dir: r.get("working_dir"),
+        }))
+    }
+
     /// List sessions with an optional `since` cutoff. Empty `since` = no filter.
     pub async fn list_sessions_since(
         &self,

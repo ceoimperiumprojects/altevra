@@ -8,8 +8,10 @@ pub mod fts;
 pub mod hooks;
 pub mod improvement_signals;
 pub mod installations;
+pub mod managed_writes;
 pub mod mentions;
 pub mod objects;
+pub mod personal_notes;
 pub mod prompts;
 pub mod proposals;
 pub mod read_state;
@@ -38,10 +40,15 @@ pub use improvement_signals::{
     ImprovementSignalsRepository, NewSignal, SignalCluster, SignalRow,
 };
 pub use installations::{InstallationsRepository, InstalledComponentRow, ToolInstallationRow};
+pub use managed_writes::{ManagedWriteRow, ManagedWritesRepository};
 pub use mentions::{MentionEdge, MentionsRepository};
 pub use objects::{
     InsightCardRow, InsightCardsRepository, LearningRow, LearningsRepository,
     ObjectIndexRepository, ObjectIndexRow,
+};
+pub use personal_notes::{
+    default_domain_for_kind, PersonalNoteRow, PersonalNotesRepository, CANONICAL_STORE_KINDS,
+    PERSONAL_NOTE_KINDS,
 };
 pub use prompts::PromptsRepository;
 pub use proposals::{write_resident_proposals, NewProposal, ProposalRow, ProposalsRepository};

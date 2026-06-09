@@ -49,6 +49,14 @@ pub struct SkillSyncArgs {
     /// Coalesce window in milliseconds for watch mode (default 2000).
     #[arg(long, default_value_t = 2000)]
     pub debounce_ms: u64,
+    /// SQLite database path — the guarded applier's drift manifest
+    /// (managed_writes) lives here. Used only with --apply.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    /// Backup root for pre-write backups (guarded --apply path).
+    /// Default: ~/.altevra/backups/sync/
+    #[arg(long)]
+    pub backup_root: Option<PathBuf>,
     #[arg(long)]
     pub json: bool,
 }
@@ -171,7 +179,30 @@ async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
     };
 
     let plan = build_plan(&inventory, &targets, &skill_dir_for);
-    let result = apply_plan(&plan, args.apply);
+    // P3 install/sync: real writes go through the GUARDED applier (drift
+    // manifest + backups + TOCTOU re-verify + review routing); dry-run keeps
+    // the cheap no-DB path.
+    let (result, drift_refused) = if args.apply {
+        let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+        altevra_db::run_migrations(&pool).await?;
+        let backup_root = args
+            .backup_root
+            .clone()
+            .unwrap_or_else(|| altevra_core::home_dir().join(".altevra/backups/sync"));
+        let g = crate::commands::skill_sync::guarded_apply_plan(&pool, &plan, &backup_root, true)
+            .await?;
+        (
+            altevra_skills::sync::SyncResult {
+                created: g.created,
+                refreshed: g.refreshed,
+                skipped: g.skipped,
+                errors: g.errors.clone(),
+            },
+            g.drift_refused,
+        )
+    } else {
+        (apply_plan(&plan, false), Vec::new())
+    };
 
     if args.json {
         println!(
@@ -186,6 +217,7 @@ async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
                 "created": result.created,
                 "refreshed": result.refreshed,
                 "skipped": result.skipped,
+                "drift_refused": drift_refused,
                 "errors": result.errors,
                 "actions": plan.actions,
             }))?
@@ -248,12 +280,16 @@ async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
         }
         if args.apply {
             println!(
-                "\nApplied — created: {}, refreshed: {}, skipped: {}, errors: {}",
+                "\nApplied — created: {}, refreshed: {}, skipped: {}, drift-refused: {}, errors: {}",
                 result.created,
                 result.refreshed,
                 result.skipped,
+                drift_refused.len(),
                 result.errors.len()
             );
+            for d in &drift_refused {
+                eprintln!("  ⚠ drift (refused, routed to review): {d}");
+            }
             for e in &result.errors {
                 eprintln!("  ! {e}");
             }
@@ -264,6 +300,12 @@ async fn run_sync(args: SkillSyncArgs) -> anyhow::Result<()> {
 
     // --watch: block on the long-running watcher AFTER the initial sync.
     if args.watch {
+        if args.apply {
+            eprintln!(
+                "⚠ watch-mode applies use the UNGUARDED writer (managed-marker check only — \
+                 no drift manifest/backups). Foreground `skill sync --apply` runs are guarded."
+            );
+        }
         let cfg = WatchConfig {
             targets,
             vault_skills_dir: Some(args.vault.join("06-skills")).filter(|p| p.exists()),

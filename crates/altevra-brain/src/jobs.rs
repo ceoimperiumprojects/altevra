@@ -34,6 +34,12 @@ pub enum JobKind {
     /// *status* archive; this one targets the lifecycle_state derived
     /// from envelope timestamps + domain policy. See [`crate::lifecycle`].
     LifecycleArchiver,
+    /// P3c — SkillOpt backward pass. Drains pending `skill_invocation`
+    /// events through the anti-sycophancy success judge (local lfm via
+    /// Ollama structured outputs); confirmed failures become bounded edit
+    /// proposals routed to the REVIEW QUEUE — never auto-published. See
+    /// [`crate::skill_judge`].
+    SkillReactionJudge,
 }
 
 impl JobKind {
@@ -53,6 +59,7 @@ impl JobKind {
             Self::SelfImproveOrchestrator => "self_improve_orchestrator",
             Self::Curator => "curator",
             Self::LifecycleArchiver => "lifecycle_archiver",
+            Self::SkillReactionJudge => "skill_reaction_judge",
         }
     }
 
@@ -72,6 +79,7 @@ impl JobKind {
             "self_improve_orchestrator" => Self::SelfImproveOrchestrator,
             "curator" => Self::Curator,
             "lifecycle_archiver" => Self::LifecycleArchiver,
+            "skill_reaction_judge" => Self::SkillReactionJudge,
             _ => return None,
         })
     }
@@ -103,6 +111,10 @@ impl JobKind {
             // timestamps cross a TTL/expiry boundary — a sub-day cadence would
             // burn DB ticks for no observable effect.
             Self::LifecycleArchiver => 24 * 60 * 60,
+            // P3c: cheap (a handful of indexed event reads; the judge LLM call
+            // only fires on anchor-flagged windows, never per session). 15 min
+            // keeps the failure→proposal latency low without burning ticks.
+            Self::SkillReactionJudge => 900,
         }
     }
 }
@@ -1288,7 +1300,42 @@ pub async fn dispatch(
         JobKind::SelfImproveOrchestrator => crate::selfimprove::run_self_improve(pool, ctx).await,
         JobKind::Curator => crate::curator::run_curator(pool, ctx).await,
         JobKind::LifecycleArchiver => run_lifecycle_archiver(pool, ctx).await,
+        JobKind::SkillReactionJudge => run_skill_reaction_judge(pool, ctx).await,
     }
+}
+
+/// P3c — brain-job wrapper around [`crate::skill_judge::drain_skill_reactions`].
+/// The judge is the LOCAL Ollama structured-outputs judge built from
+/// `~/.altevra/config.toml` `[llm].local_private`; when no loopback local model
+/// is configured the drain still runs with a conservative noop judge (every
+/// window judged success=true → events drained, zero proposals — a missing
+/// judge can never manufacture deficiency OR grow an unbounded backlog).
+pub async fn run_skill_reaction_judge(
+    pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use crate::skill_judge::{
+        default_skill_body_for, drain_skill_reactions, JudgeVerdict, OllamaJudge, SuccessJudge,
+    };
+
+    struct ConservativeNoopJudge;
+    #[async_trait::async_trait]
+    impl SuccessJudge for ConservativeNoopJudge {
+        async fn judge(&self, _skill: &str, _window: &str) -> JudgeVerdict {
+            JudgeVerdict::conservative()
+        }
+    }
+
+    let ollama = OllamaJudge::from_home_config();
+    let judge: &dyn SuccessJudge = match &ollama {
+        Some(j) => j,
+        None => &ConservativeNoopJudge,
+    };
+    let report = drain_skill_reactions(pool, judge, &default_skill_body_for).await?;
+    Ok(JobResult {
+        summary: report.summary(),
+        items_processed: report.judged + report.deferred,
+    })
 }
 
 /// E1 — brain-job wrapper around [`crate::lifecycle::lifecycle_archive`]. Pure
@@ -1308,7 +1355,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 14] {
+pub fn all_kinds() -> [JobKind; 15] {
     [
         JobKind::EventClassifier,
         JobKind::ObserverScan,
@@ -1324,6 +1371,7 @@ pub fn all_kinds() -> [JobKind; 14] {
         JobKind::SelfImproveOrchestrator,
         JobKind::Curator,
         JobKind::LifecycleArchiver,
+        JobKind::SkillReactionJudge,
     ]
 }
 

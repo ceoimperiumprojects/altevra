@@ -86,8 +86,8 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
 
     match args.event.as_str() {
         "session_end" | "stop" => handle_session_end(&pool, &repo, &args, &payload).await?,
-        "user_prompt_submit" => handle_user_prompt(&repo, &args, &payload).await?,
-        "post_tool_use" => handle_post_tool_use(&repo, &args, &payload).await?,
+        "user_prompt_submit" => handle_user_prompt(&pool, &repo, &args, &payload).await?,
+        "post_tool_use" => handle_post_tool_use(&pool, &repo, &args, &payload).await?,
         "pre_tool_use" => handle_pre_tool_use(&repo, &args, &payload).await?,
         other => {
             eprintln!("[altevra] unknown hook event: {other}");
@@ -403,14 +403,75 @@ async fn enqueue_session_signal(pool: &sqlx::SqlitePool, repo: &SessionsReposito
 }
 
 async fn handle_user_prompt(
+    pool: &sqlx::SqlitePool,
     repo: &SessionsRepository<'_>,
     args: &HookHandleArgs,
     payload: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let content =
         first_field(payload, &["user_prompt", "prompt", "content", "message"]).unwrap_or_default();
-    record_turn(repo, "user", &content, None, &args.tool, payload).await
+    record_turn(repo, "user", &content, None, &args.tool, payload).await?;
+    // P3c: a user prompt inside an open skill-invocation judgment window is a
+    // "reaction" — emit skill_reaction (best-effort, never blocks the hook).
+    if let Ok(Some(session_id)) = read_current_session(&args.tool) {
+        maybe_emit_skill_reaction(pool, session_id).await;
+    }
+    Ok(())
 }
+
+/// Emit a `skill_reaction` event if the session has a PENDING `skill_invocation`
+/// whose K-message window isn't spent yet (K = [`SKILL_REACTION_WINDOW_K`]).
+/// Content-free: the event carries only the invocation event id + skill slug —
+/// the judge reads the actual turns from the turns table. Best-effort: any DB
+/// error is swallowed (a reaction must never fail the host tool's hook).
+async fn maybe_emit_skill_reaction(pool: &sqlx::SqlitePool, session_id: Uuid) {
+    use altevra_core::events::{ActorType, Event, EventType};
+
+    // Latest pending invocation for THIS session.
+    let inv: Option<(String, String)> = sqlx::query_as(
+        "SELECT id, COALESCE(json_extract(payload, '$.skill'), '') FROM events \
+         WHERE event_type = 'skill_invocation' AND status = 'pending' \
+           AND entity_type = 'session' AND entity_id = ? \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(session_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+    let Some((inv_id, skill)) = inv else { return };
+
+    // Window budget: at most K reactions per invocation.
+    let reactions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'skill_reaction' \
+         AND json_extract(payload, '$.invocation_event_id') = ?",
+    )
+    .bind(&inv_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(i64::MAX);
+    if reactions >= SKILL_REACTION_WINDOW_K {
+        return;
+    }
+
+    let ev = Event::new(
+        EventType::SkillReaction,
+        &format!("reaction to skill '{skill}'"),
+        "hook_handle",
+        ActorType::User,
+    )
+    .with_entity("session", session_id.to_string())
+    .with_payload(serde_json::json!({
+        "invocation_event_id": inv_id,
+        "skill": skill,
+    }));
+    if let Err(e) = EventsRepository::new(pool).insert(&ev).await {
+        eprintln!("[altevra] skill_reaction event insert failed (non-fatal): {e}");
+    }
+}
+
+/// K-message judgment window (Hivemind `DEFAULT_JUDGE_WINDOW`, PLAN-ALIVE §P3c).
+pub(crate) const SKILL_REACTION_WINDOW_K: i64 = 3;
 
 async fn handle_pre_tool_use(
     repo: &SessionsRepository<'_>,
@@ -429,6 +490,7 @@ async fn handle_pre_tool_use(
 }
 
 async fn handle_post_tool_use(
+    pool: &sqlx::SqlitePool,
     repo: &SessionsRepository<'_>,
     args: &HookHandleArgs,
     payload: &serde_json::Value,
@@ -442,11 +504,69 @@ async fn handle_post_tool_use(
         repo,
         "tool_result",
         &response,
-        tool_name,
+        tool_name.clone(),
         &args.tool,
         payload,
     )
+    .await?;
+    // P3c: a Skill tool call opens a K-message judgment window — emit
+    // skill_invocation so the backward pass (skill_reaction_judge) can later
+    // judge whether the skill's guidance actually worked. Best-effort.
+    if tool_name.as_deref() == Some("Skill") {
+        if let Ok(Some(session_id)) = read_current_session(&args.tool) {
+            emit_skill_invocation(pool, session_id, payload).await;
+        }
+    }
+    Ok(())
+}
+
+/// Emit a `skill_invocation` event for a Skill tool call. Payload is
+/// content-free metadata only: the skill slug + the session's current turn
+/// index (the judge pins the reaction window to this index, Hivemind
+/// `toolUseId` semantics). Best-effort, never fails the hook.
+async fn emit_skill_invocation(
+    pool: &sqlx::SqlitePool,
+    session_id: Uuid,
+    payload: &serde_json::Value,
+) {
+    use altevra_core::events::{ActorType, Event, EventType};
+
+    let skill = payload
+        .get("tool_input")
+        .and_then(|ti| {
+            ti.get("skill")
+                .or_else(|| ti.get("skill_name"))
+                .or_else(|| ti.get("name"))
+        })
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+
+    // Pin the invocation to the just-recorded tool_result turn's index so a
+    // quick re-invocation of the same skill can't shift the judged window.
+    let turn_idx: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(MAX(turn_idx), 0) FROM turns WHERE session_id = ?",
+    )
+    .bind(session_id.to_string())
+    .fetch_one(pool)
     .await
+    .unwrap_or(0);
+
+    let ev = Event::new(
+        EventType::SkillInvocation,
+        &format!("skill '{skill}' invoked"),
+        "hook_handle",
+        ActorType::Agent,
+    )
+    .with_entity("session", session_id.to_string())
+    .with_payload(serde_json::json!({
+        "skill": skill,
+        "session_id": session_id.to_string(),
+        "invocation_turn_idx": turn_idx,
+    }));
+    if let Err(e) = EventsRepository::new(pool).insert(&ev).await {
+        eprintln!("[altevra] skill_invocation event insert failed (non-fatal): {e}");
+    }
 }
 
 /// Recursively scrub every string leaf of a JSON value through `guard_text`.

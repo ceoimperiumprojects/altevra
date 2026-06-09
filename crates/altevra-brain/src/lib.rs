@@ -24,6 +24,7 @@ pub mod resident;
 pub mod routing;
 pub mod scheduler;
 pub mod selfimprove;
+pub mod skill_judge;
 
 pub use backfill::{run_observer_backfill, BackfillReport, BACKFILL_SOURCE};
 pub use curator::{curator_digest_line, curate, run_curator, CuratorReport};
@@ -36,3 +37,7 @@ pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use routing::role_for_object;
 pub use scheduler::{BrainConfig, BrainScheduler, BrainStatus};
 pub use selfimprove::{resident_disabled, run_self_improve, ApplyOutcome, SelfImproveReport};
+pub use skill_judge::{
+    drain_skill_reactions, extract_reaction_window, parse_judge_response, DrainReport,
+    JudgeVerdict, OllamaJudge, SuccessJudge, REACTION_WINDOW_K,
+};

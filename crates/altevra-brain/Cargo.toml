@@ -11,8 +11,14 @@ altevra-mcp = { workspace = true }
 altevra-memory = { workspace = true }
 altevra-research = { workspace = true }
 altevra-secrets = { workspace = true }
+# P3c skill_judge: bounded SkillEdit ops + fingerprint + skill-dir scan.
+altevra-skills = { workspace = true }
 altevra-vault = { workspace = true }
 reqwest = { workspace = true }
+# P3c: the SuccessJudge trait is async (mockable in tests with no HTTP).
+async-trait = { workspace = true }
+# P3c: the judge reads [llm].local_private from ~/.altevra/config.toml.
+toml = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

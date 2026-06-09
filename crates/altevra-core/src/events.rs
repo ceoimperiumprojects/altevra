@@ -41,6 +41,13 @@ pub enum EventType {
     FileChanged,
     McpCall,
     AgentThinkingStep,
+    // P3c — SkillOpt backward-pass signals (PLAN-ALIVE §P3c). Emitted by
+    // hook_handle: an org/installed skill was invoked (PostToolUse on the
+    // Skill tool) and the user "reacted" (a UserPromptSubmit inside the
+    // K-message judgment window). The skill_reaction_judge brain job drains
+    // pending invocations through the success judge.
+    SkillInvocation,
+    SkillReaction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

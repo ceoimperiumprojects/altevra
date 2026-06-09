@@ -44,7 +44,11 @@ pub fn classify(event: &Event) -> Importance {
         | EventType::PromptSent
         | EventType::ResponseReceived
         | EventType::McpCall
-        | EventType::AgentThinkingStep => Importance::Noise,
+        | EventType::AgentThinkingStep
+        // P3c skillopt signals: high-volume plumbing for the judge loop —
+        // never user-facing feed items.
+        | EventType::SkillInvocation
+        | EventType::SkillReaction => Importance::Noise,
     }
 }
 

@@ -123,6 +123,7 @@ dependencies = [
  "altevra-memory",
  "altevra-research",
  "altevra-secrets",
+ "altevra-skills",
  "altevra-vault",
  "anyhow",
  "async-trait",
@@ -136,6 +137,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
  "uuid",
 ]

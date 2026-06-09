@@ -231,8 +231,10 @@ fn sync_key(a: &SyncAction) -> (String, String) {
 }
 
 /// Inject `<!-- ALTEVRA_MANAGED -->` (if absent) so the next sync recognises this
-/// file as something it owns. Preserves the body as-is otherwise.
-fn wrap_with_managed_header(body: &str, source_tool: &str) -> String {
+/// file as something it owns. Preserves the body as-is otherwise. Public so the
+/// CLI's GUARDED applier (P3 install/sync — drift manifest + backups) renders
+/// byte-identical content to what [`apply_plan`] would write.
+pub fn wrap_with_managed_header(body: &str, source_tool: &str) -> String {
     if body.contains(MANAGED_MARKER) {
         return body.to_string();
     }

@@ -39,6 +39,11 @@ enum Commands {
     #[command(subcommand, name = "skill-factory")]
     SkillFactory(commands::skill_factory::SkillFactoryCommands),
 
+    /// Guarded skill-sync rails (P3 install/sync) — managed-writes manifest
+    /// (drift baselines) + restore-from-backup.
+    #[command(subcommand, name = "skill-sync")]
+    SkillSync(commands::skill_sync::SkillSyncCommands),
+
     /// Manage hooks
     #[command(subcommand)]
     Hook(commands::hook::HookCommands),
@@ -196,6 +201,12 @@ enum Commands {
     /// can/cannot/unverified capabilities.
     #[command(subcommand)]
     Capability(commands::capability::CapabilityCommands),
+
+    /// Personal brain notes — capture/list across the reconciled stores
+    /// (029 persons/relationships/preferences, decisions, goals,
+    /// personal_notes).
+    #[command(subcommand)]
+    Note(commands::note::NoteCommands),
 }
 
 #[tokio::main]
@@ -214,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Updates(args) => commands::updates::run(args).await,
         Commands::Skill(cmd) => commands::skill::run(cmd).await,
         Commands::SkillFactory(cmd) => commands::skill_factory::run(cmd).await,
+        Commands::SkillSync(cmd) => commands::skill_sync::run(cmd).await,
         Commands::Hook(cmd) => commands::hook::run(cmd).await,
         Commands::Connect(args) => commands::connect::run(args).await,
         Commands::Setup(cmd) => commands::setup::run(cmd).await,
@@ -252,5 +264,6 @@ async fn main() -> anyhow::Result<()> {
         Commands::Db(cmd) => commands::db::run(cmd).await,
         Commands::Tool(cmd) => commands::tool::run(cmd).await,
         Commands::Capability(cmd) => commands::capability::run(cmd).await,
+        Commands::Note(cmd) => commands::note::run(cmd).await,
     }
 }
