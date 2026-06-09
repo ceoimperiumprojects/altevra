@@ -25,3 +25,7 @@
 
 # graphify generated knowledge graph (local tooling)
 graphify-out/
+
+# local altevra state — never commit (sessions/DBs/quarantine)
+/.altevra/
+**/.altevra/

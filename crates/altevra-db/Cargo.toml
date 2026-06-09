@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 altevra-core = { workspace = true }
+# §P1.3 (mandatory): tool_records / adapter_dossiers guard EVERY field at the
+# persistence boundary — the guard lives in altevra-secrets (acyclic: secrets
+# depends only on core).
+altevra-secrets = { workspace = true }
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

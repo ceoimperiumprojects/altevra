@@ -174,6 +174,18 @@ enum Commands {
     /// `replay-spool` drains hook events spooled during maintenance.
     #[command(subcommand)]
     Db(commands::db::DbCommands),
+
+    /// Tool Register — discover (`scan`), seed, list, register, and verify
+    /// invocable tools (skills/CLIs/binaries/MCP servers/...). One row per
+    /// (name, kind); all install locations tracked.
+    #[command(subcommand)]
+    Tool(commands::tool::ToolCommands),
+
+    /// Capability registry — seed adapter dossiers from
+    /// ~/.imperium/capabilities/*.yaml, list, and record honest
+    /// can/cannot/unverified capabilities.
+    #[command(subcommand)]
+    Capability(commands::capability::CapabilityCommands),
 }
 
 #[tokio::main]
@@ -226,5 +238,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mirror(cmd) => commands::mirror::run(cmd).await,
         Commands::Cursor(cmd) => commands::cursor::run(cmd).await,
         Commands::Db(cmd) => commands::db::run(cmd).await,
+        Commands::Tool(cmd) => commands::tool::run(cmd).await,
+        Commands::Capability(cmd) => commands::capability::run(cmd).await,
     }
 }

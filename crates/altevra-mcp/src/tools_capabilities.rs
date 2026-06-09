@@ -42,24 +42,142 @@ fn load_jsonl(path: &std::path::Path) -> Vec<Value> {
         .collect()
 }
 
-pub fn handle_get_capabilities(id: Value, _args: &Value) -> McpResponse {
-    let cap_path = state_path("capabilities.json");
-    let caps = if cap_path.exists() {
-        std::fs::read_to_string(&cap_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({"adapters": [], "skills": [], "hooks": []}))
-    } else {
-        // Defaults
-        serde_json::json!({
-            "adapters": ["claude-code", "codex", "cursor", "antigravity"],
-            "skills": [],
-            "hooks": ["session_start", "session_end", "on_error"],
-            "mcp_tools": 22,
-            "cli_commands": 15,
+/// DB-backed capability registry (PLAN-ALIVE §P1.4 — replaces the hardcoded
+/// `~/.altevra/state/capabilities.json` fallback).
+///
+/// Returns three keys:
+///  * `tools` — `tool_records` rows (the Tool Register, migration 036)
+///  * `adapter_dossiers` — per-AI-agent capability matrices (023)
+///  * `capability_records` — the honest can/cannot/unverified ledger (023)
+///
+/// **Precedence (documented contract):** the same name may legitimately exist
+/// in both worlds (hermes/codex/cursor, linked via `tool_records.adapter_ref`).
+/// `adapter_dossiers` wins for agent-identity fields (version, surfaces, hook
+/// events); `tool_records` wins for invocation (how to actually call it).
+///
+/// Optional `actor` filters dossiers + capability records by actor name and
+/// tools by `adapter_ref`. Graceful: any DB failure degrades to the legacy
+/// static fallback (flagged `"fallback": true`) — NEVER panics the server.
+pub fn handle_get_capabilities(id: Value, args: &Value) -> McpResponse {
+    let actor = args
+        .get("actor")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let db_path = db_path_from_args(args);
+
+    let result: anyhow::Result<Value> = std::thread::spawn(move || -> anyhow::Result<Value> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let pool = altevra_db::create_pool(&db_path.to_string_lossy()).await?;
+            altevra_db::run_migrations(&pool).await?;
+
+            let tools = altevra_db::ToolRecordsRepository::new(&pool)
+                .list(None, None)
+                .await?;
+            let dossiers = altevra_db::AdapterDossiersRepository::new(&pool)
+                .list()
+                .await?;
+            let records = altevra_db::CapabilityRecordsRepository::new(&pool)
+                .list(actor.as_deref())
+                .await?;
+
+            let tools_json: Vec<Value> = tools
+                .iter()
+                .filter(|t| match actor.as_deref() {
+                    Some(a) => t.adapter_ref.as_deref() == Some(a),
+                    None => true,
+                })
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "kind": t.kind,
+                        "display_name": t.display_name,
+                        "description": t.description,
+                        "invocation": t.invocation,
+                        "locations": t.locations,
+                        "can_do": t.can_do,
+                        "cannot_do": t.cannot_do,
+                        "requires_session": t.requires_session,
+                        "status": t.status,
+                        "last_verified_at": t.last_verified_at,
+                        "source": t.source,
+                        "adapter_ref": t.adapter_ref,
+                    })
+                })
+                .collect();
+            let dossiers_json: Vec<Value> = dossiers
+                .iter()
+                .filter(|d| match actor.as_deref() {
+                    Some(a) => d.tool_name == a,
+                    None => true,
+                })
+                .map(|d| {
+                    serde_json::json!({
+                        "tool_name": d.tool_name,
+                        "adapter_version": d.adapter_version,
+                        "support_tier": d.support_tier,
+                        "surfaces": d.surfaces,
+                        "hook_events_supported": d.hook_events_supported,
+                        "skill_format": d.skill_format,
+                        "detection": d.detection,
+                    })
+                })
+                .collect();
+            let records_json: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "actor": r.actor,
+                        "capability_key": r.capability_key,
+                        "support": r.support,
+                        "evidence_ref": r.evidence_ref,
+                        "verification_method": r.verification_method,
+                    })
+                })
+                .collect();
+
+            Ok(serde_json::json!({
+                "tools": tools_json,
+                "adapter_dossiers": dossiers_json,
+                "capability_records": records_json,
+                "precedence": "adapter_dossiers wins for agent-identity fields; \
+                               tool_records wins for invocation (link: tool_records.adapter_ref \
+                               → adapter_dossiers.tool_name)",
+            }))
         })
-    };
-    McpResponse::ok(id, caps)
+    })
+    .join()
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("db worker thread panicked")));
+
+    match result {
+        Ok(v) => McpResponse::ok(id, v),
+        // Graceful degradation: DB unreachable must never break the MCP
+        // server — serve the legacy static shape, honestly flagged.
+        Err(e) => {
+            let cap_path = state_path("capabilities.json");
+            let mut caps = if cap_path.exists() {
+                std::fs::read_to_string(&cap_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(
+                        || serde_json::json!({"adapters": [], "skills": [], "hooks": []}),
+                    )
+            } else {
+                serde_json::json!({
+                    "adapters": ["claude-code", "codex", "cursor", "antigravity"],
+                    "skills": [],
+                    "hooks": ["session_start", "session_end", "on_error"],
+                })
+            };
+            if let Some(obj) = caps.as_object_mut() {
+                obj.insert("fallback".into(), Value::Bool(true));
+                obj.insert("fallback_reason".into(), Value::String(format!("{e}")));
+            }
+            McpResponse::ok(id, caps)
+        }
+    }
 }
 
 pub fn handle_report_knowledge_gap(id: Value, args: &Value) -> McpResponse {
@@ -288,6 +406,107 @@ mod tests {
     fn jsonl_load_empty() {
         let v = load_jsonl(std::path::Path::new("/tmp/this-should-not-exist-altevra.jsonl"));
         assert!(v.is_empty());
+    }
+
+    /// §P1.4 gate: `get_capabilities` returns DB rows (tools + dossiers +
+    /// records), NOT the static fallback, with the precedence documented.
+    #[test]
+    fn get_capabilities_returns_db_rows_not_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let db = tmp.path().join("altevra.db");
+
+        // Seed one row in each table.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = altevra_db::create_pool(&db.to_string_lossy()).await.unwrap();
+            altevra_db::run_migrations(&pool).await.unwrap();
+
+            let mut t = altevra_db::ToolRecordRow::new("imperium-crawl", "cli");
+            t.invocation = serde_json::json!({"canonical": "imperium-crawl <cmd>"});
+            t.status = "can".into();
+            t.source = "manual".into();
+            altevra_db::ToolRecordsRepository::new(&pool).upsert(&t).await.unwrap();
+
+            let d = altevra_db::AdapterDossierRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                tool_name: "hermes".into(),
+                adapter_version: "0.14.0".into(),
+                support_tier: "unverified".into(),
+                surfaces: serde_json::json!({"can": ["cron.create"]}),
+                hook_events_supported: serde_json::json!([]),
+                skill_format: None,
+                detection: None,
+            };
+            altevra_db::AdapterDossiersRepository::new(&pool).upsert(&d).await.unwrap();
+
+            let c = altevra_db::CapabilityRecordRow {
+                id: "c1".into(),
+                actor: "claude-code".into(),
+                capability_key: "hook.session_start".into(),
+                support: "supported".into(),
+                evidence_ref: Some("verify_run:1".into()),
+                verification_method: Some("tested".into()),
+            };
+            altevra_db::CapabilityRecordsRepository::new(&pool).upsert(&c).await.unwrap();
+        });
+
+        let resp = handle_get_capabilities(
+            Value::from(1),
+            &serde_json::json!({"db_path": db.to_string_lossy()}),
+        );
+        assert!(resp.error.is_none(), "handler errored: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert!(
+            result.get("fallback").is_none(),
+            "must serve DB rows, not the fallback: {result}"
+        );
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "imperium-crawl");
+        assert_eq!(tools[0]["invocation"]["canonical"], "imperium-crawl <cmd>");
+        let dossiers = result["adapter_dossiers"].as_array().unwrap();
+        assert_eq!(dossiers[0]["tool_name"], "hermes");
+        let records = result["capability_records"].as_array().unwrap();
+        assert_eq!(records[0]["capability_key"], "hook.session_start");
+        assert!(result["precedence"]
+            .as_str()
+            .unwrap()
+            .contains("adapter_dossiers wins"));
+
+        // actor filter: dossiers/records/tools narrow to the actor.
+        let resp2 = handle_get_capabilities(
+            Value::from(2),
+            &serde_json::json!({"db_path": db.to_string_lossy(), "actor": "hermes"}),
+        );
+        let r2 = resp2.result.unwrap();
+        assert_eq!(r2["adapter_dossiers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            r2["capability_records"].as_array().unwrap().len(),
+            0,
+            "claude-code record filtered out for actor=hermes"
+        );
+        assert_eq!(
+            r2["tools"].as_array().unwrap().len(),
+            0,
+            "tool without adapter_ref=hermes filtered out"
+        );
+    }
+
+    /// DB unreachable → graceful static fallback (flagged), never a panic.
+    #[test]
+    fn get_capabilities_degrades_to_fallback_on_db_error() {
+        let resp = handle_get_capabilities(
+            Value::from(1),
+            // A path that cannot be created (parent is a file, not a dir).
+            &serde_json::json!({"db_path": "/dev/null/nope/altevra.db"}),
+        );
+        assert!(resp.error.is_none(), "fallback must be an OK response");
+        let result = resp.result.unwrap();
+        assert_eq!(result["fallback"], true);
+        assert!(result.get("adapters").is_some());
     }
 
     /// HP-1: `request_forget` only writes a `review_items` row with

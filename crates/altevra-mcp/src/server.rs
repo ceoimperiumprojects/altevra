@@ -251,8 +251,15 @@ pub fn list_tools() -> Value {
     // Capabilities
     tools.push(tool(
         "get_capabilities",
-        "Get the capability registry (adapters, skills, hooks).",
-        obj_schema(&[], serde_json::json!({})),
+        "Get the capability registry from the DB: tools (tool_records), \
+         adapter_dossiers, capability_records. Precedence: adapter_dossiers \
+         wins for agent-identity fields, tool_records for invocation.",
+        obj_schema(
+            &[],
+            serde_json::json!({
+                "actor": {"type": "string", "description": "Optional actor filter (claude-code|codex|cursor|hermes|...)"},
+            }),
+        ),
     ));
     tools.push(tool(
         "report_knowledge_gap",

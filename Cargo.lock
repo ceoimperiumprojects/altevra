@@ -201,6 +201,7 @@ name = "altevra-db"
 version = "0.1.0"
 dependencies = [
  "altevra-core",
+ "altevra-secrets",
  "anyhow",
  "chrono",
  "serde",

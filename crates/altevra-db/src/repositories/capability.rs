@@ -83,6 +83,36 @@ impl<'a> CapabilityRecordsRepository<'a> {
             verification_method: r.get("verification_method"),
         }))
     }
+
+    /// List records, optionally filtered by actor.
+    pub async fn list(&self, actor: Option<&str>) -> anyhow::Result<Vec<CapabilityRecordRow>> {
+        let rows = match actor {
+            Some(a) => sqlx::query(
+                "SELECT id, actor, capability_key, support, evidence_ref, verification_method \
+                 FROM capability_records WHERE actor = ? ORDER BY capability_key",
+            )
+            .bind(a)
+            .fetch_all(self.pool)
+            .await?,
+            None => sqlx::query(
+                "SELECT id, actor, capability_key, support, evidence_ref, verification_method \
+                 FROM capability_records ORDER BY actor, capability_key",
+            )
+            .fetch_all(self.pool)
+            .await?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|r| CapabilityRecordRow {
+                id: r.get("id"),
+                actor: r.get("actor"),
+                capability_key: r.get("capability_key"),
+                support: r.get("support"),
+                evidence_ref: r.get("evidence_ref"),
+                verification_method: r.get("verification_method"),
+            })
+            .collect())
+    }
 }
 
 pub struct SkillProposalsRepository<'a> {
@@ -313,6 +343,126 @@ impl<'a> CapabilityGrantsRepository<'a> {
             .await?,
         };
         Ok(rows.into_iter().map(row_to_grant).collect())
+    }
+}
+
+/// Per-AI-agent capability matrix row (migration 023 `adapter_dossiers`).
+/// Distinct from invocable tools (036 `tool_records`); `tool_records.adapter_ref`
+/// links by `tool_name` for entities living in both worlds (hermes/codex/cursor).
+#[derive(Debug, Clone)]
+pub struct AdapterDossierRow {
+    pub id: String,
+    pub tool_name: String, // claude-code|codex|cursor|antigravity|hermes
+    pub adapter_version: String,
+    pub support_tier: String, // native|partial|fallback_only|unsupported|unverified
+    /// JSON — per-surface support; the capability-YAML seed stores
+    /// `{"can": [...], "cannot": [...]}` here.
+    pub surfaces: serde_json::Value,
+    pub hook_events_supported: serde_json::Value,
+    pub skill_format: Option<String>,
+    pub detection: Option<String>,
+}
+
+pub struct AdapterDossiersRepository<'a> {
+    pool: &'a SqlitePool,
+}
+
+impl<'a> AdapterDossiersRepository<'a> {
+    pub fn new(pool: &'a SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Upsert by `tool_name`. All fields are guarded (same mandatory rule as
+    /// `tool_records` §P1.3 — the source YAMLs can embed credentials); sightings
+    /// are recorded under `adapter_dossier:{tool_name}`.
+    pub async fn upsert(&self, row: &AdapterDossierRow) -> anyhow::Result<usize> {
+        use super::tool_records::{guard_opt, guard_value, record_sightings};
+
+        let mut sightings = Vec::new();
+        let g_version = {
+            let g = altevra_secrets::guard_text(
+                &row.adapter_version,
+                altevra_core::security::Sensitivity::Internal,
+            );
+            sightings.extend(g.sightings);
+            g.value
+        };
+        let g_skill_format = guard_opt(&row.skill_format, &mut sightings);
+        let g_detection = guard_opt(&row.detection, &mut sightings);
+        let (g_surfaces, s) = guard_value(&row.surfaces);
+        sightings.extend(s);
+        let (g_hooks, s) = guard_value(&row.hook_events_supported);
+        sightings.extend(s);
+
+        let now = ts_to_text(&Utc::now());
+        sqlx::query(
+            "INSERT INTO adapter_dossiers \
+             (id, tool_name, adapter_version, support_tier, surfaces, \
+              hook_events_supported, skill_format, detection, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(tool_name) DO UPDATE SET \
+               adapter_version=excluded.adapter_version, support_tier=excluded.support_tier, \
+               surfaces=excluded.surfaces, \
+               hook_events_supported=excluded.hook_events_supported, \
+               skill_format=excluded.skill_format, detection=excluded.detection, \
+               updated_at=excluded.updated_at",
+        )
+        .bind(&row.id)
+        .bind(&row.tool_name)
+        .bind(&g_version)
+        .bind(&row.support_tier)
+        .bind(g_surfaces.to_string())
+        .bind(g_hooks.to_string())
+        .bind(g_skill_format.as_deref())
+        .bind(g_detection.as_deref())
+        .bind(&now)
+        .bind(&now)
+        .execute(self.pool)
+        .await?;
+
+        let source_ref = format!("adapter_dossier:{}", row.tool_name);
+        record_sightings(self.pool, &sightings, &source_ref, "adapter_dossier_fields").await?;
+        Ok(sightings.len())
+    }
+
+    pub async fn get(&self, tool_name: &str) -> anyhow::Result<Option<AdapterDossierRow>> {
+        let row = sqlx::query(
+            "SELECT id, tool_name, adapter_version, support_tier, surfaces, \
+             hook_events_supported, skill_format, detection \
+             FROM adapter_dossiers WHERE tool_name = ?",
+        )
+        .bind(tool_name)
+        .fetch_optional(self.pool)
+        .await?;
+        Ok(row.map(row_to_dossier))
+    }
+
+    pub async fn list(&self) -> anyhow::Result<Vec<AdapterDossierRow>> {
+        let rows = sqlx::query(
+            "SELECT id, tool_name, adapter_version, support_tier, surfaces, \
+             hook_events_supported, skill_format, detection \
+             FROM adapter_dossiers ORDER BY tool_name",
+        )
+        .fetch_all(self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_dossier).collect())
+    }
+}
+
+fn row_to_dossier(r: sqlx::sqlite::SqliteRow) -> AdapterDossierRow {
+    AdapterDossierRow {
+        id: r.get("id"),
+        tool_name: r.get("tool_name"),
+        adapter_version: r.get("adapter_version"),
+        support_tier: r.get("support_tier"),
+        surfaces: serde_json::from_str(&r.get::<String, _>("surfaces"))
+            .unwrap_or(serde_json::json!({})),
+        hook_events_supported: serde_json::from_str(
+            &r.get::<String, _>("hook_events_supported"),
+        )
+        .unwrap_or(serde_json::json!([])),
+        skill_format: r.get("skill_format"),
+        detection: r.get("detection"),
     }
 }
 

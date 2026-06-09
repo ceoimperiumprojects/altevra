@@ -17,12 +17,13 @@ pub mod resident;
 pub mod sessions;
 pub mod skills;
 pub mod tasks;
+pub mod tool_records;
 pub mod updates;
 pub mod wiki;
 
 pub use capability::{
-    CapabilityGrantRow, CapabilityGrantsRepository, CapabilityRecordRow,
-    CapabilityRecordsRepository, SkillProposalsRepository,
+    AdapterDossierRow, AdapterDossiersRepository, CapabilityGrantRow, CapabilityGrantsRepository,
+    CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository,
 };
 pub use cursor_edits::{CursorEditRow, CursorEditsRepository};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
@@ -51,5 +52,6 @@ pub use tasks::{
     DecisionDueForReview, DecisionIndexEnvelope, DecisionRow, GoalRow, ReviewItemRow, TaskRow,
     TasksRepository,
 };
+pub use tool_records::{ToolRecordRow, ToolRecordsRepository, TOOL_KINDS, TOOL_STATUSES};
 pub use updates::UpdatesRepository;
 pub use wiki::{WikiPageLinkRow, WikiPageRow, WikiPagesRepository};
