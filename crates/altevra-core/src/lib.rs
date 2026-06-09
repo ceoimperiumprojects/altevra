@@ -20,6 +20,7 @@ pub mod retrieval;
 pub mod safety;
 pub mod security;
 pub mod selfimprove;
+pub mod session_context;
 pub mod status;
 pub mod template;
 pub mod time_window;
@@ -67,6 +68,10 @@ pub use security::Sensitivity;
 pub use selfimprove::{
     derive_risk_tier, firewall_check, FirewallDenyReason, FirewallLimits, FirewallState,
     FirewallVerdict, ProposedAction, RiskTier,
+};
+pub use session_context::{
+    render_session_context_block, render_tool_register_block, session_start_transport,
+    SessionContextData, SessionStartTransport, ToolSummary, SESSION_BLOCK_TOKEN_BUDGET,
 };
 pub use status::{
     CapabilityState, LifecycleState, ObjectStatus, ProposalStatus, RedactionStatus, ReviewStatus,

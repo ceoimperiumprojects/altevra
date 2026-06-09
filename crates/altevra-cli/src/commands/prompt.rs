@@ -57,6 +57,10 @@ pub struct PromptBuildArgs {
     #[arg(long, default_value_t = DEFAULT_UPDATES_LIMIT)]
     pub updates_limit: usize,
 
+    /// Brain database — source of the Tool Register layer (§P2 #7).
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+
     /// Output the full PromptOutput as JSON
     #[arg(long)]
     pub json: bool,
@@ -118,6 +122,9 @@ async fn run_build(args: PromptBuildArgs) -> anyhow::Result<()> {
         .project
         .as_deref()
         .and_then(|p| load_project_readme(&args.vault, p));
+    // Tool Register layer (§P2 #7): curated tools between skills and the
+    // output protocol. Fault-tolerant — a DB error yields an empty layer.
+    let (tools, tools_more) = load_tool_register_for_prompt(&args.db).await;
 
     let input = PromptInput {
         tool_name: args.tool.clone(),
@@ -126,6 +133,8 @@ async fn run_build(args: PromptBuildArgs) -> anyhow::Result<()> {
         current_goal: args.goal.clone(),
         recent_updates,
         skills,
+        tools,
+        tools_more,
         project_readme,
         altevra_version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -158,6 +167,39 @@ fn load_skills_for_prompt(vault: &Path) -> anyhow::Result<Vec<PromptSkill>> {
         out.push(sk);
     }
     Ok(out)
+}
+
+/// Curated tool summaries (manual/seeded first, capped) + the long-tail count
+/// for the prompt's Tool Register layer. Fault-tolerant: any DB error → empty.
+async fn load_tool_register_for_prompt(
+    db: &Path,
+) -> (Vec<altevra_core::session_context::ToolSummary>, usize) {
+    let run = async {
+        let pool = altevra_db::create_pool(&db.to_string_lossy()).await?;
+        altevra_db::run_migrations(&pool).await?;
+        let rows = altevra_db::ToolRecordsRepository::new(&pool)
+            .list(None, None)
+            .await?;
+        let total = rows.len();
+        let tools: Vec<_> = rows
+            .iter()
+            .filter(|t| t.source == "manual")
+            .take(20)
+            .map(|t| altevra_core::session_context::ToolSummary {
+                name: t.name.clone(),
+                kind: t.kind.clone(),
+                invocation: t
+                    .invocation
+                    .get("canonical")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no invocation recorded)")
+                    .to_string(),
+            })
+            .collect();
+        let more = total.saturating_sub(tools.len());
+        anyhow::Ok((tools, more))
+    };
+    run.await.unwrap_or((vec![], 0))
 }
 
 fn load_recent_updates_for_prompt(limit: usize) -> Vec<UpdateFeedItem> {
@@ -211,6 +253,7 @@ mod tests {
             goal: None,
             vault: tmp.path().to_path_buf(),
             updates_limit: DEFAULT_UPDATES_LIMIT,
+            db: tmp.path().join("prompt-test.db"),
             json: true,
         };
         run_build(args).await.unwrap();
@@ -237,6 +280,7 @@ mod tests {
             goal: None,
             vault: tmp.path().to_path_buf(),
             updates_limit: 3,
+            db: tmp.path().join("prompt-test.db"),
             json: true,
         };
         run_build(args).await.unwrap();

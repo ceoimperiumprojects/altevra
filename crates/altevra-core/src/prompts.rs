@@ -9,6 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::session_context::ToolSummary;
 use crate::updates::{Importance, UpdateFeedItem};
 
 /// Note: we re-declare a minimal mirror of skills::ParsedSkill here so that
@@ -46,6 +47,13 @@ pub struct PromptInput {
     pub current_goal: Option<String>,
     pub recent_updates: Vec<UpdateFeedItem>,
     pub skills: Vec<PromptSkill>,
+    /// Tool Register layer (§P2 #7): curated tool summaries rendered between
+    /// the skills layer and the output protocol.
+    #[serde(default)]
+    pub tools: Vec<ToolSummary>,
+    /// Long-tail count for the "X more — query get_capabilities" line.
+    #[serde(default)]
+    pub tools_more: usize,
     pub project_readme: Option<String>,
     pub altevra_version: String,
 }
@@ -60,6 +68,8 @@ impl PromptInput {
             current_goal: None,
             recent_updates: vec![],
             skills: vec![],
+            tools: vec![],
+            tools_more: 0,
             project_readme: None,
             altevra_version: altevra_version.into(),
         }
@@ -133,6 +143,14 @@ pub fn build_system_prompt(input: PromptInput) -> PromptOutput {
     // 7. Skills
     if !input.skills.is_empty() {
         layers.push(("Skills Available".to_string(), skills_layer(&input.skills)));
+    }
+
+    // 7.5 Tool Register (§P2 #7) — between skills and the output protocol.
+    if !input.tools.is_empty() || input.tools_more > 0 {
+        layers.push((
+            "Tool Register".to_string(),
+            crate::session_context::render_tool_lines(&input.tools, input.tools_more),
+        ));
     }
 
     // 8. Output protocol (always)
@@ -428,6 +446,34 @@ mod tests {
             .system_prompt
             .contains(".claude/altevra-instructions.md"));
         assert!(out.layers_included.iter().any(|l| l == "Safety"));
+    }
+
+    #[test]
+    fn tool_register_layer_sits_between_skills_and_output_protocol() {
+        // §P2 #7: the Tool Register layer renders between Skills and the
+        // output protocol, with curated invocations + the long-tail pointer.
+        let mut input = base_input("claude-code");
+        input.skills = vec![PromptSkill::new("altevra-core", "0.6.0", "Altevra Core")];
+        input.tools = vec![ToolSummary {
+            name: "imperium-crawl".into(),
+            kind: "cli".into(),
+            invocation: "imperium-crawl <cmd>".into(),
+        }];
+        input.tools_more = 597;
+        let out = build_for_tool(input);
+        let skills_pos = out.system_prompt.find("## Skills Available").unwrap();
+        let tools_pos = out.system_prompt.find("## Tool Register").unwrap();
+        let proto_pos = out.system_prompt.find("## Output Protocol").unwrap();
+        assert!(skills_pos < tools_pos && tools_pos < proto_pos);
+        assert!(out
+            .system_prompt
+            .contains("- imperium-crawl (cli): imperium-crawl <cmd>"));
+        assert!(out
+            .system_prompt
+            .contains("… 597 more — query `get_capabilities`"));
+        // absent input → no layer.
+        let out = build_for_tool(base_input("claude-code"));
+        assert!(!out.system_prompt.contains("## Tool Register"));
     }
 
     #[test]

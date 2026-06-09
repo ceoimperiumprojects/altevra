@@ -54,14 +54,54 @@ pub struct ContextArgs {
     /// Output mode: markdown (default), json, prompt
     #[arg(long, default_value = "markdown")]
     pub format: String,
+
+    /// Print the SessionStart context block (§P2.1 pull fallback for tools
+    /// without an additionalContext hook channel — Cursor et al). Same gated,
+    /// audited, ≤2K-token block Claude Code receives via the hook.
+    #[arg(long)]
+    pub session_block: bool,
 }
 
 pub async fn run(args: ContextArgs) -> anyhow::Result<()> {
-    if let Some(query) = args.query.clone() {
+    if args.session_block {
+        run_session_block(args).await
+    } else if let Some(query) = args.query.clone() {
         run_build(query, args).await
     } else {
         run_show(args).await
     }
+}
+
+/// `altevra context --session-block` — the pull-transport leg of the §P2.1
+/// matrix. Fail-open like the hook: any DB error or deadline overrun prints
+/// an empty block and exits 0 (a pull must never wedge the calling tool).
+async fn run_session_block(args: ContextArgs) -> anyhow::Result<()> {
+    let deadline = std::time::Duration::from_millis(900);
+    let assembled = tokio::time::timeout(deadline, async {
+        let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+        altevra_db::run_migrations(&pool).await?;
+        let data = altevra_bootstrap::session_context::gather_session_context(
+            &pool,
+            &format!("context_pull:{}", uuid::Uuid::new_v4()),
+            None,
+        )
+        .await;
+        anyhow::Ok(altevra_core::session_context::render_session_context_block(&data))
+    })
+    .await;
+    let block = match assembled {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            eprintln!("[altevra] session block degraded to empty (non-fatal): {e}");
+            String::new()
+        }
+        Err(_) => {
+            eprintln!("[altevra] session block hit the deadline — degraded to empty");
+            String::new()
+        }
+    };
+    println!("{block}");
+    Ok(())
 }
 
 async fn run_build(query: String, args: ContextArgs) -> anyhow::Result<()> {
@@ -409,6 +449,27 @@ mod tests {
             chunk_limit: 5,
             update_limit: 10,
             format: "json".into(),
+            session_block: false,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// §P2.1 pull leg: `altevra context --session-block` runs against a
+    /// per-test temp DB and exits Ok (fail-open even when the store is empty).
+    #[tokio::test]
+    async fn session_block_mode_runs_on_empty_db() {
+        let tmp = TempDir::new().unwrap();
+        run(ContextArgs {
+            query: None,
+            project: None,
+            vault: tmp.path().to_path_buf(),
+            db: tmp_db(&tmp),
+            packet_budget: 8000,
+            chunk_limit: 5,
+            update_limit: 10,
+            format: "markdown".into(),
+            session_block: true,
         })
         .await
         .unwrap();
@@ -433,6 +494,7 @@ mod tests {
             chunk_limit: 5,
             update_limit: 10,
             format: "markdown".into(),
+            session_block: false,
         })
         .await
         .unwrap();

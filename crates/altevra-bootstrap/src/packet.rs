@@ -1,5 +1,6 @@
 use crate::freshness::FreshnessCheck;
 use crate::setup_status::SetupStatus;
+use altevra_core::session_context::ToolSummary;
 use altevra_core::updates::UpdateFeedItem;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,14 @@ pub struct AgentBootstrapPacket {
     pub last_updates: Vec<UpdateSummary>,
     pub active_task: Option<TaskPlaceholder>,
     pub goals: Vec<GoalPlaceholder>,
+    /// Tool Register summaries (§P2 #7) — curated/seeded tools first, capped,
+    /// populated from `tool_records` via `ToolRecordsRepository`.
+    #[serde(default)]
+    pub available_tools: Vec<ToolSummary>,
+    /// The SAME gated session-context block Claude Code receives via the hook
+    /// `additionalContext` — Hermes (no hook channel) gets it here (§P2.1).
+    #[serde(default)]
+    pub session_context: Option<String>,
     pub warnings: Vec<String>,
     pub recommended_next_action: Option<String>,
     pub session_id: Uuid,
@@ -68,6 +77,8 @@ pub struct BootstrapBuilder {
     skill_freshness: Vec<FreshnessCheck>,
     setup_status: Option<SetupStatus>,
     last_updates: Vec<UpdateSummary>,
+    available_tools: Vec<ToolSummary>,
+    session_context: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -80,6 +91,8 @@ impl BootstrapBuilder {
             skill_freshness: vec![],
             setup_status: None,
             last_updates: vec![],
+            available_tools: vec![],
+            session_context: None,
             warnings: vec![],
         }
     }
@@ -163,6 +176,20 @@ impl BootstrapBuilder {
         self
     }
 
+    /// Tool Register summaries (curated/seeded first, capped) — see
+    /// `crate::session_context::bootstrap_context` for the DB-backed gather.
+    pub fn available_tools(mut self, tools: Vec<ToolSummary>) -> Self {
+        self.available_tools = tools;
+        self
+    }
+
+    /// The gated session-context block (same content as the Claude Code hook
+    /// `additionalContext`).
+    pub fn session_context(mut self, block: Option<String>) -> Self {
+        self.session_context = block;
+        self
+    }
+
     pub fn warning(mut self, w: impl Into<String>) -> Self {
         self.warnings.push(w.into());
         self
@@ -209,6 +236,8 @@ impl BootstrapBuilder {
             last_updates: self.last_updates,
             active_task: None,
             goals: vec![],
+            available_tools: self.available_tools,
+            session_context: self.session_context,
             warnings,
             recommended_next_action,
             session_id: Uuid::new_v4(),

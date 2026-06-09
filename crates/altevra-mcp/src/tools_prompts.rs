@@ -31,6 +31,14 @@ pub fn handle_build_system_prompt(id: Value, args: &Value, altevra_version: &str
         .as_deref()
         .and_then(|p| load_project_readme(vault, p));
 
+    // Tool Register layer (§P2 #7): populated only when the caller names a DB
+    // (keeps the handler hermetic — no implicit real-~/.altevra open). Fault
+    // tolerant: a DB error yields an empty layer, never a failed prompt.
+    let (tools, tools_more) = match args["db_path"].as_str() {
+        Some(db) => load_tool_register(db),
+        None => (vec![], 0),
+    };
+
     let input = PromptInput {
         tool_name,
         project,
@@ -38,6 +46,8 @@ pub fn handle_build_system_prompt(id: Value, args: &Value, altevra_version: &str
         current_goal,
         recent_updates,
         skills,
+        tools,
+        tools_more,
         project_readme,
         altevra_version: altevra_version.to_string(),
     };
@@ -47,6 +57,43 @@ pub fn handle_build_system_prompt(id: Value, args: &Value, altevra_version: &str
         Ok(v) => McpResponse::ok(id, v),
         Err(e) => McpResponse::error(id, -32603, format!("Serialization error: {e}")),
     }
+}
+
+/// Curated tool summaries (manual/seeded first, capped) + long-tail count for
+/// the prompt's Tool Register layer. Fault-tolerant: any error → empty layer.
+fn load_tool_register(db_path: &str) -> (Vec<altevra_core::session_context::ToolSummary>, usize) {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return (vec![], 0); // no tokio context — degrade, never panic.
+    }
+    let db_path = db_path.to_string();
+    futures::executor::block_on(async move {
+        let run = async {
+            let pool = altevra_db::create_pool(&db_path).await?;
+            altevra_db::run_migrations(&pool).await?;
+            let rows = altevra_db::ToolRecordsRepository::new(&pool)
+                .list(None, None)
+                .await?;
+            let total = rows.len();
+            let tools: Vec<_> = rows
+                .iter()
+                .filter(|t| t.source == "manual")
+                .take(20)
+                .map(|t| altevra_core::session_context::ToolSummary {
+                    name: t.name.clone(),
+                    kind: t.kind.clone(),
+                    invocation: t
+                        .invocation
+                        .get("canonical")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no invocation recorded)")
+                        .to_string(),
+                })
+                .collect();
+            let more = total.saturating_sub(tools.len());
+            anyhow::Ok((tools, more))
+        };
+        run.await.unwrap_or((vec![], 0))
+    })
 }
 
 fn load_skills_for_prompt(vault: &Path) -> Vec<PromptSkill> {

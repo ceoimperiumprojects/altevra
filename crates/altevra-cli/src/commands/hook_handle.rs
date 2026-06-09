@@ -68,12 +68,23 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // session_start is dispatched BEFORE the shared pool open: its entire DB
+    // work (pool + migrations + insert + context assembly) runs under an
+    // internal ≤1s deadline with a catch-all, so a locked/slow DB can never
+    // stall or fail the hook (§P2.3). It always prints valid (possibly empty)
+    // output and exits 0.
+    if args.event == "session_start" {
+        if let Some(out) = run_session_start(&args).await {
+            println!("{out}");
+        }
+        return Ok(());
+    }
+
     let pool = create_pool(&args.db.to_string_lossy()).await?;
     run_migrations(&pool).await?;
     let repo = SessionsRepository::new(&pool);
 
     match args.event.as_str() {
-        "session_start" => handle_session_start(&pool, &repo, &args, &payload).await?,
         "session_end" | "stop" => handle_session_end(&pool, &repo, &args, &payload).await?,
         "user_prompt_submit" => handle_user_prompt(&repo, &args, &payload).await?,
         "post_tool_use" => handle_post_tool_use(&repo, &args, &payload).await?,
@@ -90,7 +101,8 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
 /// JSON file per event (O_EXCL, 0600, $HOME-anchored) instead of touching
 /// the database. Session pointer files are still maintained (they are plain
 /// files, not DB rows) so turn events can resolve their session id, and the
-/// stdout contract (`{"session_id": …}`) is preserved for the host tool.
+/// per-tool stdout contract ([`session_start_stdout`], §P2.2) is preserved —
+/// with the injected context degraded to empty while the lock is held.
 fn spool_during_maintenance(
     args: &HookHandleArgs,
     payload: &serde_json::Value,
@@ -114,7 +126,11 @@ fn spool_during_maintenance(
                 },
             )?;
             write_current_session(&id, &args.tool)?;
-            println!("{{\"session_id\":\"{id}\"}}");
+            // Same §P2.2 stdout contract as the live path; the injected
+            // context degrades to EMPTY while the DB is maintenance-locked.
+            if let Some(out) = session_start_stdout(&args.tool, &id, "") {
+                println!("{out}");
+            }
         }
         "session_end" | "stop" => {
             if let Some(id) = read_current_session(&args.tool)? {
@@ -176,17 +192,74 @@ fn resolve_working_dir() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-async fn handle_session_start(
-    pool: &sqlx::SqlitePool,
-    repo: &SessionsRepository<'_>,
+/// Hard deadline for the ENTIRE session_start DB path (pool + migrations +
+/// insert + context assembly). Below busy_timeout (5s) by design — a
+/// write-locked DB degrades to empty context instead of stalling the host
+/// tool (§P2.3).
+const SESSION_START_DEADLINE_MS: u64 = 900;
+
+/// session_start, fail-open end to end (§P2.2/§P2.3). Returns the EXACT
+/// stdout document (or `None` for codex — its stdout is user-visible and
+/// clobbers the TUI). Never errors: any DB failure or deadline overrun
+/// degrades the injected context to the empty string, the pointer file is
+/// still written, and the hook exits 0.
+async fn run_session_start(args: &HookHandleArgs) -> Option<String> {
+    use altevra_core::session_context::{session_start_transport, SessionStartTransport};
+
+    let id = Uuid::new_v4();
+    let working_dir = resolve_working_dir();
+    // Only the hook-additionalContext transport (claude-code) assembles a
+    // block — the channel decision lives in ONE place (§P2.1).
+    let wants_block = matches!(
+        session_start_transport(&args.tool),
+        SessionStartTransport::HookAdditionalContext
+    );
+
+    let deadline = std::time::Duration::from_millis(SESSION_START_DEADLINE_MS);
+    let assembled = tokio::time::timeout(
+        deadline,
+        session_start_db_work(args, id, working_dir, wants_block),
+    )
+    .await;
+    let block = match assembled {
+        Ok(Ok(block)) => block,
+        Ok(Err(e)) => {
+            eprintln!("[altevra] session_start db work failed (non-fatal): {e}");
+            String::new()
+        }
+        Err(_) => {
+            eprintln!(
+                "[altevra] session_start exceeded {SESSION_START_DEADLINE_MS}ms — \
+                 context degraded to empty (non-fatal)"
+            );
+            String::new()
+        }
+    };
+
+    // The pointer file is plain-filesystem — written even when the DB row
+    // didn't land (record_turn already downgrades the resulting FK miss).
+    if let Err(e) = write_current_session(&id, &args.tool) {
+        eprintln!("[altevra] session pointer write failed (non-fatal): {e}");
+    }
+    session_start_stdout(&args.tool, &id, &block)
+}
+
+/// Everything session_start does against the DB, so the caller can put ONE
+/// deadline around it. Returns the rendered context block ("" when the tool's
+/// transport doesn't want one).
+async fn session_start_db_work(
     args: &HookHandleArgs,
-    _payload: &serde_json::Value,
-) -> anyhow::Result<()> {
+    id: Uuid,
+    working_dir: Option<String>,
+    wants_block: bool,
+) -> anyhow::Result<String> {
     use altevra_core::events::{ActorType, Event, EventType};
 
-    let working_dir = resolve_working_dir();
+    let pool = create_pool(&args.db.to_string_lossy()).await?;
+    run_migrations(&pool).await?;
+    let repo = SessionsRepository::new(&pool);
     let row = SessionRow {
-        id: Uuid::new_v4(),
+        id,
         tool: args.tool.clone(),
         project_id: None,
         project_name: args.project.clone(),
@@ -200,7 +273,7 @@ async fn handle_session_start(
         metadata: serde_json::json!({"started_via": "hook"}),
         external_id: None,
         imported_from: None,
-        working_dir: working_dir.clone(),
+        working_dir,
     };
     repo.start_session(&row).await?;
 
@@ -212,13 +285,56 @@ async fn handle_session_start(
         "hook_handle",
         ActorType::System,
     );
-    if let Err(e) = EventsRepository::new(pool).insert(&ev).await {
+    if let Err(e) = EventsRepository::new(&pool).insert(&ev).await {
         eprintln!("[altevra] events insert failed (non-fatal): {e}");
     }
 
-    write_current_session(&row.id, &args.tool)?;
-    println!("{{\"session_id\":\"{}\"}}", row.id);
-    Ok(())
+    if !wants_block {
+        return Ok(String::new());
+    }
+    // Gated + audited assembly (§P2.4); an assembly error degrades to empty
+    // (fail-open for availability) while per-item filtering stays fail-closed
+    // inside the gather layer.
+    let data = altevra_bootstrap::session_context::gather_session_context(
+        &pool,
+        &format!("session_start:{id}"),
+        None,
+    )
+    .await;
+    Ok(altevra_core::session_context::render_session_context_block(&data))
+}
+
+/// The §P2.2 stdout contract, decided in ONE place keyed by `--tool`:
+///  * claude-code → EXACTLY ONE JSON document shaped per the Claude Code
+///    hooks spec (`hookSpecificOutput.additionalContext`); the session id
+///    moves to stderr (never a second JSON object on stdout).
+///  * codex → `None` (NOTHING on stdout — user-visible, clobbers the TUI).
+///  * everything else (hermes/cursor/unknown) → the legacy `{"session_id"}`
+///    document (hermes pulls context via the MCP bootstrap packet, cursor via
+///    `altevra context --session-block`).
+pub(crate) fn session_start_stdout(tool: &str, id: &Uuid, block: &str) -> Option<String> {
+    use altevra_core::session_context::{session_start_transport, SessionStartTransport};
+    match session_start_transport(tool) {
+        SessionStartTransport::HookAdditionalContext => {
+            eprintln!("[altevra] session_id={id}");
+            Some(
+                serde_json::json!({
+                    "hookSpecificOutput": {
+                        "hookEventName": "SessionStart",
+                        "additionalContext": block,
+                    }
+                })
+                .to_string(),
+            )
+        }
+        SessionStartTransport::Nothing => {
+            eprintln!("[altevra] session_id={id}");
+            None
+        }
+        SessionStartTransport::BootstrapPacket | SessionStartTransport::PullCli => {
+            Some(format!("{{\"session_id\":\"{id}\"}}"))
+        }
+    }
 }
 
 async fn handle_session_end(
@@ -681,17 +797,25 @@ mod tests {
         );
     }
 
+    /// Serializes every HOME-mutating test in this binary — $HOME is process
+    /// global, so two parallel HomeGuards would corrupt each other's paths.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Panic-safe HOME override: restores the previous HOME on drop so a
     /// failing assertion can't leak a TempDir HOME into sibling tests.
     struct HomeGuard {
         prev: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl HomeGuard {
         fn set(home: &std::path::Path) -> Self {
+            // A panicked sibling poisons the lock; the env value is restored
+            // by its Drop, so the poison itself is harmless — clear it.
+            let lock = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var_os("HOME");
             std::env::set_var("HOME", home);
-            Self { prev }
+            Self { prev, _lock: lock }
         }
     }
 
@@ -746,6 +870,204 @@ mod tests {
         );
 
         std::env::set_current_dir(cwd).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 hermetic gate — SessionStart context injection
+    // -----------------------------------------------------------------------
+
+    fn hook_args(tool: &str, db: std::path::PathBuf) -> HookHandleArgs {
+        HookHandleArgs {
+            event: "session_start".into(),
+            tool: tool.into(),
+            project: Some("altevra".into()),
+            db,
+            no_stdin: true,
+        }
+    }
+
+    /// Seed a decision row in the object-envelope store P2 queries.
+    async fn seed_decision(
+        pool: &sqlx::SqlitePool,
+        id: &str,
+        title: &str,
+        domain: &str,
+        sens: &str,
+        red: &str,
+    ) {
+        altevra_db::ObjectIndexRepository::new(pool)
+            .upsert(&altevra_db::ObjectIndexRow {
+                object_type: "decision".into(),
+                id: id.into(),
+                status: "active".into(),
+                sensitivity: sens.into(),
+                domain: domain.into(),
+                scope: None,
+                title: Some(title.into()),
+                categories: "[\"business\"]".into(),
+                tags: "[]".into(),
+                redaction_status: red.into(),
+                updated_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// P2 gate: for claude-code the hook emits EXACTLY ONE JSON document,
+    /// shaped per the Claude Code hooks spec, whose `additionalContext`
+    /// carries goals + decisions + the tool register — and a Restricted/
+    /// high-water decision is NOT in it. Every injected item has an
+    /// exposure_decisions audit row; the block fits the 2K budget.
+    #[tokio::test]
+    async fn p2_claude_code_block_gated_audited_single_json_doc() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let db = tmp.path().join("p2.db");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        // goals.json at the $HOME-anchored default path (HomeGuard isolates).
+        let goals = tmp.path().join(".altevra/state/goals.json");
+        std::fs::create_dir_all(goals.parent().unwrap()).unwrap();
+        std::fs::write(
+            &goals,
+            serde_json::json!([{"title": "2 paying Simple Surplus clients"}]).to_string(),
+        )
+        .unwrap();
+        // an injectable business decision + a Restricted high-water one.
+        seed_decision(&pool, "d1", "ONE canonical DB", "business", "internal", "clean").await;
+        seed_decision(
+            &pool,
+            "d_secret",
+            "Private health decision",
+            "health",
+            "restricted",
+            "clean",
+        )
+        .await;
+        // a curated tool for the register section.
+        let mut t = altevra_db::ToolRecordRow::new("imperium-crawl", "cli");
+        t.invocation = serde_json::json!({"canonical": "imperium-crawl <cmd>"});
+        t.source = "manual".into();
+        altevra_db::ToolRecordsRepository::new(&pool)
+            .upsert(&t)
+            .await
+            .unwrap();
+
+        let out = run_session_start(&hook_args("claude-code", db))
+            .await
+            .expect("claude-code emits a stdout document");
+
+        // EXACTLY ONE valid JSON document (a 2nd object would fail the parse).
+        let doc: serde_json::Value =
+            serde_json::from_str(&out).expect("stdout must be one valid JSON document");
+        assert_eq!(doc["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let block = doc["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext present");
+        // session_id moved OFF stdout (§P2.2) — never a second JSON object.
+        assert!(!out.contains("\"session_id\""));
+
+        // content: goals + decisions + tool register.
+        assert!(block.contains("2 paying Simple Surplus clients"), "goal missing: {block}");
+        assert!(block.contains("ONE canonical DB"), "decision missing: {block}");
+        assert!(block.contains("=== ALTEVRA TOOL REGISTER ==="), "register missing");
+        assert!(block.contains("imperium-crawl (cli): imperium-crawl <cmd>"));
+        // THE leak assertion: the Restricted/high-water decision is NOT injected.
+        assert!(
+            !block.contains("Private health decision"),
+            "Restricted decision leaked into session context"
+        );
+        // §P2.5: budget pinned ≤ 2K tokens.
+        assert!(
+            altevra_core::session_context::estimate_tokens(block)
+                <= altevra_core::session_context::SESSION_BLOCK_TOKEN_BUDGET
+        );
+
+        // §P2.4: every evaluated item wrote an exposure_decisions audit row
+        // (1 goal + 2 decisions [1 included + 1 excluded] + 1 tool = 4).
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM exposure_decisions WHERE packet_id LIKE 'session_start:%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 4, "one audit row per evaluated item");
+    }
+
+    /// P2 gate: codex gets NOTHING on stdout (user-visible — clobbers the TUI),
+    /// while non-injection tools keep the legacy `{"session_id"}` document.
+    #[tokio::test]
+    async fn p2_codex_emits_nothing_others_keep_legacy_stdout() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+
+        let out = run_session_start(&hook_args("codex", tmp.path().join("codex.db"))).await;
+        assert!(out.is_none(), "codex must print NOTHING on stdout");
+        // the session pointer still exists so turn capture keeps working.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(altevra_core::current_session_path("codex", &cwd).exists());
+
+        // cursor (pull transport) keeps the legacy single-line session_id doc.
+        let out = run_session_start(&hook_args("cursor", tmp.path().join("cursor.db")))
+            .await
+            .expect("cursor keeps legacy stdout");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(doc["session_id"].is_string());
+        assert!(doc.get("hookSpecificOutput").is_none());
+    }
+
+    /// P2 gate: a write-locked DB must neither stall nor fail the hook — the
+    /// deadline (≤1s) degrades the context to EMPTY, output stays a single
+    /// valid JSON document, and the handler returns Ok (exit 0).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn p2_locked_db_degrades_to_empty_within_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let db = tmp.path().join("locked.db");
+        // pre-migrate so the lock contends on the WRITE path, not migration.
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        pool.close().await;
+
+        // hold an exclusive write lock for the duration of the hook call.
+        let lock = rusqlite::Connection::open(&db).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+
+        let started = std::time::Instant::now();
+        let out = run_session_start(&hook_args("claude-code", db.clone())).await;
+        let elapsed = started.elapsed();
+        drop(lock);
+
+        // fail-open: still exactly one valid JSON doc, context EMPTY.
+        let out = out.expect("locked DB still yields valid output");
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["hookSpecificOutput"]["additionalContext"], "");
+        // within the deadline (900ms) + slack — never the 5s busy_timeout.
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "locked DB stalled the hook for {elapsed:?}"
+        );
+    }
+
+    /// §P2.2 stdout contract, pure: one JSON doc for claude-code, None for
+    /// codex, legacy session_id for hermes/cursor — decided in ONE place.
+    #[test]
+    fn session_start_stdout_contract_per_tool() {
+        let id = Uuid::new_v4();
+        let out = session_start_stdout("claude-code", &id, "CTX").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(doc["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(doc["hookSpecificOutput"]["additionalContext"], "CTX");
+        assert!(!out.contains(&id.to_string()), "session_id stays off stdout");
+
+        assert!(session_start_stdout("codex", &id, "CTX").is_none());
+
+        for tool in ["hermes", "cursor", "some-future-tool"] {
+            let out = session_start_stdout(tool, &id, "CTX").unwrap();
+            let doc: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(doc["session_id"], id.to_string());
+        }
     }
 
     #[test]

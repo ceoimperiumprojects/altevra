@@ -38,6 +38,10 @@ pub struct AgentBootstrapArgs {
     /// Vault path to load skills from
     #[arg(long, default_value = ".")]
     pub vault: PathBuf,
+
+    /// Brain database — source of the tool register + session-context block.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
 }
 
 #[derive(Args)]
@@ -82,9 +86,28 @@ async fn run_bootstrap(args: AgentBootstrapArgs) -> anyhow::Result<()> {
     // Build setup status
     let setup = SetupStatus::placeholder(&args.tool);
 
+    // §P2 #7: tool register + the gated session-context block ride the packet.
+    // Fault-tolerant — a locked/missing DB degrades to an empty register.
+    let (available_tools, session_context) = {
+        let run = async {
+            let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+            altevra_db::run_migrations(&pool).await?;
+            anyhow::Ok(
+                altevra_bootstrap::session_context::bootstrap_context(
+                    &pool,
+                    &format!("bootstrap_packet:{}", uuid::Uuid::new_v4()),
+                )
+                .await,
+            )
+        };
+        run.await.unwrap_or((vec![], None))
+    };
+
     let mut builder = BootstrapBuilder::new(&args.tool, env!("CARGO_PKG_VERSION"))
         .skill_freshness(freshness)
-        .setup_status(setup);
+        .setup_status(setup)
+        .available_tools(available_tools)
+        .session_context(session_context);
 
     if let Some(p) = &args.project {
         builder = builder.project(p.clone());
@@ -288,6 +311,7 @@ mod tests {
             session_id: None,
             json: true,
             vault: tmp.path().to_path_buf(),
+            db: tmp.path().join("agent-test.db"),
         };
         run_bootstrap(args).await.unwrap();
     }
@@ -310,6 +334,7 @@ mod tests {
             session_id: None,
             json: true,
             vault: tmp.path().to_path_buf(),
+            db: tmp.path().join("agent-test.db"),
         };
         run_bootstrap(args).await.unwrap();
     }
