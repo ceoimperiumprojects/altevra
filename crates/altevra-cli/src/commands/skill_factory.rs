@@ -320,6 +320,7 @@ pub(crate) async fn gate_and_build_packet(
     use altevra_core::safety::ExposureRequest;
     let request = ExposureRequest::external_route();
     let mut included = 0usize;
+    let mut allowed_turns: Vec<TurnRow> = Vec::new();
     let mut excluded: Vec<(String, usize)> = Vec::new();
     let mut redaction_counts: std::collections::BTreeMap<String, usize> = Default::default();
     let mut first_denial: Option<String> = None;
@@ -346,6 +347,7 @@ pub(crate) async fn gate_and_build_packet(
         match turn_external_route_decision(t, &request) {
             altevra_core::safety::ExposureDecision::Allow => {
                 included += 1;
+                allowed_turns.push(t.clone());
                 *redaction_counts.entry(t.redaction_status.clone()).or_default() += 1;
             }
             altevra_core::safety::ExposureDecision::Deny(reason) => {
@@ -363,9 +365,13 @@ pub(crate) async fn gate_and_build_packet(
     }
     let excluded_count: usize = excluded.iter().map(|(_, n)| n).sum();
 
-    // Bounded packet text (built only when nothing was denied, but counts are
-    // computed first so the audit row is honest either way).
-    let (text, truncated) = build_packet_text(&turns);
+    // Bounded packet text — built ONLY from gate-allowed turns. Denied turns
+    // are OMITTED (their content is never included) rather than killing the
+    // whole render: refusing on any single denial made every real session
+    // unrenderable (a long work session almost always contains one
+    // secret-bearing, already-redacted turn). Integrity floor below still
+    // refuses when the majority of evidence is locked.
+    let (text, truncated) = build_packet_text(&allowed_turns);
 
     // Audit row — content-free aggregates, written for refused builds too.
     let audit = ExposureAudit {
@@ -380,15 +386,31 @@ pub(crate) async fn gate_and_build_packet(
     };
     ExposureDecisionsRepository::new(pool).insert(&audit).await?;
 
-    if let Some(denial) = first_denial {
+    // Integrity floor: refuse when there is no usable evidence at all, or when
+    // the MAJORITY of evidence is gate-denied (a packet that hides most of its
+    // evidence would invite fabrication). Otherwise denied turns are omitted —
+    // their content was never read into the packet — and the omission is
+    // declared to the renderer explicitly.
+    if included == 0 || excluded_count * 2 >= included + excluded_count {
+        let denial = first_denial.unwrap_or_else(|| "no usable evidence".into());
         anyhow::bail!(
-            "REFUSED: proposal '{}' — {} ({} evidence item(s) denied; nothing was \
+            "REFUSED: proposal '{}' — {} ({} of {} evidence item(s) denied; nothing was \
              sent to any provider)",
             proposal.id,
             denial,
-            excluded_count
+            excluded_count,
+            included + excluded_count
         );
     }
+
+    let text = if excluded_count > 0 {
+        format!(
+            "{text}\n\n[exposure gate: {excluded_count} evidence turn(s) omitted — locked \
+             content was never included in this packet; do not speculate about it]"
+        )
+    } else {
+        text
+    };
 
     Ok(EvidencePacket {
         text,
@@ -1004,6 +1026,47 @@ mod tests {
         let p = proposal_with_refs(&[format!("turn:{}", Uuid::new_v4())]);
         let err = gate_and_build_packet(&pool, &p).await.unwrap_err();
         assert!(err.to_string().contains("REFUSED"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn minority_denied_evidence_is_omitted_with_note_not_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pool = test_pool(&dir).await;
+
+        // 2 clean turns + 1 confidential (real redaction finding): the locked
+        // turn is OMITTED (content never read into the packet), the packet is
+        // built from the clean majority, and the omission is declared.
+        let (_sid, ids) = seed_session(
+            &pool,
+            Some("altevra"),
+            &[
+                (0, "user", "fix the tsv parser", "internal", "clean"),
+                (1, "assistant", "use read -r with explicit cut", "internal", "clean"),
+                (2, "assistant", "secret-bearing output", "confidential", "redacted"),
+            ],
+        )
+        .await;
+        let p = proposal_with_refs(&[
+            format!("turn:{}", ids[0]),
+            format!("turn:{}", ids[1]),
+            format!("turn:{}", ids[2]),
+        ]);
+        let packet = gate_and_build_packet(&pool, &p).await.unwrap();
+        assert_eq!(packet.turn_count, 2, "only gate-allowed turns counted");
+        assert!(
+            !packet.text.contains("secret-bearing output"),
+            "denied content must never reach the packet"
+        );
+        assert!(
+            packet.text.contains("1 evidence turn(s) omitted"),
+            "omission must be declared to the renderer: {}",
+            packet.text
+        );
+        assert_eq!(
+            exposure_audit_count(&pool, &p.id).await,
+            1,
+            "omit-path build still writes an exposure_decisions audit row"
+        );
     }
 
     #[tokio::test]
