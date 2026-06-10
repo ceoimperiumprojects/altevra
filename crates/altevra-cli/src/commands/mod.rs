@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod analyze;
+pub mod auth;
 pub mod banner;
 pub mod brain;
 pub mod brief;

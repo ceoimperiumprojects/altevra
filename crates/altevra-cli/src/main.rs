@@ -65,6 +65,11 @@ enum Commands {
     /// Run health checks on the current Altevra setup
     Doctor(commands::doctor::DoctorArgs),
 
+    /// Auth lanes — bare `auth` shows Codex OAuth + local Ollama status;
+    /// `auth codex` activates Codex OAuth (spawns `codex login` if needed);
+    /// `auth ollama` configures the local lane.
+    Auth(commands::auth::AuthArgs),
+
     /// Manage Altevra configuration
     #[command(subcommand)]
     Config(commands::config::ConfigCommands),
@@ -232,6 +237,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Agent(cmd) => commands::agent::run(cmd).await,
         Commands::Serve(args) => commands::serve::run(args).await,
         Commands::Doctor(args) => commands::doctor::run(args).await,
+        Commands::Auth(args) => commands::auth::run(args).await,
         Commands::Config(cmd) => commands::config::run(cmd).await,
         Commands::Llm(cmd) => commands::llm::run(cmd).await,
         Commands::Memory(cmd) => commands::memory::run(cmd).await,

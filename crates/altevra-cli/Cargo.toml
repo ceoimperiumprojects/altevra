@@ -46,6 +46,7 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 rpassword = { workspace = true }
 
 [dev-dependencies]

@@ -48,7 +48,7 @@ pub async fn run(cmd: LlmCommands) -> anyhow::Result<()> {
     }
 }
 
-async fn run_use(args: UseArgs) -> anyhow::Result<()> {
+pub(crate) async fn run_use(args: UseArgs) -> anyhow::Result<()> {
     let mut cfg = load_config(&args.repo);
     let before_mode = cfg.llm.reasoning_mode.as_str().to_string();
     let before_local = describe_local_private(&cfg);
