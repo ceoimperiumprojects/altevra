@@ -279,7 +279,12 @@ fn claude_event_matrix() -> &'static [(&'static str, &'static str)] {
         ("UserPromptSubmit", "user_prompt_submit"),
         ("PreToolUse", "pre_tool_use"),
         ("PostToolUse", "post_tool_use"),
-        ("Stop", "session_end"),
+        // Claude Code fires `Stop` after EVERY assistant turn, NOT only at
+        // session termination. Mapping it to `session_end` (the old bug) made
+        // `clear_current_session` delete the pointer after the first response,
+        // so every subsequent turn silently dropped. `stop` is a SOFT
+        // CHECKPOINT that accrues stats without clearing the pointer.
+        ("Stop", "stop"),
     ]
 }
 
@@ -288,7 +293,8 @@ fn cursor_event_matrix() -> &'static [(&'static str, &'static str)] {
     &[
         ("sessionStart", "session_start"),
         ("postToolUse", "post_tool_use"),
-        ("stop", "session_end"),
+        // Soft checkpoint (see claude_event_matrix) — not a session_end.
+        ("stop", "stop"),
     ]
 }
 

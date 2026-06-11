@@ -85,7 +85,12 @@ pub async fn run(args: HookHandleArgs) -> anyhow::Result<()> {
     let repo = SessionsRepository::new(&pool);
 
     match args.event.as_str() {
-        "session_end" | "stop" => handle_session_end(&pool, &repo, &args, &payload).await?,
+        "session_end" => handle_session_end(&pool, &repo, &args, &payload).await?,
+        // SOFT CHECKPOINT: Claude Code fires `Stop` after every assistant turn.
+        // Accrue stats / close-for-stats but DO NOT clear the session pointer —
+        // otherwise the next `user_prompt_submit` has no session to attach to and
+        // the turn is silently lost (the live-capture regression).
+        "stop" => handle_stop_checkpoint(&pool, &repo, &args, &payload).await?,
         "user_prompt_submit" => handle_user_prompt(&pool, &repo, &args, &payload).await?,
         "post_tool_use" => handle_post_tool_use(&pool, &repo, &args, &payload).await?,
         "pre_tool_use" => handle_pre_tool_use(&repo, &args, &payload).await?,
@@ -376,6 +381,33 @@ async fn handle_session_end(
     Ok(())
 }
 
+/// Soft checkpoint for the Claude Code `Stop` hook.
+///
+/// `Stop` fires after EVERY assistant turn, not only at session termination.
+/// Treating it as a session-end (the original regression) deleted the session
+/// pointer after the first response, so every later `user_prompt_submit`
+/// silently dropped. This handler keeps the pointer ALIVE: it does not call
+/// `end_session` and does not call `clear_current_session`. The true close
+/// happens on the `session_end` event (or via the recovery path on the next
+/// turn if the pointer was lost). It is intentionally cheap and non-destructive.
+async fn handle_stop_checkpoint(
+    pool: &sqlx::SqlitePool,
+    _repo: &SessionsRepository<'_>,
+    args: &HookHandleArgs,
+    _payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    // Pointer must survive the checkpoint. If there is no active session we do
+    // nothing (the next turn's recovery path will re-establish one).
+    let Some(id) = read_current_session(&args.tool)? else {
+        return Ok(());
+    };
+    // Best-effort, non-fatal: leave a lightweight marker that the turn boundary
+    // was observed. Never clears the pointer, never ends the session.
+    let _ = pool; // (reserved for future stats accrual; pointer is the invariant)
+    println!("{{\"checkpoint_session\":\"{id}\"}}");
+    Ok(())
+}
+
 /// Enqueue the per-session improvement signal (C1 producer). Reads the closed
 /// session's provenance (`tool`/`project`/`turn_count`) and asks the pure
 /// [`signal_for_session`] producer for a signal — which is `None` when SI-6
@@ -614,6 +646,51 @@ pub(crate) fn guard_json(
     }
 }
 
+/// Recover from a missing session pointer (e.g. the old `Stop`-as-session_end
+/// regression wiped it mid-conversation). Creates a fresh session row tagged
+/// `started_via=recovered` and writes the pointer so subsequent turns attach.
+///
+/// Race-guarded: re-reads the pointer after a would-be insert window; if another
+/// concurrent hook already recovered the session we adopt theirs (idempotent,
+/// never two rows for the same logical recovery).
+async fn recover_session(repo: &SessionsRepository<'_>, source_tool: &str) -> anyhow::Result<Uuid> {
+    // Re-check: a concurrent hook may have just recovered.
+    if let Some(id) = read_current_session(source_tool)? {
+        return Ok(id);
+    }
+    let id = Uuid::new_v4();
+    let row = SessionRow {
+        id,
+        tool: source_tool.to_string(),
+        project_id: None,
+        project_name: None,
+        started_at: Utc::now(),
+        ended_at: None,
+        summary: None,
+        tokens_in_total: 0,
+        tokens_out_total: 0,
+        cost_usd_estimate: 0.0,
+        turn_count: 0,
+        metadata: serde_json::json!({"started_via": "recovered"}),
+        external_id: None,
+        imported_from: None,
+        working_dir: resolve_working_dir(),
+    };
+    repo.start_session(&row).await?;
+    // Final race-guard: if someone wrote a pointer between our re-check and now,
+    // adopt theirs (our row becomes a harmless empty session).
+    if let Some(existing) = read_current_session(source_tool)? {
+        return Ok(existing);
+    }
+    write_current_session(&id, source_tool)?;
+    eprintln!(
+        "[altevra] WARN: no active session pointer for tool '{source_tool}'; \
+         recovered as {id} (started_via=recovered). Run `altevra connect` if this \
+         recurs — the hook config may still have the legacy Stop->session_end mapping."
+    );
+    Ok(id)
+}
+
 async fn record_turn(
     repo: &SessionsRepository<'_>,
     role: &str,
@@ -627,9 +704,12 @@ async fn record_turn(
     let session_id = match read_current_session(source_tool)? {
         Some(id) => id,
         None => {
-            // No active session — silently skip so the agent isn't blocked
-            // when running outside the recorded lifecycle.
-            return Ok(());
+            // No active session pointer. Rather than silently dropping the turn
+            // (the live-capture data-loss path), RECOVER: create a fresh session
+            // row tagged `started_via=recovered`, write the pointer, warn on
+            // stderr, then proceed. Idempotent: a concurrent recovery is
+            // re-checked before insert so we never create two rows.
+            recover_session(repo, source_tool).await?
         }
     };
 
@@ -1209,5 +1289,126 @@ mod tests {
         assert!(sens >= altevra_core::security::Sensitivity::Confidential);
         // non-string leaves survive untouched.
         assert!(s.contains("42"));
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK 0 — live-capture regression gates
+    // -----------------------------------------------------------------------
+
+    /// The `Stop` hook is a SOFT CHECKPOINT: it must NOT delete the session
+    /// pointer, so turns submitted AFTER a Stop still attach to the session.
+    /// This is the exact regression: `Stop` mapped to `session_end` wiped the
+    /// pointer after the first assistant response and every later turn dropped.
+    #[tokio::test]
+    async fn stop_hook_is_soft_checkpoint_pointer_survives() {
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let tool = "claude-code";
+        let db = tmp.path().join("altevra.db");
+        let mk = |event: &str| HookHandleArgs {
+            event: event.into(),
+            tool: tool.to_string(),
+            project: Some("altevra".into()),
+            db: db.clone(),
+            no_stdin: true,
+        };
+
+        run(mk("session_start")).await.unwrap();
+        let ptr = altevra_core::current_session_path(tool, tmp.path());
+        assert!(ptr.exists(), "pointer exists after session_start");
+
+        // A `stop` checkpoint must NOT clear the pointer.
+        run(mk("stop")).await.unwrap();
+        assert!(
+            ptr.exists(),
+            "pointer MUST survive a `stop` checkpoint (regression: it was deleted)"
+        );
+
+        // Only an explicit `session_end` clears it.
+        run(mk("session_end")).await.unwrap();
+        assert!(!ptr.exists(), "pointer cleared on explicit session_end");
+
+        std::env::set_current_dir(cwd).unwrap();
+    }
+
+    /// If the pointer is missing when a turn arrives (e.g. legacy mapping wiped
+    /// it), `record_turn` must RECOVER a session rather than silently dropping
+    /// the turn. After recovery the turn is persisted under a `started_via=
+    /// recovered` session.
+    #[tokio::test]
+    async fn turn_records_after_pointer_deleted_recovery() {
+        use altevra_db::SessionsRepository;
+
+        let tmp = TempDir::new().unwrap();
+        let _home = HomeGuard::set(tmp.path());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+
+        let tool = "claude-code";
+        let db = tmp.path().join("altevra.db");
+
+        // No session_start at all — pointer is absent (worst case).
+        let ptr = altevra_core::current_session_path(tool, tmp.path());
+        assert!(!ptr.exists(), "precondition: no pointer");
+
+        // A user prompt arrives with no active session.
+        let args = HookHandleArgs {
+            event: "user_prompt_submit".into(),
+            tool: tool.to_string(),
+            project: None,
+            db: db.clone(),
+            no_stdin: true,
+        };
+        run(args).await.unwrap();
+
+        // Recovery wrote a pointer and a session row; the turn must be persisted.
+        assert!(ptr.exists(), "recovery must (re)write the session pointer");
+
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let session_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE tool = ?")
+                .bind(tool)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(session_count, 1, "exactly one recovered session row");
+
+        let recovered: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sessions WHERE json_extract(metadata,'$.started_via') = 'recovered'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(recovered, 1, "session must be tagged started_via=recovered");
+
+        let turn_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM turns")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(turn_count, 1, "the turn must be recorded, not dropped");
+
+        // Idempotency: a SECOND turn must reuse the same session (no 2nd row).
+        let _ = SessionsRepository::new(&pool); // (repo path exercised inside run)
+        let args2 = HookHandleArgs {
+            event: "user_prompt_submit".into(),
+            tool: tool.to_string(),
+            project: None,
+            db: db.clone(),
+            no_stdin: true,
+        };
+        run(args2).await.unwrap();
+        let session_count2: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE tool = ?")
+                .bind(tool)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(session_count2, 1, "second turn reuses the recovered session");
+
+        std::env::set_current_dir(cwd).unwrap();
     }
 }

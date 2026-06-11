@@ -10,6 +10,7 @@
 //! notification window); only the brain's once-a-day delivery pass claims.
 
 use altevra_brain::notify;
+use chrono::Local;
 use clap::Args;
 use std::path::PathBuf;
 
@@ -71,7 +72,10 @@ pub async fn run(args: BriefArgs) -> anyhow::Result<()> {
                 "\nBrief already exists: {}",
                 vault
                     .join("Daily")
-                    .join(format!("{}-altevra-brief.md", now.format("%Y-%m-%d")))
+                    .join(format!(
+                        "{}-altevra-brief.md",
+                        now.with_timezone(&Local).format("%Y-%m-%d")
+                    ))
                     .display()
             ),
         }

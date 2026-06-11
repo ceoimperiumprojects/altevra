@@ -20,6 +20,7 @@ pub mod curator;
 pub mod jobs;
 pub mod lifecycle;
 pub mod notify;
+pub mod observer_detectors;
 pub mod resident;
 pub mod routing;
 pub mod scheduler;

@@ -10,6 +10,14 @@ repository = "https://github.com/ceoimperiumprojects/altevra"
 name = "altevra"
 path = "src/main.rs"
 
+# R2: enables BGE-M3 1024d local embedder (fastembed/ONNX).
+# Build command: cargo build --release --features embedding
+# Service ExecStart (after feature build):
+#   ExecStart=/home/pavle/.local/bin/altevra embed run --bge \
+#             --db /home/pavle/.altevra/altevra.db
+[features]
+embedding = ["altevra-memory/embedding"]
+
 [dependencies]
 altevra-core = { workspace = true }
 altevra-skills = { workspace = true }
@@ -36,6 +44,9 @@ async-trait = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 libc = "0.2"
+# R1: backup snapshot tarball (config.toml/interests.yaml/state/).
+tar = "0.4"
+flate2 = "1"
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -53,3 +64,4 @@ rpassword = { workspace = true }
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+filetime = "0.2"

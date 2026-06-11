@@ -1,3 +1,4 @@
+pub mod block_writes;
 pub mod capability;
 pub mod cursor_edits;
 pub mod domain_policy;
@@ -28,6 +29,7 @@ pub use capability::{
     AdapterDossierRow, AdapterDossiersRepository, CapabilityGrantRow, CapabilityGrantsRepository,
     CapabilityRecordRow, CapabilityRecordsRepository, SkillProposalsRepository,
 };
+pub use block_writes::{BlockWriteRow, BlockWritesRepository};
 pub use cursor_edits::{CursorEditRow, CursorEditsRepository};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;

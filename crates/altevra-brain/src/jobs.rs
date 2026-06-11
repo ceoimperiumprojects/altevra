@@ -231,22 +231,23 @@ pub async fn run_observer_scan(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
         .await
         .unwrap_or_default();
 
+    // 1. Event-pattern detectors (keyless, over the events table).
     let insights = detect_patterns(&events, &[]);
     let insight_count = insights.len();
 
-    if insight_count == 0 {
-        return Ok(JobResult {
-            summary: format!(
-                "observer scan: {} events checked, no patterns detected",
-                events.len()
-            ),
-            items_processed: 0,
-        });
-    }
+    // 2. DB-backed detectors (R4) — query sessions/turns/hook_runs directly.
+    //    Metadata-only evidence; never body text. Runs regardless of whether
+    //    the event-pattern path produced anything (the two paths are
+    //    independent signal sources).
+    let db_insights = crate::observer_detectors::run_db_detectors(pool, ctx.now)
+        .await
+        .unwrap_or_default();
+    let db_insight_count = db_insights.len();
 
-    // Persist each insight as a proposal (idempotent via dedup_hash).
     let proposals = ProposalsRepository::new(pool);
     let mut new_proposals = 0usize;
+
+    // Persist each event-pattern insight as a proposal (idempotent via dedup_hash).
     for ins in &insights {
         let np = NewProposal {
             kind: "improvement".into(),
@@ -269,14 +270,37 @@ pub async fn run_observer_scan(pool: &SqlitePool, ctx: &JobContext) -> anyhow::R
         }
     }
 
+    // Persist each DB-backed insight as a proposal tagged `observer_db`.
+    // Evidence is metadata-only (session/turn ids + counts) — never body text.
+    for ins in &db_insights {
+        let np = NewProposal {
+            kind: "improvement".into(),
+            title: ins.title.clone(),
+            body: ins.summary.clone(),
+            source_mode: Some("observer_db".into()),
+            dedup_hash: format!("observer_db:{}:{}", ins.kind, ins.title),
+            evidence_refs: ins.evidence.iter().map(|e| e.label.clone()).collect(),
+            touches_sensitive: false,
+            touches_constitutional: false,
+        };
+        if let Ok((_, is_new)) = proposals.insert(&np).await {
+            if is_new {
+                new_proposals += 1;
+            }
+        }
+    }
+
+    let total_insights = insight_count + db_insight_count;
+
     Ok(JobResult {
         summary: format!(
-            "observer scan: {} event(s), {} insight(s) detected, {} new proposal(s)",
+            "observer scan: {} event(s), {} event-pattern + {} db insight(s), {} new proposal(s)",
             events.len(),
             insight_count,
+            db_insight_count,
             new_proposals
         ),
-        items_processed: insight_count,
+        items_processed: total_insights,
     })
 }
 
@@ -1346,9 +1370,20 @@ pub async fn run_lifecycle_archiver(
     ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
     let report = crate::lifecycle::lifecycle_archive(pool, ctx.now).await?;
+
+    // R4: events retention sweep — prune noise-class events past the retention
+    // window. Session/skill/decision events are never touched (durable signal).
+    let retention = crate::observer_detectors::prune_noise_events(
+        pool,
+        ctx.now,
+        crate::observer_detectors::DEFAULT_RETENTION_DAYS,
+    )
+    .await
+    .unwrap_or_default();
+
     Ok(JobResult {
-        summary: report.summary(),
-        items_processed: report.total_actions(),
+        summary: format!("{} | {}", report.summary(), retention.summary()),
+        items_processed: report.total_actions() + retention.pruned,
     })
 }
 

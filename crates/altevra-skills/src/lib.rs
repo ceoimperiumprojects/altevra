@@ -1,3 +1,4 @@
+pub mod block_writer;
 pub mod checksum;
 pub mod importer;
 pub mod parser;
@@ -8,6 +9,10 @@ pub mod sync;
 pub mod version;
 pub mod watcher;
 
+pub use block_writer::{
+    detect_eol, end_marker, parse_block, sha256_hex as block_sha256, start_marker, wrap_block,
+    write_block, Eol, ParseResult, WriteOutcome,
+};
 pub use importer::{
     default_skill_dirs, group_by_slug, scan_all, scan_external_dir, ExternalSkill, SourceTool,
 };

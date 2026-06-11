@@ -1,8 +1,10 @@
 pub mod chunker;
+pub mod db_uri;
 pub mod embedding;
 pub mod embedding_router;
 pub mod gemini;
 pub mod hybrid;
+pub mod hybrid_db;
 pub mod hybrid_rrf;
 pub mod ingestion;
 pub mod search;
@@ -18,6 +20,8 @@ pub mod bge;
 pub mod vec_store_sqlite;
 
 pub use chunker::{chunk_markdown, Chunk, ChunkMeta};
+pub use db_uri::{db_uri, embed_checksum, parse_db_uri, DbObjectType, MAX_CHUNKS_PER_TURN};
+pub use hybrid_db::{hybrid_db_search, DbHybridHit};
 pub use embedding::{AsyncEmbeddingProvider, Embedding, EmbeddingProvider, NoOpEmbedder};
 pub use embedding_router::{EmbeddingRole, EmbeddingRouter};
 pub use gemini::{cosine, GeminiEmbedder, GEMINI_DIM, GEMINI_MODEL};

@@ -10,7 +10,7 @@
 //!     the policy-blocked items verbatim.
 
 use altevra_research::RelevanceGate;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 
@@ -57,8 +57,11 @@ pub async fn build_brief_data(
     gate: &RelevanceGate,
     now: DateTime<Utc>,
 ) -> BriefData {
+    // Use LOCAL timezone for the date stamp — Pavle's vault dates must match
+    // his wall-clock day, not UTC (which can differ by hours at night).
+    let local_date = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
     let mut data = BriefData {
-        date: now.format("%Y-%m-%d").to_string(),
+        date: local_date,
         ..Default::default()
     };
 
@@ -82,6 +85,37 @@ pub async fn build_brief_data(
         data.personal_private.push(line(item));
     }
     data.personal_withheld = delivery.obsidian_blocked.len();
+
+    // --- What Changed: wire recent sessions + file_changes from DB so the
+    // section renders non-empty when data exists (R6 brief polish).
+    // The delivery already contributes via RULE_RESUME_BRIEF; supplement with
+    // the last few distinct projects/sessions and recent file edits.
+    let recent_changes = recent_changes_lines(pool, now).await;
+    for line_str in recent_changes {
+        if !data.what_changed.contains(&line_str) {
+            data.what_changed.push(line_str);
+        }
+    }
+
+    // --- Decisions: wire object_index decisions from DB (supplement delivery).
+    // Delivery contributes via RULE_DECISION_STALENESS (past review_after date);
+    // here we also surface recent decisions that are still current.
+    let recent_decisions = recent_decision_lines(pool).await;
+    for line_str in recent_decisions {
+        if !data.decisions.contains(&line_str) {
+            data.decisions.push(line_str);
+        }
+    }
+
+    // --- Tasks: wire active tasks from DB (supplement delivery).
+    // Delivery contributes via RULE_OPEN_PROPOSALS; here we directly surface
+    // active tasks (not proposals) so the Tasks section renders when tasks exist.
+    let active_tasks = active_task_lines(pool).await;
+    for line_str in active_tasks {
+        if !data.tasks.contains(&line_str) {
+            data.tasks.push(line_str);
+        }
+    }
 
     // Patterns over recent events → What Matters / Risks.
     let (matters, risks) = pattern_lines(pool, now).await;
@@ -165,6 +199,126 @@ async fn research_lines(pool: &SqlitePool, gate: &RelevanceGate, limit: i64) -> 
         .collect()
 }
 
+/// R6: What-Changed supplement — recent sessions (last 3 days) and
+/// recent file_changes (last 24h, up to 5 distinct paths) from DB.
+/// Fail-soft: DB errors → empty vec.
+async fn recent_changes_lines(pool: &SqlitePool, now: DateTime<Utc>) -> Vec<String> {
+    use altevra_db::SessionsRepository;
+    let mut lines = Vec::new();
+
+    // Recent sessions from the last 3 days with a known project.
+    let window = now - chrono::Duration::days(3);
+    let sessions = SessionsRepository::new(pool)
+        .list_sessions(None, None, 20)
+        .await
+        .unwrap_or_default();
+    let mut seen_projects = std::collections::HashSet::new();
+    for s in &sessions {
+        if s.started_at < window {
+            break;
+        }
+        if let Some(proj) = &s.project_name {
+            if seen_projects.insert(proj.clone()) {
+                let summary = s
+                    .summary
+                    .as_deref()
+                    .map(|x| x.chars().take(80).collect::<String>())
+                    .unwrap_or_else(|| format!("{} turns", s.turn_count));
+                lines.push(format!("{proj}: {summary}"));
+                if lines.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Recent file_changes (last 24h) — distinct paths, most-recent 5.
+    let fc_window = now - chrono::Duration::hours(24);
+    let fc_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT path, diff_summary FROM file_changes \
+         WHERE created_at >= ? \
+         ORDER BY created_at DESC LIMIT 30",
+    )
+    .bind(fc_window.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut fc_lines: Vec<String> = Vec::new();
+    for (path, diff) in fc_rows {
+        if seen_paths.insert(path.clone()) {
+            let short_path = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            let line = if diff.trim().is_empty() {
+                format!("edited: {short_path}")
+            } else {
+                let short_diff: String = diff.trim().chars().take(60).collect();
+                format!("{short_path}: {short_diff}")
+            };
+            fc_lines.push(line);
+            if fc_lines.len() >= 5 {
+                break;
+            }
+        }
+    }
+    lines.extend(fc_lines);
+    lines
+}
+
+/// R6: Decisions supplement — recent active decisions from `object_index`
+/// (type = 'decision', status = 'active'), up to 5 most-recent.
+async fn recent_decision_lines(pool: &SqlitePool) -> Vec<String> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT oi.title, d.rationale \
+         FROM object_index oi \
+         LEFT JOIN decisions d ON d.id = oi.id \
+         WHERE oi.type = 'decision' AND oi.status = 'active' \
+           AND oi.redaction_status IN ('clean','redacted') \
+         ORDER BY oi.updated_at DESC LIMIT 5",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    rows.into_iter()
+        .filter_map(|(title, _)| {
+            if title.trim().is_empty() {
+                None
+            } else {
+                Some(title)
+            }
+        })
+        .collect()
+}
+
+/// R6: Tasks supplement — active (non-completed, non-cancelled) tasks from
+/// `tasks` table, ordered by priority then due date, up to 5.
+async fn active_task_lines(pool: &SqlitePool) -> Vec<String> {
+    use altevra_db::TasksRepository;
+    let tasks = TasksRepository::new(pool)
+        .list_active(None, 5)
+        .await
+        .unwrap_or_default();
+    tasks
+        .into_iter()
+        .map(|t| {
+            if let Some(due) = t.due_at {
+                format!(
+                    "{} [{}] (due {})",
+                    t.title,
+                    t.priority,
+                    due.format("%Y-%m-%d")
+                )
+            } else {
+                format!("{} [{}]", t.title, t.priority)
+            }
+        })
+        .collect()
+}
+
 /// Render the brief per daily_briefing_v1. Headers verbatim; empty sections
 /// stay present (empty); Personal Signals omitted when nothing to say.
 pub fn render_brief(data: &BriefData, private: bool) -> String {
@@ -227,7 +381,8 @@ pub async fn write_vault_brief(
     gate: &RelevanceGate,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let date = now.format("%Y-%m-%d").to_string();
+    // LOCAL date for the vault filename — matches Pavle's wall-clock day.
+    let date = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
     let dir = vault.join("Daily");
     let path = dir.join(format!("{date}-altevra-brief.md"));
     if path.exists() {
@@ -245,4 +400,172 @@ pub async fn write_vault_brief(
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&path, render_brief(&data, false))?;
     Ok(Some(path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use altevra_db::{create_pool, run_migrations};
+    use altevra_research::RelevanceGate;
+    use chrono::Utc;
+    use tempfile::TempDir;
+
+    async fn setup_pool(dir: &TempDir) -> sqlx::SqlitePool {
+        let db = dir.path().join("brief_test.db");
+        let pool = create_pool(&db.to_string_lossy()).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        pool
+    }
+
+    // Seed fixture data into the DB so every brief section has something to
+    // render. We insert: a session with project + summary (What Changed),
+    // a decision in object_index (Decisions), an active task (Tasks).
+    async fn seed_fixtures(pool: &sqlx::SqlitePool, now: DateTime<Utc>) {
+        use uuid::Uuid;
+
+        // --- Session (What Changed via recent_changes_lines)
+        sqlx::query(
+            "INSERT INTO sessions \
+             (id, tool, started_at, ended_at, summary, project_name, \
+              turn_count, tokens_in_total, tokens_out_total, cost_usd_estimate, metadata) \
+             VALUES (?, 'claude-code', ?, ?, ?, ?, 5, 100, 200, 0.01, '{}')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(
+            (now - chrono::Duration::hours(2))
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        )
+        .bind(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .bind("fixed the auth flow")
+        .bind("altevra")
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // --- Decision in decisions + object_index (Decisions section)
+        let dec_id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO decisions (id, title, rationale, decided_at, metadata) \
+             VALUES (?, ?, ?, ?, '{}')",
+        )
+        .bind(&dec_id)
+        .bind("Use SQLite as the single store")
+        .bind("Simplest self-contained option; no separate server needed")
+        .bind(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT OR REPLACE INTO object_index \
+             (type, id, status, sensitivity, domain, title, categories, tags, \
+              redaction_status, updated_at) \
+             VALUES ('decision', ?, 'active', 'internal', 'business', \
+                     'Use SQLite as the single store', '[]', '[]', 'clean', ?)",
+        )
+        .bind(&dec_id)
+        .bind(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+
+        // --- Active task (Tasks section)
+        sqlx::query(
+            "INSERT INTO tasks \
+             (id, title, status, priority, metadata, created_at, updated_at) \
+             VALUES (?, ?, 'in_progress', 'high', '{}', ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind("Ship R6 doctor checks")
+        .bind(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .bind(now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// R6 fixture test: when DB has sessions, decisions, and tasks,
+    /// `render_brief` produces non-empty What Changed, Decisions, and Tasks
+    /// sections.
+    #[tokio::test]
+    async fn brief_renders_all_sections_with_fixture_data() {
+        let tmp = TempDir::new().unwrap();
+        let pool = setup_pool(&tmp).await;
+        let now = Utc::now();
+        seed_fixtures(&pool, now).await;
+
+        let gate = RelevanceGate::default();
+        let delivery = super::Delivery {
+            obsidian: vec![],
+            obsidian_blocked: vec![],
+            ..Default::default()
+        };
+        let data = build_brief_data(&pool, &delivery, &gate, now).await;
+        let rendered = render_brief(&data, false);
+
+        // Local date is in frontmatter.
+        let local_date = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
+        assert!(
+            rendered.contains(&format!("date: {local_date}")),
+            "frontmatter must use LOCAL date: {local_date}, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# Daily Brief"),
+            "must have title, got:\n{rendered}"
+        );
+
+        // What Changed: session with project name.
+        assert!(
+            rendered.contains("altevra"),
+            "What Changed should mention the project 'altevra', got:\n{rendered}"
+        );
+
+        // Decisions: the seeded decision.
+        assert!(
+            rendered.contains("Use SQLite as the single store"),
+            "Decisions section must contain seeded decision, got:\n{rendered}"
+        );
+
+        // Tasks: the seeded task.
+        assert!(
+            rendered.contains("Ship R6 doctor checks"),
+            "Tasks section must contain seeded task, got:\n{rendered}"
+        );
+
+        // All major section headers present (even if empty).
+        for header in &[
+            "## What Changed",
+            "## What Matters",
+            "## Decisions",
+            "## Tasks Needing Attention",
+            "## Useful Research",
+            "## Risks",
+            "## Suggested Focus",
+        ] {
+            assert!(
+                rendered.contains(header),
+                "section header '{header}' missing from rendered brief:\n{rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn brief_local_date_in_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let pool = setup_pool(&tmp).await;
+        // Use a UTC "now" that is likely to differ from local date near midnight.
+        let now = Utc::now();
+        let gate = RelevanceGate::default();
+        let delivery = super::Delivery {
+            obsidian: vec![],
+            obsidian_blocked: vec![],
+            ..Default::default()
+        };
+        let data = build_brief_data(&pool, &delivery, &gate, now).await;
+        let local_date = now.with_timezone(&Local).format("%Y-%m-%d").to_string();
+        assert_eq!(
+            data.date, local_date,
+            "BriefData.date must be local-tz date"
+        );
+    }
 }

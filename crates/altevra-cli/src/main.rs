@@ -82,6 +82,12 @@ enum Commands {
     #[command(subcommand)]
     Memory(commands::memory::MemoryCommands),
 
+    /// Memory sync hub (R5) — ingest the LOCKED allowlist (CLAUDE.md,
+    /// projects memory, Obsidian Decisions/Learnings/People) + block-level
+    /// write-back into managed ALTEVRA_MANAGED blocks.
+    #[command(subcommand, name = "memory-sync")]
+    MemorySync(commands::memory_sync::MemorySyncCommands),
+
     /// Build a layered system prompt for an agent tool
     #[command(subcommand)]
     Prompt(commands::prompt::PromptCommands),
@@ -93,6 +99,16 @@ enum Commands {
     /// Secrets management (keyring or encrypted file)
     #[command(subcommand)]
     Secrets(commands::secrets::SecretsCommands),
+
+    /// Systemd persistence (R1) — install/status the brain, embedder, and
+    /// backup user units (idempotent; --dry-run prints unit content).
+    #[command(subcommand)]
+    Service(commands::service::ServiceCommands),
+
+    /// Backup automation (R1) — checkpoint + VACUUM INTO snapshot under a held
+    /// maintenance lock, verify, rotate (keep-14); status + off-by-default remote.
+    #[command(subcommand)]
+    Backup(commands::backup::BackupCommands),
 
     /// Project context report
     Context(commands::context::ContextArgs),
@@ -241,9 +257,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config(cmd) => commands::config::run(cmd).await,
         Commands::Llm(cmd) => commands::llm::run(cmd).await,
         Commands::Memory(cmd) => commands::memory::run(cmd).await,
+        Commands::MemorySync(cmd) => commands::memory_sync::run(cmd).await,
         Commands::Prompt(cmd) => commands::prompt::run(cmd).await,
         Commands::Research(cmd) => commands::research::run(cmd).await,
         Commands::Secrets(cmd) => commands::secrets::run(cmd).await,
+        Commands::Service(cmd) => commands::service::run(cmd).await,
+        Commands::Backup(cmd) => commands::backup::run(cmd).await,
         Commands::Context(args) => commands::context::run(args).await,
         Commands::Journal(cmd) => commands::journal::run(cmd).await,
         Commands::Observer(cmd) => commands::observer::run(cmd).await,
