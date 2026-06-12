@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# E1: connector_sync drives the Connector SDK from altevra-adapters.
+altevra-adapters = { workspace = true }
 altevra-core = { workspace = true }
 altevra-db = { workspace = true }
 altevra-llm = { workspace = true }
@@ -35,6 +37,3 @@ hex = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 async-trait = { workspace = true }
-# C8 adversarial vertical-loop test renders a triaged skill into a TempDir to
-# pin the TEMP-DIR-only external-effects boundary; needs the C4 factory.
-altevra-adapters = { workspace = true }

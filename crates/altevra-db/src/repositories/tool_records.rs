@@ -28,6 +28,9 @@ pub const TOOL_KINDS: &[&str] = &[
     "web-service",
     "adb",
     "binary",
+    // E1 (PLAN-EXTEND): an external-tool connector (ICS/IMAP/Linear/Obsidian)
+    // is a tool too — registered with source=manual so it surfaces in `tool list`.
+    "connector",
 ];
 
 /// The allowed verification statuses (honest can/cannot/unverified ladder).

@@ -32,6 +32,18 @@ pub enum EmbedCommands {
     /// (watermark), idempotent (checksum), dry-run by default semantics via
     /// --dry-run.
     Backfill(EmbedBackfillArgs),
+    /// Index-only pass: drain pending_indexing into documents+chunks and the
+    /// embedder_queue WITHOUT computing any vectors (fast, no model). Use
+    /// before `export-chunks` for remote-GPU embedding.
+    Index(EmbedIndexArgs),
+    /// Export pending chunks (embedder_queue) to JSONL for remote-GPU
+    /// embedding. Privacy gate built in: chunks from db://turn/ docs are
+    /// exported ONLY when the turn is redaction=clean and sensitivity is
+    /// public/internal — everything else is held back for local embedding.
+    ExportChunks(EmbedExportArgs),
+    /// Import vectors produced remotely (JSONL: {chunk_id, vector}) through
+    /// the dim-gate (write_vector_guarded) and mark queue rows done.
+    ImportVectors(EmbedImportArgs),
 }
 
 #[derive(Args)]
@@ -76,6 +88,34 @@ pub struct EmbedStatusArgs {
 }
 
 #[derive(Args)]
+pub struct EmbedIndexArgs {
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long, default_value_t = 500)]
+    pub batch_size: usize,
+}
+
+#[derive(Args)]
+pub struct EmbedExportArgs {
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub out: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    pub limit: usize,
+}
+
+#[derive(Args)]
+pub struct EmbedImportArgs {
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub file: PathBuf,
+    #[arg(long, default_value = "bge-m3")]
+    pub model: String,
+}
+
+#[derive(Args)]
 pub struct EmbedBackfillArgs {
     #[arg(long, default_value_os_t = altevra_core::default_db_path())]
     pub db: PathBuf,
@@ -96,7 +136,7 @@ pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
     // Maintenance lock (db unify): the embedder is a batch writer — refuse
     // non-fatally for every write mode; `status` stays read-only and allowed,
     // as does a backfill --dry-run (it only reads and reports).
-    let read_only = matches!(cmd, EmbedCommands::Status(_))
+    let read_only = matches!(cmd, EmbedCommands::Status(_) | EmbedCommands::ExportChunks(_))
         || matches!(&cmd, EmbedCommands::Backfill(a) if a.dry_run);
     if !read_only && crate::commands::brain::refuse_if_maintenance_locked("embedder") {
         return Ok(());
@@ -107,7 +147,139 @@ pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
         EmbedCommands::Run(args) => run_loop(args).await,
         EmbedCommands::Status(args) => run_status(args).await,
         EmbedCommands::Backfill(args) => run_backfill_cmd(args).await,
+        EmbedCommands::Index(args) => run_index_only(args).await,
+        EmbedCommands::ExportChunks(args) => run_export_chunks(args).await,
+        EmbedCommands::ImportVectors(args) => run_import_vectors(args).await,
     }
+}
+
+/// Index-only: chunk pending objects, enqueue embedder_queue, write NO vectors.
+async fn run_index_only(args: EmbedIndexArgs) -> anyhow::Result<()> {
+    let pool = open_pool(&args.db).await?;
+    let cfg = EmbedderWorkerConfig {
+        batch_size: args.batch_size,
+        ..EmbedderWorkerConfig::default()
+    };
+    let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool, cfg);
+    let mut total = 0usize;
+    loop {
+        let n = worker.drain_pending_files().await?;
+        total += n;
+        eprintln!("  indexed {total} object(s)…");
+        if n == 0 {
+            break;
+        }
+    }
+    println!("Index-only pass complete: {total} object(s) chunked + enqueued (no vectors).");
+    Ok(())
+}
+
+/// Export pending embedder_queue chunks to JSONL for remote-GPU embedding.
+/// Privacy gate: db://turn/ chunks only when the turn is clean + ≤ internal.
+async fn run_export_chunks(args: EmbedExportArgs) -> anyhow::Result<()> {
+    use sqlx::Row;
+    let pool = open_pool(&args.db).await?;
+    let limit = if args.limit == 0 { i64::MAX } else { args.limit as i64 };
+    let rows = sqlx::query(
+        r#"SELECT q.chunk_id, c.text, d.source_path,
+                  t.sensitivity AS turn_sensitivity,
+                  t.redaction_status AS turn_redaction
+           FROM embedder_queue q
+           JOIN memory_chunks c ON c.id = q.chunk_id
+           JOIN memory_documents d ON d.id = c.document_id
+           LEFT JOIN turns t
+             ON d.source_path = 'db://turn/' || t.id
+           WHERE q.status = 'pending'
+           ORDER BY q.enqueued_at
+           LIMIT ?"#,
+    )
+    .bind(limit)
+    .fetch_all(&pool)
+    .await?;
+
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&args.out)?);
+    use std::io::Write;
+    let (mut exported, mut held) = (0u64, 0u64);
+    for r in rows {
+        let source: String = r.get("source_path");
+        if source.starts_with("db://turn/") {
+            let sens: Option<String> = r.get("turn_sensitivity");
+            let red: Option<String> = r.get("turn_redaction");
+            let ok = matches!(red.as_deref(), Some("clean"))
+                && matches!(sens.as_deref(), Some("public") | Some("internal"));
+            if !ok {
+                held += 1;
+                continue;
+            }
+        }
+        let chunk_id: String = r.get("chunk_id");
+        let text: String = r.get("text");
+        writeln!(
+            out,
+            "{}",
+            serde_json::json!({ "chunk_id": chunk_id, "text": text })
+        )?;
+        exported += 1;
+    }
+    out.flush()?;
+    println!(
+        "Exported {exported} chunk(s) to {} — {held} held back (locked turns stay local).",
+        args.out.display()
+    );
+    Ok(())
+}
+
+/// Import remotely-computed vectors through the dim-gate; mark queue done.
+async fn run_import_vectors(args: EmbedImportArgs) -> anyhow::Result<()> {
+    let pool = open_pool(&args.db).await?;
+    let f = std::fs::File::open(&args.file)?;
+    let reader = std::io::BufReader::new(f);
+    use std::io::BufRead;
+    let (mut ok, mut failed) = (0u64, 0u64);
+    let mut registered = false;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&line)?;
+        let chunk_id_s = v["chunk_id"].as_str().unwrap_or_default().to_string();
+        let Ok(chunk_id) = uuid::Uuid::parse_str(&chunk_id_s) else {
+            failed += 1;
+            continue;
+        };
+        let vector: Vec<f32> = v["vector"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect())
+            .unwrap_or_default();
+        if vector.is_empty() {
+            failed += 1;
+            continue;
+        }
+        if !registered {
+            altevra_memory::register_model_dim(&pool, &args.model, vector.len()).await?;
+            registered = true;
+        }
+        match altevra_memory::write_vector_guarded(&pool, chunk_id, &args.model, &vector).await {
+            Ok(()) => {
+                sqlx::query(
+                    r#"UPDATE embedder_queue
+                       SET status='done', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                       WHERE chunk_id = ?"#,
+                )
+                .bind(&chunk_id_s)
+                .execute(&pool)
+                .await?;
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("  chunk {chunk_id_s}: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("Imported {ok} vector(s) ({failed} failed) — model '{}' via dim-gate.", args.model);
+    Ok(())
 }
 
 /// The model name the watermark is keyed by — must match what the worker

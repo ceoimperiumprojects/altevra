@@ -6,6 +6,7 @@ pub mod registry;
 pub mod renderer;
 pub mod skill_edits;
 pub mod sync;
+pub mod unified_diff;
 pub mod version;
 pub mod watcher;
 
@@ -23,5 +24,6 @@ pub use skill_edits::{
     EditOutcome, SkillEdit, SkippedEdit, DEFAULT_EDIT_BUDGET, SLOW_UPDATE_END, SLOW_UPDATE_START,
 };
 pub use sync::{apply_plan, build_plan, SkipReason, SyncAction, SyncPlan, SyncResult};
+pub use unified_diff::{apply_unified_diff, validate_unified_diff, DiffError};
 pub use version::SkillVersion;
 pub use watcher::{run_one_cycle, watch_loop, CycleReport, WatchConfig};

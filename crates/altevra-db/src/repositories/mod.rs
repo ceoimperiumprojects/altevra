@@ -1,6 +1,7 @@
 pub mod block_writes;
 pub mod capability;
 pub mod cursor_edits;
+pub mod db_size_history;
 pub mod domain_policy;
 pub mod events;
 pub mod exposure;
@@ -31,6 +32,7 @@ pub use capability::{
 };
 pub use block_writes::{BlockWriteRow, BlockWritesRepository};
 pub use cursor_edits::{CursorEditRow, CursorEditsRepository};
+pub use db_size_history::{DbSizeHistoryRepository, DbSizeRow, MAX_SNAPSHOTS as DB_SIZE_MAX_SNAPSHOTS};
 pub use domain_policy::{CloudSync, DomainPolicyRepository, DomainPolicyRow, EmbeddingModelRole};
 pub use events::EventsRepository;
 pub use exposure::{ExposureAudit, ExposureDecisionsRepository};

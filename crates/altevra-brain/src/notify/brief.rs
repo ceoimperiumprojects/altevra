@@ -23,6 +23,8 @@ use super::types::{
 #[derive(Debug, Default)]
 pub struct BriefData {
     pub date: String,
+    /// E1 — today/tomorrow calendar events pulled by the ICS connector.
+    pub calendar: Vec<String>,
     pub what_changed: Vec<String>,
     pub what_matters: Vec<String>,
     pub decisions: Vec<String>,
@@ -38,7 +40,8 @@ pub struct BriefData {
 
 impl BriefData {
     fn signal_count(&self) -> usize {
-        self.what_changed.len()
+        self.calendar.len()
+            + self.what_changed.len()
             + self.what_matters.len()
             + self.decisions.len()
             + self.tasks.len()
@@ -128,6 +131,10 @@ pub async fn build_brief_data(
     // interest removed since fetch stops surfacing immediately).
     data.research = research_lines(pool, gate, 5).await;
 
+    // E1 — Calendar: today/tomorrow events the ICS connector pulled (sourced
+    // from connector_synced events whose entity_type = calendar_event).
+    data.calendar = calendar_lines(pool, now).await;
+
     // Suggested Focus — deterministic top-3 derived from the sections.
     if let Some(d) = data.decisions.first() {
         data.focus.push(format!("re-check: {d}"));
@@ -197,6 +204,49 @@ async fn research_lines(pool: &SqlitePool, gate: &RelevanceGate, limit: i64) -> 
         .take(limit as usize)
         .map(|(title, link, _, _)| format!("{title} — {link}"))
         .collect()
+}
+
+/// E1: Calendar — today/tomorrow events the ICS connector ingested. Sourced
+/// from `events` rows (event_type = connector_synced, entity_type =
+/// calendar_event); the source START time lives in the JSON payload `ts`. Only
+/// events whose start date is today or tomorrow (relative to `now`) are shown,
+/// sorted chronologically. Fail-soft: DB/parse errors → empty.
+async fn calendar_lines(pool: &SqlitePool, now: DateTime<Utc>) -> Vec<String> {
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT title, payload FROM events \
+         WHERE event_type = 'connector_synced' AND entity_type = 'calendar_event' \
+         ORDER BY created_at DESC LIMIT 200",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let today = now.date_naive();
+    let tomorrow = today.succ_opt().unwrap_or(today);
+    let mut dated: Vec<(DateTime<Utc>, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (title, payload) in rows {
+        let ts = payload
+            .as_deref()
+            .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+            .and_then(|v| v.get("ts").and_then(|t| t.as_str().map(String::from)))
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc));
+        let Some(start) = ts else { continue };
+        let d = start.date_naive();
+        if d != today && d != tomorrow {
+            continue;
+        }
+        // dedup by title+time (re-sync writes a fresh event row each pass).
+        let key = format!("{}-{title}", start.to_rfc3339());
+        if !seen.insert(key) {
+            continue;
+        }
+        let label = if d == today { "today" } else { "tomorrow" };
+        dated.push((start, format!("{} {} — {title}", label, start.format("%H:%M"))));
+    }
+    dated.sort_by_key(|(t, _)| *t);
+    dated.into_iter().map(|(_, l)| l).collect()
 }
 
 /// R6: What-Changed supplement — recent sessions (last 3 days) and
@@ -339,6 +389,11 @@ pub fn render_brief(data: &BriefData, private: bool) -> String {
         }
     };
 
+    // E1 — Calendar section, rendered ONLY when there are events today/tomorrow
+    // (the other sections render even when empty; Calendar is additive signal).
+    if !data.calendar.is_empty() {
+        section("Calendar", &data.calendar);
+    }
     section("What Changed", &data.what_changed);
     section("What Matters", &data.what_matters);
     section("Decisions", &data.decisions);
@@ -567,5 +622,67 @@ mod tests {
             data.date, local_date,
             "BriefData.date must be local-tz date"
         );
+    }
+
+    /// E1 fixture test: an ICS event ingested through the connector path feeds a
+    /// Calendar section in the brief. Drives the REAL ingest + the REAL
+    /// `calendar_lines` query — no hand-inserted events.
+    #[tokio::test]
+    async fn brief_calendar_section_from_ingested_ics() {
+        use altevra_adapters::connectors::{ingest_items, IcsConnector, Connector, ConnectorCtx};
+        use altevra_adapters::connectors::config::ConnectorConfig;
+        use chrono::TimeZone;
+        use std::collections::BTreeMap;
+
+        let tmp = TempDir::new().unwrap();
+        let pool = setup_pool(&tmp).await;
+        let now = Utc.with_ymd_and_hms(2026, 6, 12, 12, 0, 0).unwrap();
+
+        // A real ICS file with a today event + a far-future event.
+        let ics = tmp.path().join("cal.ics");
+        std::fs::write(
+            &ics,
+            "BEGIN:VEVENT\r\nUID:e-today\r\nSUMMARY:Investor call\r\nDTSTART:20260612T150000Z\r\nEND:VEVENT\r\n\
+             BEGIN:VEVENT\r\nUID:e-far\r\nSUMMARY:Later\r\nDTSTART:20270101T100000Z\r\nEND:VEVENT\r\n",
+        )
+        .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("path".to_string(), ics.to_str().unwrap().to_string());
+        let ctx = ConnectorCtx {
+            config: ConnectorConfig {
+                enabled: true,
+                auth_secret: String::new(),
+                cadence_minutes: 60,
+                domain: None,
+                params,
+            },
+            auth_value: None,
+            now,
+        };
+        let items = IcsConnector::new().pull(&ctx).unwrap();
+        ingest_items(&pool, "ics", &items).await.unwrap();
+
+        let gate = RelevanceGate::default();
+        let delivery = super::Delivery {
+            obsidian: vec![],
+            obsidian_blocked: vec![],
+            ..Default::default()
+        };
+        let data = build_brief_data(&pool, &delivery, &gate, now).await;
+        assert!(
+            data.calendar.iter().any(|l| l.contains("Investor call")),
+            "today's event must appear in calendar: {:?}",
+            data.calendar
+        );
+        assert!(
+            !data.calendar.iter().any(|l| l.contains("Later")),
+            "far-future event must NOT appear: {:?}",
+            data.calendar
+        );
+
+        let rendered = render_brief(&data, false);
+        assert!(rendered.contains("## Calendar"), "Calendar section must render:\n{rendered}");
+        assert!(rendered.contains("Investor call"));
     }
 }

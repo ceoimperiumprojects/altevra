@@ -10,6 +10,7 @@ pub mod capture;
 pub mod capture_watch;
 pub mod config;
 pub mod connect;
+pub mod connector;
 pub mod context;
 pub mod control;
 pub mod cursor;

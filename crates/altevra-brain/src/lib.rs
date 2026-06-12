@@ -16,11 +16,13 @@
 //! fire when the wall clock crosses the scheduled boundary.
 
 pub mod backfill;
+pub mod connector_sync;
 pub mod curator;
 pub mod jobs;
 pub mod lifecycle;
 pub mod notify;
 pub mod observer_detectors;
+pub mod prompt_tweak;
 pub mod resident;
 pub mod routing;
 pub mod scheduler;
@@ -28,11 +30,19 @@ pub mod selfimprove;
 pub mod skill_judge;
 
 pub use backfill::{run_observer_backfill, BackfillReport, BACKFILL_SOURCE};
+pub use connector_sync::{
+    register_connectors_as_tools, run_connector_sync_at, ConnectorSyncReport, ConnectorSyncResult,
+};
 pub use curator::{curator_digest_line, curate, run_curator, CuratorReport};
 pub use jobs::{all_kinds, load_relevance_gate, run_all, JobKind, JobResult};
 pub use lifecycle::{
     lifecycle_archive, lifecycle_sweep, LifecycleArchiveReport, LifecycleReport,
     CONTEXT_PACKET_RETENTION_DAYS, PENDING_DELETE_MARKER,
+};
+pub use prompt_tweak::{
+    apply_prompt_tweak, detect_low_quality_modes, parse_tweak_body, propose_prompt_tweak,
+    record_rejected, ApplyTweakOutcome, ProposeOutcome, PromptTweakBody, PROMPT_TWEAK_KIND,
+    PROMPT_TWEAK_MARKER,
 };
 pub use resident::{parse_role, ResidentRunReport, ResidentRunner};
 pub use routing::role_for_object;

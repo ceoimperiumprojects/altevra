@@ -59,6 +59,7 @@ pub async fn run(args: DoctorArgs) -> anyhow::Result<()> {
     // Environment-level checks (read $HOME) that live outside the hermetic set.
     checks.push(check_spool_empty());
     checks.push(check_embedding_lag_db());
+    checks.push(check_db_size_trend(&home.join(".altevra/altevra.db")));
 
     let ok = checks
         .iter()
@@ -578,6 +579,110 @@ fn check_embedding_lag_db() -> DoctorCheck {
     }
 }
 
+/// E2: DB-size trend. Reads the two most-recent `db_size_history` snapshots
+/// (written by the weekly `db_optimize` job) and reports the growth between
+/// them. Raw turns are canonical and never deleted, so SOME growth is normal —
+/// this flags ANOMALOUS growth (a snapshot that more than doubled, suggesting a
+/// runaway table) and surfaces if the retention/maintenance job hasn't run.
+///
+/// Path-injectable so it can be tested against a fixture DB.
+fn check_db_size_trend(db_path: &Path) -> DoctorCheck {
+    const NAME: &str = "db_size_trend";
+    if !db_path.exists() {
+        return DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Ok,
+            message: "DB not yet created — no size history".into(),
+            fix_hint: None,
+        };
+    }
+    let conn = match rusqlite::Connection::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return DoctorCheck {
+                name: NAME.into(),
+                status: CheckStatus::Warn,
+                message: format!("Could not open DB for size trend: {e}"),
+                fix_hint: None,
+            };
+        }
+    };
+
+    // (size_bytes, freed_bytes, jobs_in_window) newest first. A missing table /
+    // empty history is informational, not a failure.
+    let mut snapshots: Vec<(i64, i64, i64)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT size_bytes, freed_bytes, jobs_in_window FROM db_size_history ORDER BY ts DESC LIMIT 2",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+            for row in rows.flatten() {
+                snapshots.push(row);
+            }
+        }
+    }
+
+    if snapshots.is_empty() {
+        return DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Ok,
+            message: "No db_optimize snapshots yet — trend builds after the weekly job runs".into(),
+            fix_hint: Some("Run: altevra brain run --job db_optimize".into()),
+        };
+    }
+
+    let (latest_size, latest_freed, jobs_in_window) = snapshots[0];
+    let mb = latest_size as f64 / 1_048_576.0;
+
+    // Liveness: the maintenance job ran (we have a snapshot), but if NO other
+    // brain jobs ran in the trailing window the scheduler may be wedged.
+    if jobs_in_window <= 1 {
+        return DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Warn,
+            message: format!(
+                "DB {mb:.1} MB; only {jobs_in_window} brain job(s) ran in the trailing window — \
+                 retention jobs may not be running"
+            ),
+            fix_hint: Some("Check: altevra service status / altevra brain status".into()),
+        };
+    }
+
+    if snapshots.len() < 2 {
+        return DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Ok,
+            message: format!("DB {mb:.1} MB; reclaimed {latest_freed} bytes last run (one snapshot — trend pending)"),
+            fix_hint: None,
+        };
+    }
+
+    let prev_size = snapshots[1].0;
+    let growth = latest_size - prev_size;
+    let growth_mb = growth as f64 / 1_048_576.0;
+    // Anomalous = more than doubled since the previous weekly snapshot AND grew
+    // by a non-trivial amount (ignore noise on a tiny DB).
+    let doubled = prev_size > 0 && latest_size > prev_size.saturating_mul(2);
+    if doubled && growth > 50 * 1_048_576 {
+        DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Warn,
+            message: format!(
+                "DB {mb:.1} MB grew {growth_mb:+.1} MB (>2x) since last snapshot — investigate a runaway table"
+            ),
+            fix_hint: Some("Inspect table sizes; raw turns are expected to grow but not double weekly".into()),
+        }
+    } else {
+        DoctorCheck {
+            name: NAME.into(),
+            status: CheckStatus::Ok,
+            message: format!(
+                "DB {mb:.1} MB ({growth_mb:+.1} MB since last snapshot); reclaimed {latest_freed} bytes last run"
+            ),
+            fix_hint: None,
+        }
+    }
+}
+
 /// R6: Count unimported AI session files.
 /// Counts `*.jsonl` files under `claude_projects_dir/**` and checks if
 /// `codex_history_file` exists (as a simple presence hint).
@@ -975,5 +1080,83 @@ mod tests {
             "uninstalled skill must be Warn, got: {:?}",
             result.message
         );
+    }
+
+    // ---- E2: DB-size-trend check -------------------------------------------
+
+    /// Build a fixture DB with the `db_size_history` + `brain_jobs` tables and
+    /// the given history rows (size_bytes, freed_bytes, jobs_in_window), oldest
+    /// first (so the LAST tuple is the newest snapshot).
+    fn fixture_size_db(tmp: &TempDir, rows: &[(i64, i64, i64)]) -> std::path::PathBuf {
+        let db = tmp.path().join("altevra.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE db_size_history (id TEXT PRIMARY KEY, size_bytes INTEGER, \
+             freed_bytes INTEGER, jobs_in_window INTEGER, ts TEXT);",
+        )
+        .unwrap();
+        for (i, (size, freed, jobs)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO db_size_history (id, size_bytes, freed_bytes, jobs_in_window, ts) \
+                 VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    format!("id{i}"),
+                    size,
+                    freed,
+                    jobs,
+                    // monotonically increasing ts so ORDER BY ts DESC picks the last row.
+                    format!("2026-06-{:02}T00:00:00.000Z", 10 + i)
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn db_size_trend_no_db_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let r = check_db_size_trend(&tmp.path().join("nope.db"));
+        assert!(matches!(r.status, CheckStatus::Ok));
+        assert_eq!(r.name, "db_size_trend");
+    }
+
+    #[test]
+    fn db_size_trend_empty_history_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        let db = fixture_size_db(&tmp, &[]);
+        let r = check_db_size_trend(&db);
+        assert!(matches!(r.status, CheckStatus::Ok), "{:?}", r.message);
+        assert!(r.message.contains("No db_optimize snapshots"));
+    }
+
+    #[test]
+    fn db_size_trend_normal_growth_is_ok() {
+        let tmp = TempDir::new().unwrap();
+        // Two snapshots, modest growth, healthy job count → Ok.
+        let db = fixture_size_db(&tmp, &[(100 * 1_048_576, 0, 20), (110 * 1_048_576, 1024, 25)]);
+        let r = check_db_size_trend(&db);
+        assert!(matches!(r.status, CheckStatus::Ok), "{:?}", r.message);
+        assert!(r.message.contains("MB"));
+    }
+
+    #[test]
+    fn db_size_trend_anomalous_doubling_warns() {
+        let tmp = TempDir::new().unwrap();
+        // Newest snapshot more than doubled AND grew > 50 MB → Warn.
+        let db = fixture_size_db(&tmp, &[(100 * 1_048_576, 0, 20), (300 * 1_048_576, 0, 25)]);
+        let r = check_db_size_trend(&db);
+        assert!(matches!(r.status, CheckStatus::Warn), "{:?}", r.message);
+        assert!(r.message.contains(">2x"));
+    }
+
+    #[test]
+    fn db_size_trend_wedged_scheduler_warns() {
+        let tmp = TempDir::new().unwrap();
+        // A snapshot exists but only 1 job ran in the window → retention liveness Warn.
+        let db = fixture_size_db(&tmp, &[(50 * 1_048_576, 0, 1)]);
+        let r = check_db_size_trend(&db);
+        assert!(matches!(r.status, CheckStatus::Warn), "{:?}", r.message);
+        assert!(r.message.contains("retention jobs may not be running"));
     }
 }

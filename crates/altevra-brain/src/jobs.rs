@@ -40,6 +40,19 @@ pub enum JobKind {
     /// proposals routed to the REVIEW QUEUE — never auto-published. See
     /// [`crate::skill_judge`].
     SkillReactionJudge,
+    /// E2 — weekly self-cleaning maintenance. `PRAGMA optimize` +
+    /// `PRAGMA incremental_vacuum` + a DB-size snapshot for the doctor's
+    /// size-trend check + a retention-job liveness count. RAW TURNS ARE NEVER
+    /// DELETED (the raw trace is canonical — doctrine); this only reclaims free
+    /// pages the lifecycle archiver / retention sweeps already freed. See
+    /// [`run_db_optimize`].
+    DbOptimize,
+    /// E1 (PLAN-EXTEND) — Connector SDK sync. Pulls each ENABLED connector from
+    /// `~/.altevra/connectors.toml` through the full safety stack (guard →
+    /// domain floor → persist into events + object_index). A failing connector
+    /// goes health-red but never blocks other connectors or jobs. See
+    /// [`crate::connector_sync`].
+    ConnectorSync,
 }
 
 impl JobKind {
@@ -60,6 +73,8 @@ impl JobKind {
             Self::Curator => "curator",
             Self::LifecycleArchiver => "lifecycle_archiver",
             Self::SkillReactionJudge => "skill_reaction_judge",
+            Self::DbOptimize => "db_optimize",
+            Self::ConnectorSync => "connector_sync",
         }
     }
 
@@ -80,6 +95,8 @@ impl JobKind {
             "curator" => Self::Curator,
             "lifecycle_archiver" => Self::LifecycleArchiver,
             "skill_reaction_judge" => Self::SkillReactionJudge,
+            "db_optimize" => Self::DbOptimize,
+            "connector_sync" => Self::ConnectorSync,
             _ => return None,
         })
     }
@@ -115,6 +132,15 @@ impl JobKind {
             // only fires on anchor-flagged windows, never per session). 15 min
             // keeps the failure→proposal latency low without burning ticks.
             Self::SkillReactionJudge => 900,
+            // E2: weekly. PRAGMA optimize + incremental_vacuum are cheap but
+            // pointless to run more than ~weekly — free pages accumulate slowly
+            // and the size snapshot is a trend, not a real-time gauge.
+            Self::DbOptimize => 7 * 24 * 60 * 60,
+            // E1: the per-connector cadence lives in connectors.toml; this is
+            // the SCHEDULER backstop tick (15 min) — `run_connector_sync` itself
+            // only pulls connectors whose own cadence has elapsed. Cheap when
+            // everything is disabled (the common default).
+            Self::ConnectorSync => 900,
         }
     }
 }
@@ -1325,7 +1351,98 @@ pub async fn dispatch(
         JobKind::Curator => crate::curator::run_curator(pool, ctx).await,
         JobKind::LifecycleArchiver => run_lifecycle_archiver(pool, ctx).await,
         JobKind::SkillReactionJudge => run_skill_reaction_judge(pool, ctx).await,
+        JobKind::DbOptimize => run_db_optimize(pool, ctx).await,
+        JobKind::ConnectorSync => run_connector_sync(pool, ctx).await,
     }
+}
+
+/// E1 (PLAN-EXTEND) — brain-job wrapper around [`crate::connector_sync`]. Reads
+/// the connectors config from `ALTEVRA_CONNECTORS_PATH` or the default home
+/// path, syncs every ENABLED connector through the full safety stack, and
+/// projects the report onto a one-line `JobResult`. Never blocks other jobs: a
+/// connector error becomes red health, not a job failure.
+pub async fn run_connector_sync(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    let cfg_path = altevra_adapters::connectors::ConnectorsConfig::default_path();
+    let report =
+        crate::connector_sync::run_connector_sync_at(pool, &cfg_path, ctx.now, None, false).await?;
+    Ok(JobResult {
+        summary: report.summary(),
+        items_processed: report.total_persisted(),
+    })
+}
+
+/// E2 — weekly self-cleaning maintenance job.
+///
+/// Runs `PRAGMA optimize` (refreshes query-planner stats) + `PRAGMA
+/// incremental_vacuum` (reclaims free pages the lifecycle archiver / retention
+/// sweeps already freed — NEVER deletes content; raw turns are canonical), then
+/// snapshots the DB file size + a retention-job liveness count into
+/// `db_size_history` for the doctor's size-trend check.
+///
+/// All steps are best-effort: a PRAGMA that the SQLite build does not support
+/// (e.g. incremental_vacuum when auto_vacuum is OFF) is a no-op, not a failure —
+/// the job still records its snapshot so the trend line stays continuous.
+pub async fn run_db_optimize(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_db::DbSizeHistoryRepository;
+
+    // Free-page count BEFORE the vacuum (in pages); used to estimate freed bytes.
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(4096);
+    let free_before: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+    // PRAGMA optimize — refreshes planner stats. Cheap, always safe.
+    let _ = sqlx::query("PRAGMA optimize").execute(pool).await;
+
+    // PRAGMA incremental_vacuum — reclaims free pages WITHOUT rewriting the whole
+    // DB (only effective when auto_vacuum=INCREMENTAL; otherwise a harmless no-op).
+    let _ = sqlx::query("PRAGMA incremental_vacuum").execute(pool).await;
+
+    let free_after: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(free_before);
+    let freed_bytes = (free_before - free_after).max(0) * page_size;
+
+    // On-disk size = page_count * page_size (works for in-memory + file DBs).
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    let size_bytes = page_count * page_size;
+
+    // Retention-job liveness: how many brain_jobs ran in the trailing 8 days
+    // (one weekly cadence + slack). A zero here while this job runs would mean
+    // the scheduler is wedged — surfaced by the doctor.
+    let since = (ctx.now - chrono::Duration::days(8))
+        .format("%Y-%m-%dT%H:%M:%fZ")
+        .to_string();
+    let jobs_in_window: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM brain_jobs WHERE started_at >= ?")
+            .bind(&since)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+
+    DbSizeHistoryRepository::new(pool)
+        .record(size_bytes, freed_bytes, jobs_in_window)
+        .await?;
+
+    Ok(JobResult {
+        summary: format!(
+            "db_optimize: {size_bytes} bytes ({:.1} MB), reclaimed {freed_bytes} bytes, \
+             {jobs_in_window} job(s) in trailing window",
+            size_bytes as f64 / 1_048_576.0
+        ),
+        items_processed: 1,
+    })
 }
 
 /// P3c — brain-job wrapper around [`crate::skill_judge::drain_skill_reactions`].
@@ -1390,7 +1507,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 15] {
+pub fn all_kinds() -> [JobKind; 17] {
     [
         JobKind::EventClassifier,
         JobKind::ObserverScan,
@@ -1407,6 +1524,8 @@ pub fn all_kinds() -> [JobKind; 15] {
         JobKind::Curator,
         JobKind::LifecycleArchiver,
         JobKind::SkillReactionJudge,
+        JobKind::DbOptimize,
+        JobKind::ConnectorSync,
     ]
 }
 
@@ -1743,8 +1862,11 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let _env = hermetic_brief_env(&tmp);
         let pool = migrated_pool().await;
-        // Fixed clock so the date math is deterministic.
-        let now: chrono::DateTime<Utc> = "2026-06-03T23:30:00Z".parse().unwrap();
+        // Seed relative to real now: the recurring-drift detector uses a
+        // real-time DRIFT_WINDOW_DAYS window (recent-flapping semantics), so a
+        // hardcoded past date silently falls out of the window once wall-clock
+        // moves on. now-relative keeps the test deterministic across any date.
+        let now: chrono::DateTime<Utc> = Utc::now();
 
         // 1. Seed events that trip a detector: 3 SkillDriftDetected for one slug in
         //    the last week → a RecurringDrift insight.
@@ -1817,7 +1939,10 @@ mod tests {
         let r = run_daily_summary(&pool, &ctx).await.unwrap();
         assert_eq!(r.items_processed, 1);
 
-        let file = tmp.path().join("10-insights").join("daily-2026-06-03.md");
+        let file = tmp
+            .path()
+            .join("10-insights")
+            .join(format!("daily-{}.md", now.format("%Y-%m-%d")));
         let content = std::fs::read_to_string(&file).unwrap();
 
         // a pattern line...
@@ -1851,7 +1976,10 @@ mod tests {
 
         // P4 integration: the daily job also delivers the policy-gated brief
         // into <vault>/Daily/ — and it carries no person name either.
-        let brief = tmp.path().join("Daily").join("2026-06-03-altevra-brief.md");
+        let brief = tmp
+            .path()
+            .join("Daily")
+            .join(format!("{}-altevra-brief.md", now.format("%Y-%m-%d")));
         assert!(brief.exists(), "daily job must write the P4 brief");
         let brief_md = std::fs::read_to_string(&brief).unwrap();
         assert!(brief_md.contains("kind: altevra-daily-brief"));

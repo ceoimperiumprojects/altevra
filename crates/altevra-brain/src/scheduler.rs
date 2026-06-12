@@ -315,6 +315,12 @@ mod tests {
                 // for the same reason as the curator. Tested directly in
                 // `crate::lifecycle::tests`.
                 "lifecycle_archiver".into(),
+                // E2 db_optimize + E1 connector_sync both need the full schema
+                // (and connector_sync would otherwise read the real
+                // ~/.altevra/connectors.toml) — opted out of the minimal-schema
+                // scheduler smoke. Tested directly in their own modules.
+                "db_optimize".into(),
+                "connector_sync".into(),
             ],
             ..BrainConfig::default()
         };
@@ -349,6 +355,12 @@ mod tests {
                 // for the same reason as the curator. Tested directly in
                 // `crate::lifecycle::tests`.
                 "lifecycle_archiver".into(),
+                // E2 db_optimize + E1 connector_sync both need the full schema
+                // (and connector_sync would otherwise read the real
+                // ~/.altevra/connectors.toml) — opted out of the minimal-schema
+                // scheduler smoke. Tested directly in their own modules.
+                "db_optimize".into(),
+                "connector_sync".into(),
             ],
             ..BrainConfig::default()
         };
@@ -385,6 +397,8 @@ mod tests {
                 "curator".into(),
                 "lifecycle_archiver".into(),
                 "skill_reaction_judge".into(),
+                "db_optimize".into(),
+                "connector_sync".into(),
             ],
             ..BrainConfig::default()
         };

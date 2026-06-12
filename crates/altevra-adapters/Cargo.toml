@@ -18,9 +18,12 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 toml_edit = { workspace = true }
+toml = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
+# E1 connectors: ICS URL fetch (blocking — pull() is sync), Linear GraphQL.
+reqwest = { workspace = true, features = ["blocking"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

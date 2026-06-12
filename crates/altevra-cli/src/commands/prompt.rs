@@ -16,6 +16,93 @@ pub enum PromptCommands {
     /// non-interactive caller is refused. Constitutional-locked slugs (safety,
     /// altevra_rules) are refused by the registry (SI-2).
     Rollback(PromptRollbackArgs),
+    /// E2 — review queue for Altevra's self-proposed resident-mode prompt
+    /// tweaks. `list`/`show` inspect; `approve` applies the carried unified diff
+    /// to the managed region of the mode prompt file via the guarded block
+    /// writer (human presence required); `reject` records the fingerprint so the
+    /// same tweak is never re-proposed.
+    #[command(subcommand)]
+    Tweaks(TweakCommands),
+}
+
+#[derive(Subcommand)]
+pub enum TweakCommands {
+    /// List open `prompt_tweak` proposals (defaults to status=proposed).
+    List(TweakListArgs),
+    /// Show one prompt_tweak proposal in full (mode, target file, diff, reason).
+    Show(TweakShowArgs),
+    /// Approve a prompt_tweak: apply its diff to the managed region of the mode
+    /// prompt file (guarded write: backup + manifest + drift-refuse). Requires
+    /// human presence — an agent caller is refused.
+    Propose(TweakProposeArgs),
+    /// Manually propose a prompt tweak from a diff file (the explicit entry path).
+    Approve(TweakApproveArgs),
+    /// Reject a prompt_tweak with a reason; records the fingerprint so the same
+    /// (mode, diff) is never re-proposed.
+    Reject(TweakRejectArgs),
+}
+
+#[derive(Args)]
+pub struct TweakListArgs {
+    /// Filter by status (proposed|triaged|approved|applied|rejected). Default: proposed.
+    #[arg(long, default_value = "proposed")]
+    pub status: String,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TweakShowArgs {
+    /// Proposal id.
+    pub id: String,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TweakProposeArgs {
+    /// Resident mode being tweaked (e.g. observer, memory_curator).
+    #[arg(long)]
+    pub mode: String,
+    /// Path to the mode prompt file the diff applies to.
+    #[arg(long)]
+    pub file: PathBuf,
+    /// Path to a file containing the UNIFIED DIFF body.
+    #[arg(long)]
+    pub diff: PathBuf,
+    /// Why this tweak is being proposed.
+    #[arg(long)]
+    pub reason: String,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args)]
+pub struct TweakApproveArgs {
+    /// Proposal id to approve + apply.
+    pub id: String,
+    /// Plan only — do not write the file (still requires presence to run).
+    #[arg(long)]
+    pub dry_run: bool,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+}
+
+#[derive(Args)]
+pub struct TweakRejectArgs {
+    /// Proposal id to reject.
+    pub id: String,
+    /// Reason for the rejection (recorded in the reject memory).
+    #[arg(long, default_value = "rejected by Pavle")]
+    pub reason: String,
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
 }
 
 #[derive(Args)]
@@ -70,7 +157,235 @@ pub async fn run(cmd: PromptCommands) -> anyhow::Result<()> {
     match cmd {
         PromptCommands::Build(args) => run_build(args).await,
         PromptCommands::Rollback(args) => run_rollback(args).await,
+        PromptCommands::Tweaks(cmd) => run_tweaks(cmd).await,
     }
+}
+
+// ---------------------------------------------------------------------------
+// E2 — prompt tweak review queue.
+// ---------------------------------------------------------------------------
+
+async fn run_tweaks(cmd: TweakCommands) -> anyhow::Result<()> {
+    match cmd {
+        TweakCommands::List(args) => run_tweaks_list(args).await,
+        TweakCommands::Show(args) => run_tweaks_show(args).await,
+        TweakCommands::Propose(args) => run_tweaks_propose(args).await,
+        TweakCommands::Approve(args) => run_tweaks_approve(args).await,
+        TweakCommands::Reject(args) => run_tweaks_reject(args).await,
+    }
+}
+
+async fn run_tweaks_list(args: TweakListArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let rows = altevra_db::ProposalsRepository::new(&pool)
+        .list(Some(&args.status), Some(altevra_brain::PROMPT_TWEAK_KIND))
+        .await?;
+
+    if args.json {
+        let items: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                let body = altevra_brain::parse_tweak_body(r).ok();
+                serde_json::json!({
+                    "id": r.id,
+                    "status": r.status,
+                    "title": r.title,
+                    "mode": body.as_ref().map(|b| b.mode.clone()),
+                    "target_file": body.as_ref().map(|b| b.target_file.clone()),
+                    "evidence_count": r.evidence_count,
+                    "created_at": r.created_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+    } else if rows.is_empty() {
+        println!("No prompt tweaks with status '{}'.", args.status);
+    } else {
+        println!("Prompt tweaks ({}):", args.status);
+        for r in &rows {
+            let mode = altevra_brain::parse_tweak_body(r)
+                .map(|b| b.mode)
+                .unwrap_or_else(|_| "?".into());
+            println!("  {} | mode={} | x{} | {}", r.id, mode, r.evidence_count, r.created_at);
+        }
+    }
+    Ok(())
+}
+
+async fn run_tweaks_show(args: TweakShowArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let row = altevra_db::ProposalsRepository::new(&pool)
+        .get(&args.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("prompt tweak '{}' not found", args.id))?;
+    if row.kind != altevra_brain::PROMPT_TWEAK_KIND {
+        anyhow::bail!("proposal '{}' is not a prompt_tweak (kind={})", args.id, row.kind);
+    }
+    let body = altevra_brain::parse_tweak_body(&row)?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "id": row.id,
+                "status": row.status,
+                "kind": row.kind,
+                "mode": body.mode,
+                "target_file": body.target_file,
+                "reason": body.reason,
+                "fingerprint": body.fingerprint,
+                "diff": body.diff,
+                "created_at": row.created_at,
+            }))?
+        );
+    } else {
+        println!("Prompt tweak {} [{}]", row.id, row.status);
+        println!("  mode:        {}", body.mode);
+        println!("  target_file: {}", body.target_file);
+        println!("  reason:      {}", body.reason);
+        println!("  fingerprint: {}", body.fingerprint);
+        println!("  --- diff ---");
+        for line in body.diff.lines() {
+            println!("  {line}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_tweaks_propose(args: TweakProposeArgs) -> anyhow::Result<()> {
+    let diff = std::fs::read_to_string(&args.diff)
+        .map_err(|e| anyhow::anyhow!("read diff file {}: {e}", args.diff.display()))?;
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+
+    let outcome =
+        altevra_brain::propose_prompt_tweak(&pool, &args.mode, &args.file, &diff, &args.reason)
+            .await?;
+
+    let (status, id): (&str, Option<String>) = match &outcome {
+        altevra_brain::ProposeOutcome::Proposed(id) => ("proposed", Some(id.clone())),
+        altevra_brain::ProposeOutcome::AlreadyProposed(id) => ("already_proposed", Some(id.clone())),
+        altevra_brain::ProposeOutcome::RefusedRejected => ("refused_previously_rejected", None),
+        altevra_brain::ProposeOutcome::RefusedInvalidDiff(_) => ("refused_invalid_diff", None),
+    };
+
+    if args.json {
+        let reason = match &outcome {
+            altevra_brain::ProposeOutcome::RefusedInvalidDiff(r) => Some(r.clone()),
+            _ => None,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status, "id": id, "detail": reason,
+            }))?
+        );
+    } else {
+        match &outcome {
+            altevra_brain::ProposeOutcome::Proposed(id) => {
+                println!("proposed prompt tweak {id} for mode '{}' (review with: altevra prompt tweaks show {id})", args.mode);
+            }
+            altevra_brain::ProposeOutcome::AlreadyProposed(id) => {
+                println!("already proposed (merged into {id})");
+            }
+            altevra_brain::ProposeOutcome::RefusedRejected => {
+                println!("refused: this exact tweak was previously rejected — not re-proposing");
+            }
+            altevra_brain::ProposeOutcome::RefusedInvalidDiff(r) => {
+                println!("refused: diff does not apply cleanly — {r}");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_tweaks_approve(args: TweakApproveArgs) -> anyhow::Result<()> {
+    // HP gate FIRST — approving a prompt self-modify is a self-modify; refuse a
+    // non-interactive/agent caller before any DB work.
+    let proof = require_human_presence().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let proposals = altevra_db::ProposalsRepository::new(&pool);
+    let row = proposals
+        .get(&args.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("prompt tweak '{}' not found", args.id))?;
+    if row.kind != altevra_brain::PROMPT_TWEAK_KIND {
+        anyhow::bail!("proposal '{}' is not a prompt_tweak (kind={})", args.id, row.kind);
+    }
+    let body = altevra_brain::parse_tweak_body(&row)?;
+
+    let backup_root = altevra_core::home_dir().join(".altevra/backups/prompt-tweak");
+    let outcome =
+        altevra_brain::apply_prompt_tweak(&pool, &body, &backup_root, !args.dry_run).await?;
+
+    match outcome {
+        altevra_brain::ApplyTweakOutcome::Applied { new_block_hash } => {
+            if !args.dry_run {
+                // Record the human decision through the legal transition path:
+                // proposed → approved → applied (both stamp decided_by).
+                let decider = format!("pavle:{}", proof.method.as_str());
+                proposals
+                    .transition_status(&args.id, altevra_core::status::ProposalStatus::Approved, Some(&decider))
+                    .await?;
+                proposals
+                    .transition_status(&args.id, altevra_core::status::ProposalStatus::Applied, Some(&decider))
+                    .await?;
+                println!(
+                    "applied prompt tweak {} to mode '{}' (block {})",
+                    args.id, body.mode, &new_block_hash[..new_block_hash.len().min(12)]
+                );
+            } else {
+                println!(
+                    "dry-run: tweak {} WOULD apply to mode '{}' (no write performed)",
+                    args.id, body.mode
+                );
+            }
+        }
+        altevra_brain::ApplyTweakOutcome::DriftRefused => {
+            println!(
+                "refused: the managed prompt block was edited since Altevra wrote it (drift). \
+                 A review item was filed; the file was left byte-identical."
+            );
+        }
+        altevra_brain::ApplyTweakOutcome::DiffNoLongerApplies(reason) => {
+            println!("refused: diff no longer applies to the current prompt — {reason}");
+        }
+        altevra_brain::ApplyTweakOutcome::WriterRefused(reason) => {
+            println!("refused by block writer: {reason}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_tweaks_reject(args: TweakRejectArgs) -> anyhow::Result<()> {
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    altevra_db::run_migrations(&pool).await?;
+    let proposals = altevra_db::ProposalsRepository::new(&pool);
+    let row = proposals
+        .get(&args.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("prompt tweak '{}' not found", args.id))?;
+    if row.kind != altevra_brain::PROMPT_TWEAK_KIND {
+        anyhow::bail!("proposal '{}' is not a prompt_tweak (kind={})", args.id, row.kind);
+    }
+    let body = altevra_brain::parse_tweak_body(&row)?;
+
+    // Record the fingerprint so the same (mode, diff) is never re-proposed.
+    altevra_brain::record_rejected(&pool, &body, &args.reason).await?;
+    // Transition the proposal to rejected (records the decision).
+    proposals
+        .transition_status(&args.id, altevra_core::status::ProposalStatus::Rejected, Some("pavle"))
+        .await?;
+
+    println!(
+        "rejected prompt tweak {} for mode '{}' — fingerprint recorded (won't re-propose)",
+        args.id, body.mode
+    );
+    Ok(())
 }
 
 /// `altevra prompt rollback <name> --to <version>` — mint a derived ACTIVE copy of
