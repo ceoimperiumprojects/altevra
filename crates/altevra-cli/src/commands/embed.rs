@@ -112,10 +112,17 @@ pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
 
 /// The model name the watermark is keyed by — must match what the worker
 /// will actually embed with, or the cursor tracks a phantom model.
+/// Preference order mirrors the worker's embedder selection:
+/// BGE-M3 (local, feature-gated) → Gemini (if configured) → NoOp.
 fn active_model_name(explicit: Option<&str>) -> String {
     if let Some(m) = explicit {
         return m.to_string();
     }
+    #[cfg(feature = "embedding")]
+    {
+        return altevra_memory::BGE_M3_MODEL.to_string();
+    }
+    #[allow(unreachable_code)]
     match GeminiEmbedder::from_secrets_or_env() {
         Ok(emb) => emb.model_name().to_string(),
         Err(_) => NoOpEmbedder::new().model_name().to_string(),
@@ -175,6 +182,23 @@ async fn run_seed(args: EmbedSeedArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn tick_gemini_or_noop(
+    pool: sqlx::SqlitePool,
+    cfg: EmbedderWorkerConfig,
+) -> anyhow::Result<usize> {
+    match GeminiEmbedder::from_secrets_or_env() {
+        Ok(emb) => {
+            let worker = EmbedderWorker::new(emb, pool, cfg);
+            worker.tick().await
+        }
+        Err(e) => {
+            eprintln!("Gemini key not configured ({e}); falling back to NoOp embedder.");
+            let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool, cfg);
+            worker.tick().await
+        }
+    }
+}
+
 async fn run_tick(args: EmbedTickArgs) -> anyhow::Result<()> {
     let pool = open_pool(&args.db).await?;
     let cfg = EmbedderWorkerConfig {
@@ -186,16 +210,25 @@ async fn run_tick(args: EmbedTickArgs) -> anyhow::Result<()> {
         let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool.clone(), cfg);
         worker.tick().await?
     } else {
-        match GeminiEmbedder::from_secrets_or_env() {
-            Ok(emb) => {
-                let worker = EmbedderWorker::new(emb, pool.clone(), cfg);
-                worker.tick().await?
+        // Embedder preference: local BGE-M3 (feature-gated, sovereign, free)
+        // → Gemini (if configured) → NoOp. The watermark/model key in
+        // active_model_name() mirrors this order.
+        #[cfg(feature = "embedding")]
+        {
+            match altevra_memory::Bge3Embedder::new() {
+                Ok(emb) => {
+                    let worker = EmbedderWorker::new(emb, pool.clone(), cfg);
+                    worker.tick().await?
+                }
+                Err(e) => {
+                    eprintln!("BGE-M3 init failed ({e}); falling back to Gemini/NoOp.");
+                    tick_gemini_or_noop(pool.clone(), cfg).await?
+                }
             }
-            Err(e) => {
-                eprintln!("Gemini key not configured ({e}); falling back to NoOp embedder.");
-                let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool.clone(), cfg);
-                worker.tick().await?
-            }
+        }
+        #[cfg(not(feature = "embedding"))]
+        {
+            tick_gemini_or_noop(pool.clone(), cfg).await?
         }
     };
     if args.json {
@@ -242,22 +275,48 @@ async fn run_loop(args: EmbedRunArgs) -> anyhow::Result<()> {
         let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool, cfg);
         worker.run(shutdown_rx).await?;
     } else {
-        match GeminiEmbedder::from_secrets_or_env() {
-            Ok(emb) => {
-                println!("Provider: {} (dim {})", emb.model_name(), emb.dim());
-                let worker = EmbedderWorker::new(emb, pool, cfg);
-                worker.run(shutdown_rx).await?;
+        // Same preference order as run_tick: BGE-M3 → Gemini → NoOp.
+        #[cfg(feature = "embedding")]
+        {
+            match altevra_memory::Bge3Embedder::new() {
+                Ok(emb) => {
+                    println!("Provider: {} (local BGE-M3)", altevra_memory::BGE_M3_MODEL);
+                    let worker = EmbedderWorker::new(emb, pool, cfg);
+                    worker.run(shutdown_rx).await?;
+                }
+                Err(e) => {
+                    eprintln!("BGE-M3 init failed ({e}); falling back to Gemini/NoOp.");
+                    run_gemini_or_noop(pool, cfg, shutdown_rx).await?;
+                }
             }
-            Err(e) => {
-                eprintln!("Gemini key missing ({e}); using NoOp embedder.");
-                let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool, cfg);
-                worker.run(shutdown_rx).await?;
-            }
+        }
+        #[cfg(not(feature = "embedding"))]
+        {
+            run_gemini_or_noop(pool, cfg, shutdown_rx).await?;
         }
     }
 
     let _ = std::fs::remove_file(&args.pid_file);
     Ok(())
+}
+
+async fn run_gemini_or_noop(
+    pool: sqlx::SqlitePool,
+    cfg: EmbedderWorkerConfig,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    match GeminiEmbedder::from_secrets_or_env() {
+        Ok(emb) => {
+            println!("Provider: {} (dim {})", emb.model_name(), emb.dim());
+            let worker = EmbedderWorker::new(emb, pool, cfg);
+            worker.run(shutdown_rx).await
+        }
+        Err(e) => {
+            eprintln!("Gemini key missing ({e}); using NoOp embedder.");
+            let worker = EmbedderWorker::new(NoOpEmbedder::new(), pool, cfg);
+            worker.run(shutdown_rx).await
+        }
+    }
 }
 
 async fn run_status(args: EmbedStatusArgs) -> anyhow::Result<()> {
