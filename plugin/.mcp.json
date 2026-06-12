@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "altevra": {
+      "command": "altevra",
+      "args": ["serve", "--vault", "${HOME}"],
+      "env": { "ALTEVRA_DB_PATH": "${HOME}/.altevra/altevra.db" }
+    }
+  }
+}

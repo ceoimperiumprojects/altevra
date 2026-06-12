@@ -1,0 +1,11 @@
+{
+  "name": "altevra",
+  "owner": { "name": "Pavle Andjelkovic" },
+  "plugins": [
+    {
+      "name": "altevra",
+      "source": "./plugin",
+      "description": "Altevra second-brain: MCP memory/recall/tool-register + machine-rendered skills. Prerequisite: cargo build --release && altevra setup (binary on PATH)."
+    }
+  ]
+}

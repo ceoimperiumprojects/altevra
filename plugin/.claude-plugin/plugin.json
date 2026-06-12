@@ -1,0 +1,9 @@
+{
+  "name": "altevra",
+  "version": "0.3.0",
+  "description": "Local-first second-brain Agent OS: records every AI session, injects context at SessionStart, semantic recall over your whole history (BGE-M3 local), tool register, skill factory (Codex-rendered skills from your real work), daily briefs. Requires the altevra Rust binary on PATH (see install).",
+  "author": { "name": "Pavle Andjelkovic / Imperium Tech" },
+  "homepage": "https://github.com/ceoimperiumprojects/altevra",
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": ["memory", "second-brain", "mcp", "context", "skill-factory", "local-first"]
+}
