@@ -51,6 +51,12 @@ pub struct ImportedSession {
     pub model: Option<String>,
     pub turns: Vec<ImportedTurn>,
     pub imported_from: PathBuf,
+    /// Absolute working directory for the session.
+    /// For claude-code: from the transcript `cwd` field, falling back to
+    /// the decoded project-directory in the file path.
+    /// For codex: from `threads.cwd` in state_5.sqlite.
+    /// None when the source tool does not record cwd.
+    pub working_dir: Option<String>,
 }
 
 impl ImportedSession {
@@ -75,6 +81,7 @@ mod tests {
             model: None,
             turns: vec![],
             imported_from: PathBuf::from("/tmp/x.jsonl"),
+            working_dir: None,
         };
         assert_eq!(s.turn_count(), 0);
     }

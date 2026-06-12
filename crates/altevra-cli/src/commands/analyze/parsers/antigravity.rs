@@ -137,6 +137,7 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Vec<ImportedSession>> {
             model: None,
             turns,
             imported_from: path.to_path_buf(),
+            working_dir: cwd.clone(),
         });
     }
     Ok(sessions)

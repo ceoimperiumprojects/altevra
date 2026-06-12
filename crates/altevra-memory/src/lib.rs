@@ -1,3 +1,4 @@
+pub mod backfill;
 pub mod chunker;
 pub mod db_uri;
 pub mod embedding;
@@ -19,6 +20,10 @@ pub mod bge;
 #[cfg(feature = "embedding")]
 pub mod vec_store_sqlite;
 
+pub use backfill::{
+    resolve_db_object_text, run_backfill, BackfillReport, DbObjectText, SourceReport,
+    BACKFILL_SOURCES,
+};
 pub use chunker::{chunk_markdown, Chunk, ChunkMeta};
 pub use db_uri::{db_uri, embed_checksum, parse_db_uri, DbObjectType, MAX_CHUNKS_PER_TURN};
 pub use hybrid_db::{hybrid_db_search, DbHybridHit};
@@ -32,7 +37,10 @@ pub use ingestion::{
     IngestedDocument,
 };
 pub use search::{search_bm25, SearchHit, SearchIndex};
-pub use vector_store::{search_by_vector, vector_count, vector_exists, write_vector};
+pub use vector_store::{
+    register_model_dim, registered_dim, search_by_vector, vector_count, vector_exists,
+    write_vector_guarded,
+};
 pub use worker::{EmbedderWorker, EmbedderWorkerConfig, QueueStats};
 
 #[cfg(feature = "embedding")]

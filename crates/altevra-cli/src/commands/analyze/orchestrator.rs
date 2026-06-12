@@ -256,8 +256,9 @@ async fn import_one(repo: &SessionsRepository<'_>, sess: ImportedSession, stats:
         }),
         external_id: Some(sess.external_id.clone()),
         imported_from: Some(sess.imported_from.to_string_lossy().to_string()),
-        // Analyze Everything imports have no live cwd context — null per PLAN.md.
-        working_dir: None,
+        // R3: propagate working_dir extracted by the parser (claude-code from
+        // transcript cwd / path decode; codex from threads.cwd; others: None).
+        working_dir: sess.working_dir.clone(),
     };
 
     match repo.upsert_imported(&row).await {
@@ -312,8 +313,8 @@ async fn import_one(repo: &SessionsRepository<'_>, sess: ImportedSession, stats:
                     sensitivity: sensitivity.to_string(),
                     redaction_status: redaction.to_string(),
                     created_at: turn.created_at,
-                    // Analyze Everything imports have no live cwd context.
-                    working_dir: None,
+                    // R3: turns inherit the session's working_dir.
+                    working_dir: sess.working_dir.clone(),
                 };
                 if let Err(e) = repo.record_turn(&trow).await {
                     stats.errors.push(format!(

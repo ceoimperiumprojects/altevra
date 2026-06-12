@@ -124,6 +124,7 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Option<ImportedSession>> {
         model: None,
         turns,
         imported_from: path.to_path_buf(),
+        working_dir: None,
     }))
 }
 

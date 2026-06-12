@@ -27,6 +27,11 @@ pub enum EmbedCommands {
     Run(EmbedRunArgs),
     /// Show queue stats.
     Status(EmbedStatusArgs),
+    /// Enqueue ALL existing DB content (turns/learnings/notes/wiki/research)
+    /// for embedding via the db:// synthetic-document contract. Resumable
+    /// (watermark), idempotent (checksum), dry-run by default semantics via
+    /// --dry-run.
+    Backfill(EmbedBackfillArgs),
 }
 
 #[derive(Args)]
@@ -70,12 +75,30 @@ pub struct EmbedStatusArgs {
     pub json: bool,
 }
 
+#[derive(Args)]
+pub struct EmbedBackfillArgs {
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
+    #[arg(long, default_value_t = 500)]
+    pub batch_size: usize,
+    /// Report per-table enqueue counts without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Override the watermark model key (defaults to the active embedder's
+    /// model name so the cursor matches what the worker will embed with).
+    #[arg(long)]
+    pub model: Option<String>,
+    #[arg(long)]
+    pub json: bool,
+}
+
 pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
     // Maintenance lock (db unify): the embedder is a batch writer — refuse
-    // non-fatally for every write mode; `status` stays read-only and allowed.
-    if !matches!(cmd, EmbedCommands::Status(_))
-        && crate::commands::brain::refuse_if_maintenance_locked("embedder")
-    {
+    // non-fatally for every write mode; `status` stays read-only and allowed,
+    // as does a backfill --dry-run (it only reads and reports).
+    let read_only = matches!(cmd, EmbedCommands::Status(_))
+        || matches!(&cmd, EmbedCommands::Backfill(a) if a.dry_run);
+    if !read_only && crate::commands::brain::refuse_if_maintenance_locked("embedder") {
         return Ok(());
     }
     match cmd {
@@ -83,7 +106,59 @@ pub async fn run(cmd: EmbedCommands) -> anyhow::Result<()> {
         EmbedCommands::Tick(args) => run_tick(args).await,
         EmbedCommands::Run(args) => run_loop(args).await,
         EmbedCommands::Status(args) => run_status(args).await,
+        EmbedCommands::Backfill(args) => run_backfill_cmd(args).await,
     }
+}
+
+/// The model name the watermark is keyed by — must match what the worker
+/// will actually embed with, or the cursor tracks a phantom model.
+fn active_model_name(explicit: Option<&str>) -> String {
+    if let Some(m) = explicit {
+        return m.to_string();
+    }
+    match GeminiEmbedder::from_secrets_or_env() {
+        Ok(emb) => emb.model_name().to_string(),
+        Err(_) => NoOpEmbedder::new().model_name().to_string(),
+    }
+}
+
+async fn run_backfill_cmd(args: EmbedBackfillArgs) -> anyhow::Result<()> {
+    let pool = open_pool(&args.db).await?;
+    let model = active_model_name(args.model.as_deref());
+    let report =
+        altevra_memory::run_backfill(&pool, &model, args.batch_size, args.dry_run).await?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "model": model,
+                "dry_run": args.dry_run,
+                "total_scanned": report.total_scanned(),
+                "total_enqueued": report.total_enqueued(),
+                "sources": report
+                    .sources
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), serde_json::json!({
+                        "scanned": v.scanned,
+                        "enqueued": v.enqueued,
+                    })))
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            }))?
+        );
+    } else {
+        let mode = if args.dry_run { "DRY-RUN" } else { "APPLIED" };
+        println!("Embed backfill ({mode}) — model '{model}':");
+        for (otype, s) in &report.sources {
+            println!("  {otype:<10} scanned {:>6}  enqueued {:>6}", s.scanned, s.enqueued);
+        }
+        println!(
+            "  total: {} scanned, {} enqueued{}",
+            report.total_scanned(),
+            report.total_enqueued(),
+            if args.dry_run { " (nothing written)" } else { "" }
+        );
+    }
+    Ok(())
 }
 
 async fn open_pool(path: &std::path::Path) -> anyhow::Result<sqlx::SqlitePool> {

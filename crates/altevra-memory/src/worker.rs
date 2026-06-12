@@ -2,8 +2,10 @@
 //!
 //! Polls the `embedder_queue` table for `status='pending'` chunks, calls the
 //! configured `AsyncEmbeddingProvider` (Gemini in production, MockEmbedder in
-//! tests), and writes vectors via `vector_store::write_vector`. Rate-limited
-//! with a token bucket so we stay well under the Gemini free tier (1500 RPM).
+//! tests), and writes vectors via `vector_store::write_vector_guarded` (R2
+//! dim-gate: the model+dim registered in `embed_meta` is enforced on every
+//! write). Rate-limited with a token bucket so we stay well under the Gemini
+//! free tier (1500 RPM).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -193,13 +195,18 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
         Ok(processed)
     }
 
-    /// Ingest ONE file into memory_documents/memory_chunks and enqueue its
-    /// chunks for embedding. No-op when the file is byte-identical to the
-    /// stored document (checksum match).
+    /// Ingest ONE queued path into memory_documents/memory_chunks and enqueue
+    /// its chunks for embedding. No-op when the content is byte-identical to
+    /// the stored document (checksum match). Synthetic `db://` URIs (R2
+    /// backfill contract) resolve their text from the DB instead of the fs.
     async fn index_file(&self, path: &str) -> anyhow::Result<()> {
         use crate::chunker::DEFAULT_CHUNK_SIZE;
         use crate::ingestion::{guard_document, ingest_file};
         use altevra_core::security::Sensitivity;
+
+        if let Some((otype, obj_id)) = crate::db_uri::parse_db_uri(path) {
+            return self.index_db_object(path, otype, obj_id).await;
+        }
 
         let mut doc = ingest_file(std::path::Path::new(path), DEFAULT_CHUNK_SIZE)?;
 
@@ -224,6 +231,61 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
             .and_then(|f| f.get("title"))
             .and_then(|v| v.as_str())
             .map(String::from);
+        self.persist_document(path, title, &doc, existing.map(|(id, _)| id))
+            .await
+    }
+
+    /// Index ONE synthetic `db://<type>/<id>` object (R2 backfill contract):
+    /// resolve the embedded text from the DB, checksum = sha256 of that text,
+    /// re-index only on checksum change, turn→chunks capped per turn.
+    async fn index_db_object(&self, uri: &str, otype: &str, obj_id: &str) -> anyhow::Result<()> {
+        use crate::backfill::resolve_db_object_text;
+        use crate::chunker::DEFAULT_CHUNK_SIZE;
+        use crate::db_uri::MAX_CHUNKS_PER_TURN;
+        use crate::ingestion::{guard_document, ingest_text};
+        use altevra_core::security::Sensitivity;
+
+        let Some(obj) = resolve_db_object_text(&self.pool, otype, obj_id).await? else {
+            anyhow::bail!("db object not found or unreadable: {uri}");
+        };
+
+        // ingest_text's checksum is sha256 over the full text bytes — exactly
+        // the db:// contract checksum (db_uri::embed_checksum).
+        let mut doc = ingest_text(&obj.text, None, DEFAULT_CHUNK_SIZE);
+
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT id, checksum FROM memory_documents WHERE source_path = ?")
+                .bind(uri)
+                .fetch_optional(&self.pool)
+                .await?;
+        if let Some((_, ref checksum)) = existing {
+            if *checksum == doc.checksum {
+                return Ok(()); // unchanged — already indexed at this text
+            }
+        }
+
+        // Cap turn chunks: one verbose assistant reply must not flood the queue.
+        if otype == "turn" && doc.chunks.len() > MAX_CHUNKS_PER_TURN {
+            doc.chunks.truncate(MAX_CHUNKS_PER_TURN);
+        }
+
+        // Same guard contract as the file lane — even though turns are
+        // redacted at capture time, re-guarding here is cheap and fail-closed.
+        guard_document(&mut doc, Sensitivity::Internal);
+
+        self.persist_document(uri, obj.title.clone(), &doc, existing.map(|(id, _)| id))
+            .await
+    }
+
+    /// Upsert a (guarded) document + replace its chunks + enqueue them for
+    /// embedding. Shared by the file lane and the `db://` object lane.
+    async fn persist_document(
+        &self,
+        source_path: &str,
+        title: Option<String>,
+        doc: &crate::ingestion::IngestedDocument,
+        existing_id: Option<String>,
+    ) -> anyhow::Result<()> {
         let body: String = doc
             .chunks
             .iter()
@@ -231,8 +293,8 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let doc_id = match existing {
-            Some((id, _)) => {
+        let doc_id = match existing_id {
+            Some(id) => {
                 sqlx::query(
                     r#"UPDATE memory_documents
                        SET title = ?, body = ?, checksum = ?,
@@ -274,7 +336,7 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
                      VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&id)
-                .bind(path)
+                .bind(source_path)
                 .bind(&title)
                 .bind(&body)
                 .bind(&doc.checksum)
@@ -338,6 +400,15 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
             return Ok(0);
         }
 
+        // R2 write-gate: record the active model+dim once (idempotent) so
+        // write_vector_guarded can refuse foreign-dim vectors below.
+        vector_store::register_model_dim(
+            &self.pool,
+            self.embedder.model_name(),
+            self.embedder.dim(),
+        )
+        .await?;
+
         let mut success = 0usize;
         for row in rows {
             let chunk_id_text: String = row.get("chunk_id");
@@ -388,7 +459,7 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
 
             match self.embedder.embed(&text).await {
                 Ok(emb) => {
-                    if let Err(e) = vector_store::write_vector(
+                    if let Err(e) = vector_store::write_vector_guarded(
                         &self.pool,
                         chunk_id,
                         self.embedder.model_name(),
@@ -396,7 +467,7 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
                     )
                     .await
                     {
-                        self.mark_failed(&chunk_id_text, &format!("write_vector: {e}"))
+                        self.mark_failed(&chunk_id_text, &format!("write_vector_guarded: {e}"))
                             .await;
                         continue;
                     }
@@ -539,7 +610,21 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        // Minimal schema needed for worker tests.
+        create_schema(&pool).await;
+        pool
+    }
+
+    /// File-backed per-test DB (R2 db:// object-lane tests).
+    async fn setup_file_pool() -> (tempfile::TempDir, SqlitePool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite://{}?mode=rwc", tmp.path().join("test.db").display());
+        let pool = SqlitePoolOptions::new().connect(&url).await.unwrap();
+        create_schema(&pool).await;
+        (tmp, pool)
+    }
+
+    /// Minimal schema needed for worker tests.
+    async fn create_schema(pool: &SqlitePool) {
         sqlx::query(
             r#"CREATE TABLE memory_chunks (
                 id TEXT PRIMARY KEY,
@@ -552,7 +637,7 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
         sqlx::query(
@@ -565,7 +650,7 @@ mod tests {
                 last_error TEXT
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
         sqlx::query(
@@ -577,7 +662,7 @@ mod tests {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
         // File-queue tables (009 + 006 shapes) for the drain_pending_files path.
@@ -593,7 +678,7 @@ mod tests {
                 UNIQUE (path)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
         sqlx::query(
@@ -609,10 +694,25 @@ mod tests {
                 UNIQUE (source_path)
             )"#,
         )
-        .execute(&pool)
+        .execute(pool)
         .await
         .unwrap();
-        pool
+        // 041: model+dim registry for the R2 write-gate.
+        sqlx::query(
+            r#"CREATE TABLE embed_meta (
+                model TEXT PRIMARY KEY,
+                dim INTEGER NOT NULL,
+                set_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            )"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        // Turns table so db://turn/<id> objects can be resolved.
+        sqlx::query("CREATE TABLE turns (id TEXT PRIMARY KEY, content TEXT NOT NULL)")
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn enqueue_path(pool: &SqlitePool, path: &std::path::Path) {
@@ -913,5 +1013,156 @@ mod tests {
         let s = worker.stats().await.unwrap();
         assert_eq!(s.done, 2);
         assert_eq!(s.pending, 0);
+    }
+
+    // ---- db:// synthetic objects (R2 backfill contract) ----
+
+    async fn insert_turn(pool: &SqlitePool, content: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO turns (id, content) VALUES (?, ?)")
+            .bind(&id)
+            .bind(content)
+            .execute(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    fn test_worker(pool: &SqlitePool) -> EmbedderWorker<MockEmbedder> {
+        EmbedderWorker::new(
+            MockEmbedder::new(),
+            pool.clone(),
+            EmbedderWorkerConfig {
+                rate_limit_rpm: 100_000,
+                ..EmbedderWorkerConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn tick_indexes_db_turn_object_through_to_vectors() {
+        let (_tmp, pool) = setup_file_pool().await;
+        let turn_id = insert_turn(&pool, "the user asked about embedding backfills").await;
+        let uri = format!("db://turn/{turn_id}");
+        enqueue_path(&pool, std::path::Path::new(&uri)).await;
+
+        let worker = test_worker(&pool);
+        let embedded = worker.tick().await.unwrap();
+        assert!(embedded >= 1, "db:// chunks must embed in-tick");
+
+        // Document persisted under the synthetic uri with the contract checksum
+        // (sha256 of the embedded text).
+        let (source_path, checksum): (String, String) = sqlx::query_as(
+            "SELECT source_path, checksum FROM memory_documents LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(source_path, uri);
+        assert_eq!(
+            checksum,
+            crate::db_uri::embed_checksum("the user asked about embedding backfills")
+        );
+        let chunks = count(&pool, "SELECT COUNT(*) FROM memory_chunks").await;
+        assert!(chunks >= 1);
+        assert_eq!(vector_store::vector_count(&pool).await.unwrap(), chunks);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM pending_indexing WHERE status = 'done'").await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn db_turn_chunks_are_capped_per_turn() {
+        let (_tmp, pool) = setup_file_pool().await;
+        // A monster turn: 40 sections of ~1.5k chars → way past the cap.
+        let huge: String = (0..40)
+            .map(|i| format!("# Section {i}\n\n{}\n\n", "altevra ".repeat(180)))
+            .collect();
+        let turn_id = insert_turn(&pool, &huge).await;
+        enqueue_path(&pool, std::path::Path::new(&format!("db://turn/{turn_id}"))).await;
+
+        let worker = test_worker(&pool);
+        worker.tick().await.unwrap();
+
+        let chunks = count(&pool, "SELECT COUNT(*) FROM memory_chunks").await;
+        assert!(
+            (1..=crate::db_uri::MAX_CHUNKS_PER_TURN as i64).contains(&chunks),
+            "turn chunks must be capped at {} (got {chunks})",
+            crate::db_uri::MAX_CHUNKS_PER_TURN
+        );
+    }
+
+    #[tokio::test]
+    async fn db_object_checksum_change_reindexes_in_place() {
+        let (_tmp, pool) = setup_file_pool().await;
+        let turn_id = insert_turn(&pool, "version one of the thought").await;
+        let uri = format!("db://turn/{turn_id}");
+        enqueue_path(&pool, std::path::Path::new(&uri)).await;
+
+        let worker = test_worker(&pool);
+        worker.tick().await.unwrap();
+
+        // Unchanged re-queue → checksum match → no duplicate chunks.
+        let chunks_v1 = count(&pool, "SELECT COUNT(*) FROM memory_chunks").await;
+        sqlx::query("UPDATE pending_indexing SET status = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_chunks").await, chunks_v1);
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 1);
+
+        // Content edit → checksum change → re-indexed in place (re-embed).
+        sqlx::query("UPDATE turns SET content = 'version two, fully rewritten' WHERE id = ?")
+            .bind(&turn_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE pending_indexing SET status = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        worker.tick().await.unwrap();
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 1);
+        let (checksum, body): (String, String) =
+            sqlx::query_as("SELECT checksum, body FROM memory_documents LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            checksum,
+            crate::db_uri::embed_checksum("version two, fully rewritten")
+        );
+        assert!(body.contains("version two"), "body re-indexed: {body}");
+        // No orphaned queue/vector rows for replaced chunks.
+        let orphans = count(
+            &pool,
+            "SELECT COUNT(*) FROM embedder_queue WHERE chunk_id NOT IN (SELECT id FROM memory_chunks)",
+        )
+        .await;
+        assert_eq!(orphans, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_db_object_marks_queue_row_failed() {
+        let (_tmp, pool) = setup_file_pool().await;
+        enqueue_path(
+            &pool,
+            std::path::Path::new("db://turn/00000000-0000-0000-0000-000000000000"),
+        )
+        .await;
+
+        let worker = test_worker(&pool);
+        worker.drain_pending_files().await.unwrap();
+
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM pending_indexing LIMIT 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("not found"));
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM memory_documents").await, 0);
     }
 }

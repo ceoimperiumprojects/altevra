@@ -156,6 +156,7 @@ pub fn parse_file(path: &Path) -> anyhow::Result<Option<ImportedSession>> {
         model: sess.model,
         turns,
         imported_from: path.to_path_buf(),
+        working_dir: None,
     }))
 }
 
@@ -296,6 +297,7 @@ pub fn parse_session_jsonl(path: &Path) -> anyhow::Result<Option<ImportedSession
         model: meta_model,
         turns,
         imported_from: path.to_path_buf(),
+        working_dir: None,
     }))
 }
 
