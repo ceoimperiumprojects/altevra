@@ -139,6 +139,69 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
             .collect::<Vec<_>>()
     };
 
+    // --- Source 3: indexed FILE content (file-watcher). The watcher captures
+    // ALL work outside AI sessions — Desktop/, Documents/, projekti/, Obsidian/ —
+    // into memory_chunks. Without this, `recall "ReVesta"` would only see AI turns
+    // and miss the actual ReVesta files Pavle edited from home. Context-based, not
+    // repo-scoped: a LIKE over the chunk text surfaces the work wherever it lives.
+    // Deduped to one hit per source file (most recent chunk), time-windowed.
+    let doc_hits: Vec<(String, DateTime<Utc>, String)> =
+        if args.query.trim().is_empty() || args.tool.is_some() {
+            Vec::new()
+        } else {
+            use sqlx::Row;
+            // Tokenize: every whitespace-separated term must appear (AND), in any
+            // order — so "Simple Surplus operator" matches a doc containing all
+            // three words, not only the literal phrase. Single-term queries
+            // ("ReVesta") still work as a plain substring.
+            let terms: Vec<String> = args
+                .query
+                .split_whitespace()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("%{t}%"))
+                .collect();
+            let where_clause = vec!["mc.text LIKE ?"; terms.len()].join(" AND ");
+            let sql = format!(
+                "SELECT mc.text AS text, mc.created_at AS created_at, \
+                        COALESCE(md.source_path, '') AS source_path \
+                 FROM memory_chunks mc \
+                 LEFT JOIN memory_documents md ON md.id = mc.document_id \
+                 WHERE {where_clause} \
+                 ORDER BY mc.created_at DESC \
+                 LIMIT ?"
+            );
+            let mut q = sqlx::query(&sql);
+            for t in &terms {
+                q = q.bind(t);
+            }
+            let rows = q
+                .bind(args.limit * 8) // over-fetch; dedup + time-filter trims below
+                .fetch_all(&pool)
+                .await
+                .unwrap_or_default();
+
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for r in rows {
+                let text: String = r.get("text");
+                let created_raw: String = r.get("created_at");
+                let source_path: String = r.get("source_path");
+                let created_at = chrono::DateTime::parse_from_rfc3339(&created_raw)
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                if !in_window(created_at, t_since, t_until) {
+                    continue;
+                }
+                // One hit per file (most recent chunk wins — rows are DESC).
+                let key = if source_path.is_empty() { text.clone() } else { source_path.clone() };
+                if !seen.insert(key) {
+                    continue;
+                }
+                out.push((text, created_at, source_path));
+            }
+            out
+        };
+
     // --- Merge into a unified, recency-sorted list. ---
     let mut items: Vec<RecallItem> = Vec::new();
     for h in &turn_hits {
@@ -165,6 +228,19 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
             snippet: snippet_with_title(&o.title, &o.body, &args.query, 200),
         });
     }
+    for (text, when, source_path) in &doc_hits {
+        let label = if source_path.is_empty() {
+            "file".to_string()
+        } else {
+            format!("file · {}", source_path.trim_start_matches("./"))
+        };
+        items.push(RecallItem {
+            when: *when,
+            when_human: humanize_relative(*when, now),
+            source: label,
+            snippet: snippet(text, &args.query, 200),
+        });
+    }
     items.sort_by_key(|it| std::cmp::Reverse(it.when));
     items.truncate(args.limit as usize);
 
@@ -187,6 +263,7 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
                 "count": entries.len(),
                 "turns": turn_hits.len(),
                 "objects": object_hits.len(),
+                "files": doc_hits.len(),
                 "window": t_since.map(|s| serde_json::json!({"since": s, "until": t_until})),
                 "results": entries,
             }))?
@@ -201,12 +278,13 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "Recall '{}'{} — {} hit(s) ({} turn / {} note):\n",
+        "Recall '{}'{} — {} hit(s) ({} turn / {} note / {} file):\n",
         args.query,
         scope,
         items.len(),
         turn_hits.len(),
-        object_hits.len()
+        object_hits.len(),
+        doc_hits.len()
     );
     for it in &items {
         println!("  • {} — {}", it.when_human, it.source);
