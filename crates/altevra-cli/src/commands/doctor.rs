@@ -474,7 +474,7 @@ fn check_backup_freshness(backups_dir: &Path) -> DoctorCheck {
                     "No backups found in {} — run a backup first",
                     backups_dir.display()
                 ),
-                fix_hint: Some("Run: altevra backup create".into()),
+                fix_hint: Some("Run: altevra backup run".into()),
             };
         }
     };
@@ -495,7 +495,7 @@ fn check_backup_freshness(backups_dir: &Path) -> DoctorCheck {
                 "Most recent backup is {:.1}h old (threshold: 48h)",
                 age.as_secs_f64() / 3600.0
             ),
-            fix_hint: Some("Run: altevra backup create".into()),
+            fix_hint: Some("Run: altevra backup run".into()),
         }
     }
 }
