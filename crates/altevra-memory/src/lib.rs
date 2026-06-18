@@ -26,7 +26,7 @@ pub use backfill::{
 };
 pub use chunker::{chunk_markdown, Chunk, ChunkMeta};
 pub use db_uri::{db_uri, embed_checksum, parse_db_uri, DbObjectType, MAX_CHUNKS_PER_TURN};
-pub use hybrid_db::{hybrid_db_search, DbHybridHit};
+pub use hybrid_db::{hybrid_db_search, retrieve, DbHybridHit, RetrievalRequest, SourceRef};
 pub use embedding::{AsyncEmbeddingProvider, Embedding, EmbeddingProvider, NoOpEmbedder};
 pub use embedding_router::{EmbeddingRole, EmbeddingRouter};
 pub use gemini::{cosine, GeminiEmbedder, GEMINI_DIM, GEMINI_MODEL};

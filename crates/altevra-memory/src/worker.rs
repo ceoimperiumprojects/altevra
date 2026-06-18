@@ -87,6 +87,10 @@ pub struct EmbedderWorker<E: AsyncEmbeddingProvider> {
     embedder: E,
     pool: SqlitePool,
     config: EmbedderWorkerConfig,
+    /// Legacy Gemini-era token bucket. The local BGE embed path no longer
+    /// rate-limits (no per-minute quota; batch size bounds throughput), so this
+    /// is retained only for construction back-compat and is never consulted.
+    #[allow(dead_code)]
     limiter: Arc<Mutex<RateLimiter>>,
 }
 
@@ -433,44 +437,36 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
 
         let mut success = 0usize;
         let mut done_ids: Vec<String> = Vec::with_capacity(rows.len());
-        for row in rows {
+
+        // Pair each parseable (chunk_id, text) for the batch embed. Rows whose
+        // chunk_id is not a valid UUID are skipped (can't write a vector for
+        // them) — same behaviour as the old per-item loop.
+        let mut batch_ids: Vec<String> = Vec::with_capacity(rows.len());
+        let mut batch_uuids: Vec<Uuid> = Vec::with_capacity(rows.len());
+        let mut batch_texts: Vec<String> = Vec::with_capacity(rows.len());
+        for row in &rows {
             let chunk_id_text: String = row.get("chunk_id");
             let text: String = row.get("text");
-            let chunk_id = match Uuid::parse_str(&chunk_id_text) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            // Rate-limit before each embed call.
-            // Manual snapshot/drop pattern: pull state from the guard, drop it
-            // before any .await, do the math, then re-lock to commit.
-            // clippy::await_holding_lock is a false positive here because the
-            // guard is explicitly dropped via `drop(g)` before any await.
-            #[allow(clippy::await_holding_lock)]
-            {
-                let g = self.limiter.lock().unwrap();
-                let snapshot = (g.refill_per_sec, g.tokens, g.capacity, g.last_refill);
-                drop(g);
-                // Recreate limiter state in an async-safe path. We re-lock briefly
-                // around the math but await OUTSIDE the lock to keep Send semantics.
-                let (per_sec, mut tokens, cap, last) = snapshot;
-                let now = Instant::now();
-                let elapsed = now.duration_since(last).as_secs_f64();
-                tokens = (tokens + elapsed * per_sec).min(cap);
-                if tokens < 1.0 {
-                    let needed = 1.0 - tokens;
-                    tokio::time::sleep(Duration::from_secs_f64((needed / per_sec).max(0.001)))
-                        .await;
-                    tokens = 1.0;
+            match Uuid::parse_str(&chunk_id_text) {
+                Ok(id) => {
+                    batch_ids.push(chunk_id_text);
+                    batch_uuids.push(id);
+                    batch_texts.push(text);
                 }
-                tokens -= 1.0;
-                let mut g2 = self.limiter.lock().unwrap();
-                g2.tokens = tokens;
-                g2.last_refill = Instant::now();
+                Err(_) => continue,
             }
+        }
 
-            match self.embedder.embed(&text).await {
-                Ok(emb) => {
+        // ONE batched embed over the whole claimed batch (replaces the per-item
+        // `embed()` loop). The dead 1000-RPM Gemini-era rate limiter is gone for
+        // the local BGE path — the local embedder has no per-minute quota; the
+        // batch size already bounds throughput. On a batch error we fall back to
+        // per-item embeds so one poisoned chunk can't fail the whole batch.
+        match self.embedder.embed_batch(&batch_texts).await {
+            Ok(embeddings) if embeddings.len() == batch_uuids.len() => {
+                for (i, emb) in embeddings.into_iter().enumerate() {
+                    let chunk_id = batch_uuids[i];
+                    let chunk_id_text = &batch_ids[i];
                     if let Err(e) = vector_store::write_vector_guarded(
                         &self.pool,
                         chunk_id,
@@ -479,20 +475,44 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
                     )
                     .await
                     {
-                        self.mark_failed(&chunk_id_text, &format!("write_vector_guarded: {e}"))
+                        self.mark_failed(chunk_id_text, &format!("write_vector_guarded: {e}"))
                             .await;
                         continue;
                     }
-                    // Defer the 'done' write — collected and flushed in ONE
-                    // batched UPDATE after the loop (see below) to cut write-lock
-                    // contention. The vector itself is already durably written
-                    // above, so a crash before the flush just re-embeds (the
-                    // vector write is an idempotent upsert) — never data loss.
-                    done_ids.push(chunk_id_text);
+                    done_ids.push(chunk_id_text.clone());
                     success += 1;
                 }
-                Err(e) => {
-                    self.mark_failed(&chunk_id_text, &e.to_string()).await;
+            }
+            // Batch failed OR returned a mismatched count — degrade to per-item
+            // so partial progress is still made and bad chunks are isolated.
+            _ => {
+                for (i, text) in batch_texts.iter().enumerate() {
+                    let chunk_id = batch_uuids[i];
+                    let chunk_id_text = &batch_ids[i];
+                    match self.embedder.embed(text).await {
+                        Ok(emb) => {
+                            if let Err(e) = vector_store::write_vector_guarded(
+                                &self.pool,
+                                chunk_id,
+                                self.embedder.model_name(),
+                                &emb.vector,
+                            )
+                            .await
+                            {
+                                self.mark_failed(
+                                    chunk_id_text,
+                                    &format!("write_vector_guarded: {e}"),
+                                )
+                                .await;
+                                continue;
+                            }
+                            done_ids.push(chunk_id_text.clone());
+                            success += 1;
+                        }
+                        Err(e) => {
+                            self.mark_failed(chunk_id_text, &e.to_string()).await;
+                        }
+                    }
                 }
             }
         }

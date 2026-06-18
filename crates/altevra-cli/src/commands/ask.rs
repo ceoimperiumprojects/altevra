@@ -133,43 +133,41 @@ pub async fn run(args: AskArgs) -> anyhow::Result<()> {
         }
     }
 
-    // 4. SEMANTIC file content — embed the question and pull nearest chunks by
-    //    meaning. Catches paraphrase + cross-language (a Serbian question hitting
-    //    an English note) that keyword retrieval misses. The smarter half of the
-    //    finder. (Only when built with the embedding feature.)
+    // 4. SEMANTIC file content — embed the question and run the Phase 1 hybrid
+    //    backbone (`altevra_memory::retrieve`: BM25 over object_fts + dense
+    //    cosine, fused on one canonical chunk key) instead of a raw vector scan.
+    //    Catches paraphrase + cross-language (a Serbian question hitting an
+    //    English note) that keyword retrieval misses, AND surfaces keyword-only
+    //    chunk hits the old raw scan dropped. (Only with the embedding feature.)
     #[cfg(feature = "embedding")]
     {
-        use altevra_memory::{search_by_vector, AsyncEmbeddingProvider, Bge3Embedder, BGE_M3_MODEL};
-        use sqlx::Row;
+        use altevra_memory::{
+            retrieve, AsyncEmbeddingProvider, Bge3Embedder, RetrievalRequest, BGE_M3_DIM,
+            BGE_M3_MODEL,
+        };
         if let Ok(embedder) = Bge3Embedder::new() {
             if let Ok(emb) = embedder.embed(&args.question).await {
-                let ranked = search_by_vector(&pool, &emb.vector, BGE_M3_MODEL, args.limit)
+                let req = RetrievalRequest {
+                    query: args.question.clone(),
+                    since: t_since,
+                    until: t_until,
+                    limit: args.limit.max(1) as usize,
+                    ..Default::default()
+                };
+                let hits = retrieve(&pool, &req, Some(&emb.vector), BGE_M3_MODEL, BGE_M3_DIM)
                     .await
                     .unwrap_or_default();
-                for (chunk_id, _score) in ranked {
-                    if let Ok(Some(r)) = sqlx::query(
-                        "SELECT mc.text AS text, mc.created_at AS created_at, \
-                                COALESCE(md.source_path,'') AS source_path \
-                         FROM memory_chunks mc LEFT JOIN memory_documents md ON md.id = mc.document_id \
-                         WHERE mc.id = ?",
-                    )
-                    .bind(chunk_id.to_string())
-                    .fetch_optional(&pool)
-                    .await
-                    {
-                        let when = chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("created_at"))
-                            .map(|d| d.with_timezone(&Utc))
-                            .unwrap_or(now);
-                        if !in_window(when, t_since, t_until) {
-                            continue;
-                        }
-                        let path: String = r.get("source_path");
-                        let label = path.trim_start_matches("./");
-                        let snip = r.get::<String, _>("text").chars().take(400).collect::<String>();
-                        ctx_lines.push(format!("[~meaning · {label}] {snip}"));
-                        if !label.is_empty() {
-                            sources.push(label.to_string());
-                        }
+                for h in hits {
+                    let when = h.source_ref.ts.unwrap_or(now);
+                    if !in_window(when, t_since, t_until) {
+                        continue;
+                    }
+                    let path = h.source_ref.source_path.clone().unwrap_or_default();
+                    let label = path.trim_start_matches("./");
+                    let snip = h.snippet.chars().take(400).collect::<String>();
+                    ctx_lines.push(format!("[~meaning · {label}] {snip}"));
+                    if !label.is_empty() {
+                        sources.push(label.to_string());
                     }
                 }
             }

@@ -310,9 +310,12 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Semantic file recall: embed the query with BGE-M3 and rank indexed file
-/// chunks by cosine similarity (meaning), then map back to (text, when, path),
-/// time-windowed + deduped per file. Returns `(text, created_at, source_path)`.
+/// Semantic file recall: embed the query with BGE-M3 and run the Phase 1 hybrid
+/// backbone (`altevra_memory::retrieve` — BM25 over object_fts + dense cosine,
+/// fused on one canonical chunk key) instead of a raw vector scan. Maps each hit
+/// back to (text, created_at, source_path) via the hit's `source_ref`, applies
+/// the same time window, dedups per file. The hybrid primitive carries the
+/// provenance + filters the old raw `search_by_vector` path lost.
 #[cfg(feature = "embedding")]
 async fn semantic_doc_hits(
     pool: &sqlx::SqlitePool,
@@ -321,8 +324,9 @@ async fn semantic_doc_hits(
     t_since: Option<DateTime<Utc>>,
     t_until: Option<DateTime<Utc>>,
 ) -> Vec<(String, DateTime<Utc>, String)> {
-    use altevra_memory::{search_by_vector, AsyncEmbeddingProvider, Bge3Embedder, BGE_M3_MODEL};
-    use sqlx::Row;
+    use altevra_memory::{
+        retrieve, AsyncEmbeddingProvider, Bge3Embedder, RetrievalRequest, BGE_M3_DIM, BGE_M3_MODEL,
+    };
 
     let embedder = match Bge3Embedder::new() {
         Ok(e) => e,
@@ -338,40 +342,37 @@ async fn semantic_doc_hits(
             return Vec::new();
         }
     };
-    let ranked = search_by_vector(pool, &emb.vector, BGE_M3_MODEL, limit * 8)
+
+    let req = RetrievalRequest {
+        query: query.to_string(),
+        since: t_since,
+        until: t_until,
+        limit: (limit * 8).max(1) as usize,
+        ..Default::default()
+    };
+    let hits = retrieve(pool, &req, Some(&emb.vector), BGE_M3_MODEL, BGE_M3_DIM)
         .await
         .unwrap_or_default();
 
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for (chunk_id, _score) in ranked {
-        let row = sqlx::query(
-            "SELECT mc.text AS text, mc.created_at AS created_at, \
-                    COALESCE(md.source_path, '') AS source_path \
-             FROM memory_chunks mc \
-             LEFT JOIN memory_documents md ON md.id = mc.document_id \
-             WHERE mc.id = ?",
-        )
-        .bind(chunk_id.to_string())
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-        let Some(r) = row else { continue };
-        let text: String = r.get("text");
-        let created_raw: String = r.get("created_at");
-        let source_path: String = r.get("source_path");
-        let created_at = chrono::DateTime::parse_from_rfc3339(&created_raw)
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+    for h in hits {
+        let source_path = h.source_ref.source_path.clone().unwrap_or_default();
+        let created_at = h.source_ref.ts.unwrap_or_else(Utc::now);
+        // retrieve() already applied the window when the hit carried a ts; this
+        // is a belt-and-suspenders cut for hits whose ts was unknown.
         if !in_window(created_at, t_since, t_until) {
             continue;
         }
-        let key = if source_path.is_empty() { text.clone() } else { source_path.clone() };
+        let key = if source_path.is_empty() {
+            h.snippet.clone()
+        } else {
+            source_path.clone()
+        };
         if !seen.insert(key) {
             continue;
         }
-        out.push((text, created_at, source_path));
+        out.push((h.snippet, created_at, source_path));
         if out.len() as i64 >= limit * 4 {
             break;
         }
@@ -737,6 +738,7 @@ mod tests {
             limit: 10,
             db: db.clone(),
             json: true,
+            semantic: false,
         })
         .await
         .unwrap();
@@ -771,6 +773,7 @@ mod tests {
             limit: 10,
             db,
             json: true,
+            semantic: false,
         })
         .await;
         assert!(r.is_err(), "garbage window must fail-closed");
@@ -915,6 +918,7 @@ mod tests {
             limit: 10,
             db: db.clone(),
             json: true,
+            semantic: false,
         })
         .await
         .unwrap();
