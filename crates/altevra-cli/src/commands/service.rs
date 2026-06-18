@@ -111,6 +111,11 @@ pub struct UnitContext {
     pub home: PathBuf,
     /// Value for `WorkingDirectory=`.
     pub working_dir: PathBuf,
+    /// Value for `Environment=PATH=…`. systemd user services start with a
+    /// minimal PATH that omits `~/.local/bin` and version-manager shims, so
+    /// the daemon's LLM jobs can't find `claude`/`codex`. We bake a sensible
+    /// PATH derived from `home` so the brain finds its tools on any machine.
+    pub path: String,
 }
 
 impl UnitContext {
@@ -150,7 +155,13 @@ impl UnitContext {
             anyhow::bail!("--working-dir must be absolute, got: {}", working_dir.display());
         }
 
-        Ok(Self { binary, db, vault, home, working_dir })
+        let h = home.display();
+        let path = format!(
+            "{h}/.local/share/mise/shims:{h}/.local/bin:{h}/.npm-global/bin:\
+             /usr/local/bin:/usr/bin:/bin"
+        );
+
+        Ok(Self { binary, db, vault, home, working_dir, path })
     }
 }
 
@@ -161,6 +172,7 @@ pub fn brain_service_unit(ctx: &UnitContext) -> String {
     let vault = ctx.vault.display();
     let home = ctx.home.display();
     let wd = ctx.working_dir.display();
+    let path = &ctx.path;
     format!(
         r#"[Unit]
 Description=Altevra Brain Daemon
@@ -172,6 +184,7 @@ Type=simple
 ExecStartPre=/bin/sh -c 'test ! -f {home}/.altevra/state/maintenance.lock || exit 0'
 ExecStart={b} brain start --db {db} --vault {vault}
 Environment=HOME={home}
+Environment=PATH={path}
 WorkingDirectory={wd}
 Restart=always
 RestartSec=5
@@ -191,6 +204,7 @@ pub fn embedder_service_unit(ctx: &UnitContext) -> String {
     let db = ctx.db.display();
     let home = ctx.home.display();
     let wd = ctx.working_dir.display();
+    let path = &ctx.path;
     format!(
         r#"[Unit]
 Description=Altevra Embedder Worker
@@ -202,6 +216,7 @@ Type=simple
 ExecStartPre=/bin/sh -c 'test ! -f {home}/.altevra/state/maintenance.lock || exit 0'
 ExecStart={b} embed run --db {db}
 Environment=HOME={home}
+Environment=PATH={path}
 WorkingDirectory={wd}
 Restart=always
 RestartSec=5
@@ -438,6 +453,7 @@ mod tests {
             vault: tmp.join("vault"),
             home: tmp.to_path_buf(),
             working_dir: tmp.to_path_buf(),
+            path: format!("{h}/.local/bin:/usr/bin:/bin", h = tmp.display()),
         }
     }
 

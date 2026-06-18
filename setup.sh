@@ -41,52 +41,10 @@ say "Initializing Altevra…"
 "$ALT" init 2>/dev/null || true
 ok "~/.altevra ready"
 
-# ── 4. connect whatever AI tools are installed ────────────────────────────────
-say "Connecting AI tools (auto-detect)…"
-for tool in claude-code codex cursor hermes antigravity; do
-  if "$ALT" connect --tool "$tool" >/dev/null 2>&1; then ok "connected $tool"; fi
-done
-
-# ── 5. LLM: Claude via claude -p (default, no API key) ────────────────────────
-say "Configuring LLM…"
-CFG="${HOME}/.altevra/config.toml"
-if command -v claude >/dev/null 2>&1; then
-  if ! grep -q 'kind = "claude-cli"' "$CFG" 2>/dev/null; then
-    cat >> "$CFG" <<'TOML'
-
-[llm]
-reasoning_mode = "api"
-
-[llm.cheap_worker]
-kind  = "claude-cli"
-model = "claude-haiku-4-5-20251001"
-
-[llm.strong_reasoner]
-kind  = "claude-cli"
-model = "claude-sonnet-4-6"
-TOML
-  fi
-  ok "Claude (claude -p) — Haiku=cheap, Sonnet=reasoning, no API key"
-else
-  warn "claude CLI not found — set an LLM later: 'altevra llm use codex|ollama|vllm'"
-fi
-
-# ── 6. background services (systemd user) ─────────────────────────────────────
-say "Installing autonomous services…"
-if command -v systemctl >/dev/null 2>&1; then
-  "$ALT" service install --apply >/dev/null 2>&1 || true
-  systemctl --user daemon-reload 2>/dev/null || true
-  for s in altevra-brain altevra-embedder; do
-    systemctl --user enable --now "${s}.service" >/dev/null 2>&1 || true
-  done
-  systemctl --user enable --now altevra-backup.timer >/dev/null 2>&1 || true
-  loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-  ok "brain + embedder running (survive reboot)"
-  warn "to capture ALL file work, also run:"
-  echo "      altevra watch start --repo ~/projects --repo ~/Documents --repo ~/notes"
-else
-  warn "systemd not found — run the brain manually: 'altevra brain start'"
-fi
+# ── 4. connect tools + LLM + services (native one-shot wizard) ────────────────
+# Everything after the build is delegated to `altevra setup all`, the native
+# wizard — one source of truth. Re-run `altevra setup all` any time to repair.
+"$ALT" setup all
 
 say "Done. Altevra is live."
 echo "  Try:  altevra recall \"what did I work on\"  ·  altevra brain status"

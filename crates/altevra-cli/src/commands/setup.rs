@@ -1,9 +1,15 @@
 use clap::{Args, Subcommand};
 
 use crate::commands::connect::{resolve_adapter, run as run_connect, ConnectArgs};
+use crate::commands::service::{run_install, ServiceInstallArgs};
 
 #[derive(Subcommand)]
 pub enum SetupCommands {
+    /// One-shot wizard: connect every installed AI tool, configure the LLM
+    /// (Claude via `claude -p` if available — no API key), and install +
+    /// enable the background services. The native equivalent of `setup.sh`
+    /// for everything after the build step. Idempotent.
+    All(SetupAllArgs),
     /// Connect a tool (alias of `connect`)
     Connect(ConnectArgs),
     /// Verify an installation
@@ -15,6 +21,19 @@ pub enum SetupCommands {
     /// v0.3.8 Analyze Everything — import all historical sessions and Obsidian
     /// vault content into Altevra in one shot
     AnalyzeEverything(AnalyzeEverythingArgs),
+}
+
+#[derive(Args)]
+pub struct SetupAllArgs {
+    /// Skip installing/enabling the systemd background services.
+    #[arg(long)]
+    pub no_services: bool,
+    /// Skip writing the Claude (`claude -p`) LLM config.
+    #[arg(long)]
+    pub no_llm: bool,
+    /// Repository path used when connecting tools (defaults to cwd).
+    #[arg(long, default_value = ".")]
+    pub repo: std::path::PathBuf,
 }
 
 #[derive(Args)]
@@ -74,12 +93,138 @@ pub struct SetupStatusArgs {
 
 pub async fn run(cmd: SetupCommands) -> anyhow::Result<()> {
     match cmd {
+        SetupCommands::All(args) => run_all(args).await,
         SetupCommands::Connect(args) => run_connect(args).await,
         SetupCommands::Verify(args) => run_verify(args).await,
         SetupCommands::Repair(args) => run_repair(args).await,
         SetupCommands::Status(args) => run_status(args).await,
         SetupCommands::AnalyzeEverything(args) => run_analyze_everything(args).await,
     }
+}
+
+/// Returns true if `bin` is resolvable on `$PATH`.
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| {
+                let p = dir.join(bin);
+                p.is_file() || p.with_extension("exe").is_file()
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// One-shot post-build wizard: connect tools + configure LLM + install services.
+async fn run_all(args: SetupAllArgs) -> anyhow::Result<()> {
+    println!("\n\x1b[1;31m▸ Altevra setup — connecting tools, LLM, and services\x1b[0m");
+
+    // ── 1. connect every adapter (best-effort; skip ones that fail) ──────────
+    println!("\n\x1b[1;31m▸ Connecting AI tools (auto-detect)\x1b[0m");
+    let mut connected = Vec::new();
+    for tool in ["claude-code", "codex", "cursor", "antigravity"] {
+        let connect_args = ConnectArgs {
+            tool: tool.to_string(),
+            project: None,
+            dry_run: false,
+            force: false,
+            repo: args.repo.clone(),
+        };
+        match run_connect(connect_args).await {
+            Ok(()) => {
+                connected.push(tool);
+                println!("  \x1b[32m✓\x1b[0m {tool}");
+            }
+            Err(e) => println!("  \x1b[33m!\x1b[0m {tool} skipped ({e})"),
+        }
+    }
+    if connected.is_empty() {
+        println!("  \x1b[33m!\x1b[0m no tools connected");
+    }
+
+    // ── 2. LLM: Claude via `claude -p` (no API key) ──────────────────────────
+    if !args.no_llm {
+        println!("\n\x1b[1;31m▸ Configuring LLM\x1b[0m");
+        let cfg_path = altevra_core::home_dir().join(".altevra/config.toml");
+        let existing = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+        if !on_path("claude") {
+            println!(
+                "  \x1b[33m!\x1b[0m claude CLI not found — set one later: \
+                 `altevra llm use codex|ollama|vllm`"
+            );
+        } else if existing.contains("claude-cli") {
+            println!("  \x1b[32m✓\x1b[0m Claude (claude -p) already configured");
+        } else {
+            const LLM_BLOCK: &str = "\n\
+[llm]\n\
+reasoning_mode = \"api\"\n\
+\n\
+[llm.cheap_worker]\n\
+kind  = \"claude-cli\"\n\
+model = \"claude-haiku-4-5-20251001\"\n\
+\n\
+[llm.strong_reasoner]\n\
+kind  = \"claude-cli\"\n\
+model = \"claude-sonnet-4-6\"\n";
+            if let Some(parent) = cfg_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut merged = existing;
+            merged.push_str(LLM_BLOCK);
+            std::fs::write(&cfg_path, merged)?;
+            println!(
+                "  \x1b[32m✓\x1b[0m Claude (claude -p) — Haiku=cheap, Sonnet=reasoning, no API key"
+            );
+        }
+    }
+
+    // ── 3. background services (systemd user) ────────────────────────────────
+    if !args.no_services {
+        println!("\n\x1b[1;31m▸ Installing autonomous services\x1b[0m");
+        if on_path("systemctl") {
+            let install_args = ServiceInstallArgs {
+                binary: None,
+                db: altevra_core::default_db_path(),
+                vault: altevra_core::default_vault_path(),
+                home: None,
+                working_dir: None,
+                dry_run: false,
+                apply: true,
+                mirror_dir: None,
+            };
+            if let Err(e) = run_install(install_args).await {
+                println!("  \x1b[33m!\x1b[0m service install failed: {e}");
+            }
+            let sc = |sargs: &[&str]| {
+                let _ = std::process::Command::new("systemctl")
+                    .arg("--user")
+                    .args(sargs)
+                    .status();
+            };
+            sc(&["daemon-reload"]);
+            sc(&["enable", "--now", "altevra-brain.service"]);
+            sc(&["enable", "--now", "altevra-embedder.service"]);
+            sc(&["enable", "--now", "altevra-backup.timer"]);
+            if let Ok(user) = std::env::var("USER") {
+                let _ = std::process::Command::new("loginctl")
+                    .args(["enable-linger", &user])
+                    .status();
+            }
+            println!("  \x1b[32m✓\x1b[0m brain + embedder running (survive reboot)");
+            println!(
+                "  \x1b[33m!\x1b[0m to capture ALL file work, also run:\n      \
+                 altevra watch start --repo ~/projects --repo ~/Documents"
+            );
+        } else {
+            println!(
+                "  \x1b[33m!\x1b[0m systemd not found — run the brain manually: \
+                 `altevra brain start`"
+            );
+        }
+    }
+
+    println!("\n\x1b[1;31m▸ Done. Altevra is live.\x1b[0m");
+    println!("  Try:  altevra recall \"what did I work on\"  ·  altevra brain status");
+    Ok(())
 }
 
 async fn run_analyze_everything(args: AnalyzeEverythingArgs) -> anyhow::Result<()> {

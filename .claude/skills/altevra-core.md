@@ -126,4 +126,6 @@ All live and autonomous (23 brain jobs, 0 failed):
   ics/imap/linear); task + goal system
 
 LLM runs on `claude -p` (Sonnet/Haiku, your subscription) or codex/ollama/vLLM.
-Install: `bash setup.sh` → one command → live. Report gaps with `altevra report-gap`.
+Install: `bash setup.sh` → one command → live (builds, then runs the native
+wizard `altevra setup all` = connect tools + LLM + services; re-run any time).
+Report gaps with `altevra report-gap`.
