@@ -306,7 +306,11 @@ fn check_managed_file(name: &str, path: &Path, label: &str, fix_cmd: &str) -> Do
         };
     }
     let content = std::fs::read_to_string(path).unwrap_or_default();
-    if content.contains("ALTEVRA_MANAGED: true") {
+    // Markdown/YAML managed files carry the HTML-comment marker
+    // `ALTEVRA_MANAGED: true`; JSON files (e.g. settings.json) can't hold HTML
+    // comments, so the adapter marks them with the `_altevra_managed` field
+    // instead. Accept either, or settings.json false-warns as "manually edited".
+    if content.contains("ALTEVRA_MANAGED: true") || content.contains("_altevra_managed") {
         DoctorCheck {
             name: name.into(),
             status: CheckStatus::Ok,
@@ -750,20 +754,20 @@ fn check_installed_skill_visibility(repo: &Path, vault: &Path) -> DoctorCheck {
     let skills_dir = vault.join("06-skills");
     let installed_dir = repo.join(".claude/skills");
 
-    // Gather vault skill slugs.
+    // Gather vault skill slugs. Only files that actually PARSE as skills count —
+    // and we use the parsed `slug()`, not the file stem. Non-skill artifacts in
+    // 06-skills/ (e.g. resident-agent prompts tagged `type: resident_agent_prompt`)
+    // don't parse and aren't installed by `connect`, so counting them here would
+    // be a false "not installed" warning.
     let vault_slugs: Vec<String> = if skills_dir.exists() {
         std::fs::read_dir(&skills_dir)
             .into_iter()
             .flatten()
             .flatten()
-            .filter(|e| {
-                e.path().extension().map(|x| x == "md").unwrap_or(false)
-            })
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
+            .filter(|e| e.path().extension().map(|x| x == "md").unwrap_or(false))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|raw| altevra_skills::parser::parse_skill(&raw).ok())
+            .map(|skill| skill.slug().to_string())
             .collect()
     } else {
         vec![]
