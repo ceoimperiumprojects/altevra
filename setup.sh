@@ -47,6 +47,5 @@ ok "~/.altevra ready"
 # Run from the repo so the skills source (06-skills/) is found regardless of
 # where `bash setup.sh` was invoked from.
 ( cd "$REPO" && "$ALT" setup all )
-
-say "Done. Altevra is live."
-echo "  Try:  altevra recall \"what did I work on\"  ·  altevra brain status"
+# `altevra setup all` prints its own "Done. Altevra is live." closing banner —
+# no second one here, or the user sees it twice.
