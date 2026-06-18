@@ -682,7 +682,7 @@ pub async fn run_healer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<J
                 "--output-format",
                 "text",
             ])
-            .current_dir("/home/pavle")
+            .current_dir(altevra_core::home_dir())
             .output()
             .await
         {
