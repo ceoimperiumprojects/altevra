@@ -102,6 +102,9 @@ pub enum JobKind {
     /// Resident Brain — the autonomous "what should I do for Pavle now?" loop.
     /// PUN-YOLO (full shell) when ALTEVRA_RESIDENT_YOLO=1, advisory otherwise.
     ResidentOrchestrator,
+    /// Renders the live second-brain state into Obsidian as a read-only showcase
+    /// (Altevra = source, Obsidian = izlog).
+    ObsidianCurator,
 }
 
 impl JobKind {
@@ -133,6 +136,7 @@ impl JobKind {
             Self::ProposalMaterializer => "proposal_materializer",
             Self::SkillSync => "skill_sync",
             Self::ResidentOrchestrator => "resident_orchestrator",
+            Self::ObsidianCurator => "obsidian_curator",
         }
     }
 
@@ -164,6 +168,7 @@ impl JobKind {
             "proposal_materializer" => Self::ProposalMaterializer,
             "skill_sync" => Self::SkillSync,
             "resident_orchestrator" => Self::ResidentOrchestrator,
+            "obsidian_curator" => Self::ObsidianCurator,
             _ => return None,
         })
     }
@@ -224,6 +229,8 @@ impl JobKind {
             Self::SkillSync => 21600,
             // Every 3h: the autonomous resident loop (full-shell when YOLO).
             Self::ResidentOrchestrator => 10800,
+            // Every 30 min: refresh the Obsidian showcase from Altevra.
+            Self::ObsidianCurator => 1800,
         }
     }
 }
@@ -997,6 +1004,76 @@ pub async fn run_resident_orchestrator(
             tasks.len()
         ),
         items_processed: 1,
+    })
+}
+
+/// Obsidian curator — renders the LIVE second-brain state from Altevra into the
+/// Obsidian vault as a read-only SHOWCASE (Pavle's directive: "Altevra je izvor,
+/// Obsidian je izlog"). Writes ~/Obsidian/Imperium/00_Altevra/Dashboard.md from
+/// the DB (active tasks/goals, recent decisions/learnings/ideas) — auto-refreshed,
+/// clearly marked generated, never touches his hand-written notes.
+pub async fn run_obsidian_curator(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    let home = altevra_core::home_dir();
+    let dir = home.join("Obsidian/Imperium/00_Altevra");
+    if !home.join("Obsidian/Imperium").is_dir() {
+        return Ok(JobResult {
+            summary: "obsidian_curator: no Obsidian/Imperium vault — skipped".into(),
+            items_processed: 0,
+        });
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return Ok(JobResult {
+            summary: "obsidian_curator: could not create showcase dir".into(),
+            items_processed: 0,
+        });
+    }
+
+    async fn col(pool: &SqlitePool, sql: &str) -> Vec<String> {
+        sqlx::query_scalar::<_, String>(sql).fetch_all(pool).await.unwrap_or_default()
+    }
+    let tasks = col(pool, "SELECT title FROM tasks WHERE status IN ('active','open','in_progress') ORDER BY updated_at DESC LIMIT 20").await;
+    let goals = col(pool, "SELECT title FROM goals WHERE status = 'active' ORDER BY updated_at DESC LIMIT 12").await;
+    let decisions = col(pool, "SELECT title FROM decisions ORDER BY decided_at DESC LIMIT 8").await;
+    let learnings = col(pool, "SELECT title FROM learnings ORDER BY created_at DESC LIMIT 8").await;
+    let ideas = col(pool, "SELECT body FROM personal_notes WHERE kind = 'idea' ORDER BY created_at DESC LIMIT 8").await;
+
+    fn bullets(items: &[String]) -> String {
+        if items.is_empty() {
+            "_(none yet)_".to_string()
+        } else {
+            items.iter().map(|s| format!("- {}", s.trim())).collect::<Vec<_>>().join("\n")
+        }
+    }
+
+    let stamp = ctx.now.format("%Y-%m-%d %H:%M");
+    let md = format!(
+        "---\nALTEVRA_GENERATED: true\n---\n\n\
+         # 🧠 Altevra Dashboard — LIVE\n\n\
+         > Auto-rendered from Altevra (the source of truth). **Do not edit by hand** — \
+         changes are overwritten. Last refresh: {stamp}.\n\n\
+         ## ✅ Active tasks\n{}\n\n\
+         ## 🎯 Active goals\n{}\n\n\
+         ## 🧩 Recent decisions\n{}\n\n\
+         ## 💡 Recent ideas\n{}\n\n\
+         ## 📚 Recent learnings\n{}\n\n\
+         ---\n_Source: `altevra recall` / MCP. This page is a window, not a notebook._\n",
+        bullets(&tasks),
+        bullets(&goals),
+        bullets(&decisions),
+        bullets(&ideas),
+        bullets(&learnings),
+    );
+
+    let written = std::fs::write(dir.join("Dashboard.md"), md).is_ok();
+    Ok(JobResult {
+        summary: format!(
+            "obsidian_curator: {} dashboard ({} tasks, {} goals, {} ideas)",
+            if written { "rendered" } else { "FAILED" },
+            tasks.len(),
+            goals.len(),
+            ideas.len()
+        ),
+        items_processed: usize::from(written),
     })
 }
 
@@ -2442,6 +2519,7 @@ pub async fn dispatch(
         JobKind::ProposalMaterializer => run_proposal_materializer(pool, ctx).await,
         JobKind::SkillSync => run_skill_sync(pool, ctx).await,
         JobKind::ResidentOrchestrator => run_resident_orchestrator(pool, ctx).await,
+        JobKind::ObsidianCurator => run_obsidian_curator(pool, ctx).await,
     }
 }
 
@@ -2596,13 +2674,14 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 26] {
+pub fn all_kinds() -> [JobKind; 27] {
     [
         JobKind::EventClassifier,
         // Cheap, no-LLM, idempotent — run early so it isn't starved behind the
         // expensive LLM jobs (a full cycle of claude -p calls can take minutes).
         JobKind::ProposalMaterializer,
         JobKind::SkillSync,
+        JobKind::ObsidianCurator,
         JobKind::ObserverScan,
         JobKind::VaultIndexer,
         JobKind::InsightSynthesizer,
