@@ -48,11 +48,34 @@ See [LICENSE](./LICENSE) for the full PolyForm Strict 1.0.0 terms.
 
 ## Quick start
 
+### 🔌 Plug-and-play (one command)
+
+```bash
+git clone https://github.com/ceoimperiumprojects/altevra.git
+cd altevra
+bash setup.sh
+```
+
+`setup.sh` builds Altevra, puts it on your `PATH`, connects every AI tool it
+detects, configures the LLM (Claude via `claude -p` — your subscription, no API
+key), and installs the autonomous background services (brain + embedder, surviving
+reboot). Idempotent — safe to re-run. **That's it: clone → one command → live.**
+
+Then point your AI tools at the MCP server (auto-wired by `altevra connect`) and
+the [`altevra-core` skill](#) bootstraps every session. Verify:
+
+```bash
+altevra brain status        # jobs running, 0 failed
+altevra recall "what did I work on"
+```
+
+<details><summary>Manual setup (if you want to do it step-by-step)</summary>
+
 ```bash
 # Build from source (binary releases coming in v0.4)
 git clone https://github.com/ceoimperiumprojects/altevra.git
 cd altevra
-cargo build --release
+cargo build --release --features embedding
 sudo ln -s "$PWD/target/release/altevra" /usr/local/bin/altevra   # or ~/.local/bin/
 
 # Initialize Altevra in any project
@@ -65,13 +88,41 @@ altevra connect --tool cursor
 altevra connect --tool hermes
 altevra connect --tool antigravity
 
-# Pick a reasoning model — one command
+# Pick a reasoning model
 altevra llm use codex          # ChatGPT Plus (codex_oauth, no API key)
 altevra llm use ollama         # Ollama on localhost:11434
 altevra llm use vllm           # vLLM OpenAI-compat
 altevra llm use local-first    # Ollama for personal, codex for everything else
+```
 
-# Start the brain (autonomous research + self-improve + curator)
+**Recommended: Claude via the `claude -p` CLI** (uses your Claude subscription, no
+API key). Set it in `~/.altevra/config.toml`:
+
+```toml
+[llm]
+reasoning_mode = "api"
+
+[llm.cheap_worker]      # fast/cheap classification, categorization
+kind  = "claude-cli"
+model = "claude-haiku-4-5-20251001"
+
+[llm.strong_reasoner]   # synthesis: insights, extraction, wiki, healer
+kind  = "claude-cli"
+model = "claude-sonnet-4-6"
+```
+
+> The `claude-cli` provider shells out to `claude -p` in an isolated sandbox
+> (`--settings '{}'` so it never recurses into Altevra's own hooks). Requires the
+> [Claude Code CLI](https://claude.com/claude-code) on your `PATH`.
+
+```bash
+# Start everything (brain jobs + file watcher + embedder).
+# Easiest: install the systemd user services so they survive logout/reboot:
+altevra service install --apply
+systemctl --user enable --now altevra-brain altevra-embedder altevra-backup.timer
+loginctl enable-linger "$USER"          # survive logout
+
+# Or just run the brain in the foreground:
 altevra brain start
 
 # Capture an Obsidian-style note, atomized per section
@@ -81,6 +132,18 @@ altevra capture ~/Obsidian/Memory/Decisions.md
 altevra recall "americans" --window last_month
 altevra recall --with Srđan
 ```
+
+### Capture ALL your work, not just AI sessions
+
+A file watcher indexes everything you touch (code, docs, notes) across your work
+dirs, so it becomes recall-able — not just AI-tool sessions:
+
+```bash
+altevra watch start --repo ~/projects --repo ~/Documents --repo ~/notes
+# (build dirs like target/ node_modules/ .next/ .cache/ are ignored automatically)
+```
+
+</details>
 
 ---
 
