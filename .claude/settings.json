@@ -28,7 +28,7 @@
       {
         "hooks": [
           {
-            "command": "altevra hook-handle session_start --tool claude-code --project $ALTEVRA_PROJECT",
+            "command": "altevra hook-handle session_start --tool claude-code",
             "type": "command"
           }
         ],
