@@ -143,7 +143,10 @@ pub fn run_checks_with_paths(
     ]
 }
 
-/// Convenience wrapper used by CLI (derives paths from $HOME).
+/// Convenience wrapper (derives auxiliary paths from $HOME). Test-only — the
+/// CLI `run` builds the paths itself; gated to `#[cfg(test)]` so release builds
+/// don't warn about an unused fn.
+#[cfg(test)]
 pub fn run_checks(repo: &Path, vault: &Path) -> Vec<DoctorCheck> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -370,12 +373,23 @@ fn check_skills_parseable(vault: &Path) -> DoctorCheck {
         if path.extension().map(|e| e == "md").unwrap_or(false) {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if altevra_skills::parser::parse_skill(&content).is_err() {
-                    errors.push(
-                        path.file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
+                    // A file in 06-skills/ that fails to parse is only a *broken
+                    // skill* if it was meant to be a skill — i.e. it declares a
+                    // `slug:`. Files without one (e.g. resident-agent prompts
+                    // tagged `type: resident_agent_prompt`) are deliberately not
+                    // tool skills; `connect` silently skips them, so do we, to
+                    // avoid a false-positive health failure.
+                    let declares_slug = content
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("slug:"));
+                    if declares_slug {
+                        errors.push(
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                        );
+                    }
                 }
             }
         }

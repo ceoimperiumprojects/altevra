@@ -94,6 +94,13 @@ altevra brain status        # jobs running, 0 failed
 altevra recall "what did I work on"
 ```
 
+**Something not working?** Run the built-in health check — it tells you exactly
+what's wired and what to fix, with a copy-paste fix for each warning:
+
+```bash
+altevra doctor              # ✓/⚠ across vault, skills, hooks, brain, MCP, embeddings
+```
+
 <details><summary>Manual setup (if you want to do it step-by-step)</summary>
 
 ```bash
