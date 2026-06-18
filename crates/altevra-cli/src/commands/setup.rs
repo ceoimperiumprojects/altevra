@@ -31,6 +31,9 @@ pub struct SetupAllArgs {
     /// Skip writing the Claude (`claude -p`) LLM config.
     #[arg(long)]
     pub no_llm: bool,
+    /// Skip registering the Altevra MCP server with Claude Code.
+    #[arg(long)]
+    pub no_mcp: bool,
     /// Repository path used when connecting tools (defaults to cwd).
     #[arg(long, default_value = ".")]
     pub repo: std::path::PathBuf,
@@ -177,7 +180,44 @@ model = \"claude-sonnet-4-6\"\n";
         }
     }
 
-    // ── 3. background services (systemd user) ────────────────────────────────
+    // ── 3. register the MCP server with Claude Code ──────────────────────────
+    // `altevra connect` wires hooks + skills but not the MCP server (which lives
+    // in Claude's own ~/.claude.json, not a repo file). We register it via the
+    // `claude` CLI so Claude manages its own config — no file clobbering. Points
+    // at the running binary (current_exe) so it can't go stale.
+    if !args.no_mcp {
+        println!("\n\x1b[1;31m▸ Registering MCP server with Claude Code\x1b[0m");
+        if on_path("claude") {
+            let exe = std::env::current_exe()
+                .ok()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "altevra".to_string());
+            // Idempotent: drop any prior `altevra` entry, then add the canonical
+            // one at user scope (available across all projects).
+            let _ = std::process::Command::new("claude")
+                .args(["mcp", "remove", "altevra", "-s", "user"])
+                .output();
+            let added = std::process::Command::new("claude")
+                .args(["mcp", "add", "altevra", "-s", "user", "--", &exe, "serve"])
+                .output();
+            match added {
+                Ok(o) if o.status.success() => {
+                    println!("  \x1b[32m✓\x1b[0m altevra MCP server registered (user scope)")
+                }
+                _ => println!(
+                    "  \x1b[33m!\x1b[0m couldn't auto-register — run: \
+                     `claude mcp add altevra -- altevra serve`"
+                ),
+            }
+        } else {
+            println!(
+                "  \x1b[33m!\x1b[0m claude CLI not found — register MCP later: \
+                 `claude mcp add altevra -- altevra serve`"
+            );
+        }
+    }
+
+    // ── 4. background services (systemd user) ────────────────────────────────
     if !args.no_services {
         println!("\n\x1b[1;31m▸ Installing autonomous services\x1b[0m");
         if on_path("systemctl") {

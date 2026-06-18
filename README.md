@@ -63,11 +63,20 @@ autonomous background services (brain + embedder, surviving reboot). Idempotent 
 safe to re-run. **That's it: clone → one command → live.**
 
 > Already built? Just run **`altevra setup all`** any time to (re)connect tools,
-> set the LLM, and (re)install services. Use `--no-services` / `--no-llm` to skip
-> either step.
+> set the LLM, register the MCP server, and (re)install services. Use
+> `--no-services` / `--no-llm` / `--no-mcp` to skip any step.
 
-Then point your AI tools at the MCP server (auto-wired by `altevra connect`) and
-the [`altevra-core` skill](#) bootstraps every session. Verify:
+`altevra setup all` also registers the Altevra **MCP server** with Claude Code
+(`claude mcp add altevra -- altevra serve`, user scope) so every session gets the
+40+ Altevra tools, and the [`altevra-core` skill](#) bootstraps automatically.
+Other tools (Codex, Cursor, Antigravity) get their MCP config written by
+`altevra connect`. Verify the server is live:
+
+```bash
+claude mcp list             # → altevra: … ✔ Connected
+```
+
+Then verify the brain:
 
 ```bash
 altevra brain status        # jobs running, 0 failed
