@@ -32,6 +32,7 @@ pub mod mirror;
 pub mod note;
 pub mod observer;
 pub mod prompt;
+pub mod ask;
 pub mod recall;
 pub mod research;
 pub mod resident;
