@@ -69,9 +69,11 @@ bash setup.sh
 autonomous background services (brain + embedder, surviving reboot). Idempotent —
 safe to re-run. **That's it: clone → one command → live.**
 
-> Already built? Just run **`altevra setup all`** any time to (re)connect tools,
-> set the LLM, register the MCP server, and (re)install services. Use
-> `--no-services` / `--no-llm` / `--no-mcp` to skip any step.
+> Already built? Just run **`altevra setup`** (or `altevra setup all`) any time to
+> (re)connect tools, set the LLM, register the MCP server, promote skills, and
+> (re)install services. Bare `altevra setup` runs the full wizard with defaults;
+> use `altevra setup all --no-services / --no-llm / --no-mcp / --no-global-skills`
+> to skip any step.
 
 `altevra setup all` also registers the Altevra **MCP server** with Claude Code
 (`claude mcp add altevra -- altevra serve`, user scope) so every session gets the

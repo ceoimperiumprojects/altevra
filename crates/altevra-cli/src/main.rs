@@ -56,9 +56,12 @@ enum Commands {
     #[command(subcommand)]
     Connector(commands::connector::ConnectorCommands),
 
-    /// Tool setup management (alias of connect with verify/repair/status)
-    #[command(subcommand)]
-    Setup(commands::setup::SetupCommands),
+    /// Tool setup. Bare `altevra setup` runs the full wizard (= `setup all`);
+    /// subcommands: all/connect/verify/repair/status/analyze-everything.
+    Setup {
+        #[command(subcommand)]
+        cmd: Option<commands::setup::SetupCommands>,
+    },
 
     /// Agent lifecycle commands
     #[command(subcommand)]
@@ -255,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hook(cmd) => commands::hook::run(cmd).await,
         Commands::Connect(args) => commands::connect::run(args).await,
         Commands::Connector(cmd) => commands::connector::run(cmd).await,
-        Commands::Setup(cmd) => commands::setup::run(cmd).await,
+        Commands::Setup { cmd } => commands::setup::run_optional(cmd).await,
         Commands::Agent(cmd) => commands::agent::run(cmd).await,
         Commands::Serve(args) => commands::serve::run(args).await,
         Commands::Doctor(args) => commands::doctor::run(args).await,

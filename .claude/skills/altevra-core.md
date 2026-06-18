@@ -127,7 +127,7 @@ All live and autonomous (23 brain jobs, 0 failed):
 
 LLM runs on `claude -p` (Sonnet/Haiku, your subscription) or codex/ollama/vLLM.
 Install: `bash setup.sh` → one command → live (builds, then runs the native
-wizard `altevra setup all` = connect tools + LLM + MCP server registration +
-services; re-run any time). The MCP server (`altevra serve`, 40+ tools) is
-auto-registered with Claude Code — verify with `claude mcp list`.
-Report gaps with `altevra report-gap`.
+wizard). Re-run the wizard any time with bare **`altevra setup`** (= connect
+tools + LLM + MCP registration + global skills + services). The MCP server
+(`altevra serve`, 40+ tools) is auto-registered with Claude Code — verify with
+`claude mcp list`. Report gaps with `altevra report-gap`.

@@ -97,6 +97,25 @@ pub struct SetupStatusArgs {
     pub json: bool,
 }
 
+/// Entry point when the subcommand is optional. Bare `altevra setup` (no
+/// subcommand) runs the full wizard — the literal `altevra setup` the
+/// plug-and-play UX promises — instead of printing a help screen.
+pub async fn run_optional(cmd: Option<SetupCommands>) -> anyhow::Result<()> {
+    match cmd {
+        Some(c) => run(c).await,
+        None => {
+            run_all(SetupAllArgs {
+                no_services: false,
+                no_llm: false,
+                no_mcp: false,
+                no_global_skills: false,
+                repo: std::path::PathBuf::from("."),
+            })
+            .await
+        }
+    }
+}
+
 pub async fn run(cmd: SetupCommands) -> anyhow::Result<()> {
     match cmd {
         SetupCommands::All(args) => run_all(args).await,
