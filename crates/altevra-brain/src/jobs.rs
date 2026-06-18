@@ -92,6 +92,13 @@ pub enum JobKind {
     /// become recall-able). Idempotent by title. Closes the "proposed but never
     /// materialized" gap (workflow diagnosis 2026-06-18).
     ProposalMaterializer,
+    /// Autonomous skill updater. Periodically runs `altevra skill sync --apply`
+    /// so every managed skill stays fresh and propagated across all connected
+    /// tools (claude/codex/cursor/hermes/imperium) — newly promoted skills land
+    /// everywhere and existing ones get refreshed when their source changes.
+    /// NEVER overwrites a user-authored skill (sync skips non-managed files).
+    /// Pavle's 2026-06-18 directive: "da update-uje skillove, postojeće uključeno."
+    SkillSync,
 }
 
 impl JobKind {
@@ -121,6 +128,7 @@ impl JobKind {
             Self::FileChangeIndexer => "file_change_indexer",
             Self::WikiCurator => "wiki_curator",
             Self::ProposalMaterializer => "proposal_materializer",
+            Self::SkillSync => "skill_sync",
         }
     }
 
@@ -150,6 +158,7 @@ impl JobKind {
             "file_change_indexer" => Self::FileChangeIndexer,
             "wiki_curator" => Self::WikiCurator,
             "proposal_materializer" => Self::ProposalMaterializer,
+            "skill_sync" => Self::SkillSync,
             _ => return None,
         })
     }
@@ -206,6 +215,8 @@ impl JobKind {
             // Every 30 min: drain applied knowledge-proposals into learnings.
             // Cheap (a handful of small rows), idempotent, no LLM.
             Self::ProposalMaterializer => 1800,
+            // Every 6h: keep managed skills fresh + propagated across tools.
+            Self::SkillSync => 21600,
         }
     }
 }
@@ -1014,6 +1025,42 @@ pub async fn run_proposal_materializer(
         ),
         items_processed: materialized,
     })
+}
+
+/// Autonomous skill updater: `altevra skill sync --apply` as a subprocess (same
+/// pattern as memory_writeback). Propagates the freshest version of every managed
+/// skill across all connected tools and refreshes drifted ones; user-authored
+/// skills are never touched (sync skips non-managed files). The daemon runs this
+/// so skills stay current without Pavle asking.
+pub async fn run_skill_sync(_pool: &SqlitePool, _ctx: &JobContext) -> anyhow::Result<JobResult> {
+    let vault = altevra_core::default_vault_path();
+    let out = tokio::process::Command::new("altevra")
+        .args(["skill", "sync", "--apply", "--vault"])
+        .arg(&vault)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let line = stdout
+                .lines()
+                .find(|l| l.contains("creates:") || l.contains("Applied") || l.contains("apply"))
+                .unwrap_or("skills propagated")
+                .trim();
+            Ok(JobResult {
+                summary: format!("skill_sync: {line}"),
+                items_processed: 1,
+            })
+        }
+        Ok(o) => Ok(JobResult {
+            summary: format!("skill_sync failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+            items_processed: 0,
+        }),
+        Err(e) => Ok(JobResult {
+            summary: format!("skill_sync exec error: {e}"),
+            items_processed: 0,
+        }),
+    }
 }
 
 /// Run pattern detection across recent events via SQLite + `detect_patterns`.
@@ -2167,6 +2214,7 @@ pub async fn dispatch(
         JobKind::FileChangeIndexer => run_file_change_indexer(pool, ctx).await,
         JobKind::WikiCurator => run_wiki_curator(pool, ctx).await,
         JobKind::ProposalMaterializer => run_proposal_materializer(pool, ctx).await,
+        JobKind::SkillSync => run_skill_sync(pool, ctx).await,
     }
 }
 
@@ -2321,7 +2369,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 24] {
+pub fn all_kinds() -> [JobKind; 25] {
     [
         JobKind::EventClassifier,
         // Cheap, no-LLM, idempotent — run early so it isn't starved behind the
@@ -2349,6 +2397,7 @@ pub fn all_kinds() -> [JobKind; 24] {
         JobKind::Healer,
         JobKind::FileChangeIndexer,
         JobKind::WikiCurator,
+        JobKind::SkillSync,
     ]
 }
 
