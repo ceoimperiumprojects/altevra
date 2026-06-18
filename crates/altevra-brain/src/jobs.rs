@@ -331,24 +331,31 @@ pub async fn run_personal_extractor(
 
     let messages = vec![
         ChatMessage::system(
-            "You extract DURABLE personal-brain facts from an activity log. Return ONLY \
-             compact JSON, no markdown, no prose. ALWAYS include all three keys, using \
-             empty arrays when nothing qualifies: \
+            "You extract DURABLE second-brain facts from an activity log. Return ONLY \
+             compact JSON, no markdown, no prose. ALWAYS include ALL keys, empty arrays \
+             when nothing qualifies: \
              {\"persons\":[{\"name\":\"\",\"note\":\"\"}],\
              \"decisions\":[{\"title\":\"\",\"rationale\":\"\"}],\
-             \"goals\":[{\"title\":\"\"}]}. \
-             persons = any REAL named person mentioned with context — mentors, partner, \
-             family, clients, colleagues, friends, investors, contacts. Capture their \
-             name and a short note on who they are or why they matter. \
-             decisions = concrete decisions made. goals = concrete goals set. \
-             Base everything ONLY on what the activity log actually says — NEVER invent \
-             people, decisions, or goals that aren't there. Keep each field short.",
+             \"goals\":[{\"title\":\"\"}],\
+             \"preferences\":[{\"key\":\"\",\"value\":\"\"}],\
+             \"tasks\":[{\"title\":\"\",\"detail\":\"\"}],\
+             \"notes\":[{\"kind\":\"\",\"body\":\"\"}]}. \
+             persons = REAL named people mentioned with context (mentors, partner, family, \
+             clients, colleagues, investors). decisions = concrete decisions made. \
+             goals = concrete goals set. \
+             preferences = stated likes/dislikes/conventions Pavle holds (coding style, \
+             tools, food, communication, workflow — e.g. key=\"dash-style\" value=\"minus not em-dash\"). \
+             tasks = concrete ACTIONABLE to-dos that are still OPEN/active (something to do next). \
+             notes = anything else durable & personal: kind is one of \
+             idea|relationship|health|fitness|mood|hobby|place|book|learning|interest, \
+             body is the fact. Capture IDEAS Pavle floats here as kind=\"idea\". \
+             Base everything ONLY on what the log says — NEVER invent. Keep fields short.",
         ),
         ChatMessage::user(format!("Activity log (oldest first):\n{block}")),
     ];
 
     let raw = match provider
-        .complete(&messages, &ChatOpts::default().with_max_tokens(800))
+        .complete(&messages, &ChatOpts::default().with_max_tokens(1400))
         .await
     {
         Ok(t) => t,
@@ -468,10 +475,90 @@ pub async fn run_personal_extractor(
         }
     }
 
+    // --- preferences (dedup by pref_key) ---
+    let mut prefs_saved = 0usize;
+    if let Some(arr) = parsed.get("preferences").and_then(|v| v.as_array()) {
+        for p in arr {
+            let key = p.get("key").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            let value = p.get("value").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            if let (Some(key), Some(value)) = (key, value) {
+                let exists: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM preferences WHERE pref_key = ? LIMIT 1")
+                        .bind(key)
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap_or(None);
+                if exists.is_none() && persons.add_preference(key, value).await.is_ok() {
+                    materialized += 1;
+                    prefs_saved += 1;
+                }
+            }
+        }
+    }
+
+    // --- active tasks (dedup by title among open tasks) ---
+    let mut tasks_saved = 0usize;
+    if let Some(arr) = parsed.get("tasks").and_then(|v| v.as_array()) {
+        for t in arr {
+            if let Some(title) = t.get("title").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let exists: Option<String> = sqlx::query_scalar(
+                    "SELECT id FROM tasks WHERE title = ? AND status IN ('active','open','in_progress') LIMIT 1",
+                )
+                .bind(title)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+                if exists.is_some() {
+                    continue;
+                }
+                let row = altevra_db::TaskRow {
+                    id: uuid::Uuid::new_v4(),
+                    project_id: None,
+                    title: title.to_string(),
+                    description: t.get("detail").and_then(|v| v.as_str()).map(String::from),
+                    status: "active".into(),
+                    priority: "medium".into(),
+                    assignee: None,
+                    due_at: None,
+                    metadata: serde_json::json!({"origin": "personal_extractor"}),
+                    created_at: ctx.now,
+                    updated_at: ctx.now,
+                };
+                if tasks.upsert_task(&row).await.is_ok() {
+                    materialized += 1;
+                    tasks_saved += 1;
+                }
+            }
+        }
+    }
+
+    // --- personal notes: ideas / relationships / health / mood / hobby / … (dedup by body) ---
+    let mut notes_saved = 0usize;
+    if let Some(arr) = parsed.get("notes").and_then(|v| v.as_array()) {
+        use altevra_db::PersonalNoteRow;
+        for n in arr {
+            let kind = n.get("kind").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).unwrap_or("idea");
+            let body = n.get("body").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+            if let Some(body) = body {
+                let exists: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM personal_notes WHERE body = ? LIMIT 1")
+                        .bind(body)
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap_or(None);
+                if exists.is_none() && persons.insert(&PersonalNoteRow::new(kind, body)).await.is_ok() {
+                    materialized += 1;
+                    notes_saved += 1;
+                }
+            }
+        }
+    }
+
     Ok(JobResult {
         summary: format!(
-            "personal_extractor: materialized {materialized} fact(s) \
-             (persons {persons_saved}/{llm_persons}, decisions+goals from {} llm items)",
+            "personal_extractor: {materialized} fact(s) — persons {persons_saved}, \
+             prefs {prefs_saved}, tasks {tasks_saved}, notes {notes_saved}, \
+             decisions+goals from {} llm items",
             llm_decisions + llm_goals
         ),
         items_processed: materialized,
