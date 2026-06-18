@@ -110,6 +110,15 @@ fn build_provider(spec: &ProviderSettings) -> Option<Arc<dyn ChatProvider>> {
                 .unwrap_or_else(|| crate::anthropic::DEFAULT_ANTHROPIC_MODEL.to_string());
             Some(Arc::new(AnthropicProvider::new(key, model)))
         }
+        // Claude via the `claude -p` headless CLI (Pavle's subscription, no key).
+        // cheap_worker → Haiku, strong_reasoner → Sonnet (set per-role in config).
+        "claude-cli" | "claude" => {
+            let model = spec
+                .model
+                .clone()
+                .unwrap_or_else(|| "claude-sonnet-4-6".to_string());
+            Some(Arc::new(crate::claude_cli::ClaudeCliProvider::new(model)))
+        }
         other => {
             tracing::warn!("unknown llm provider kind '{other}' — ignoring");
             None

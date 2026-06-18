@@ -14,6 +14,7 @@
 
 pub mod anthropic;
 pub mod chat;
+pub mod claude_cli;
 pub mod codex_oauth;
 pub mod factory;
 pub mod gemini;
@@ -23,6 +24,7 @@ pub mod rate_limit;
 
 pub use anthropic::AnthropicProvider;
 pub use chat::{ChatMessage, ChatOpts, ChatRole};
+pub use claude_cli::ClaudeCliProvider;
 pub use codex_oauth::{CodexOAuthProvider, CodexWire};
 pub use factory::build_router;
 pub use gemini::GeminiFlashChat;

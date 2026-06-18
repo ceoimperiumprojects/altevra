@@ -1,5 +1,6 @@
-use altevra_core::updates::{Importance, UpdateFeedItem};
+use altevra_core::updates::{Importance, UpdateFeedItem, UpdatesQuery};
 use serde_json::Value;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::server::McpResponse;
@@ -9,13 +10,38 @@ pub fn handle_get_last_updates(id: Value, args: &Value) -> McpResponse {
         .as_str()
         .map(parse_since_str)
         .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
-    let project_filter = args["project"].as_str();
     let importance_min = args["importance_min"]
         .as_str()
         .and_then(|s| s.parse::<Importance>().ok());
+    let db_path: PathBuf = args
+        .get("db_path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(altevra_core::default_db_path);
 
-    let items = load_local(since, project_filter, importance_min.as_ref());
+    // Read the DB `update_feed` table (filled by the event_classifier bridge),
+    // not the stale JSONL the old path read.
+    let result: anyhow::Result<Vec<UpdateFeedItem>> =
+        std::thread::spawn(move || -> anyhow::Result<Vec<UpdateFeedItem>> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(async move {
+                let pool = altevra_db::create_pool(&db_path.to_string_lossy()).await?;
+                altevra_db::run_migrations(&pool).await?;
+                let q = UpdatesQuery {
+                    since: Some(since),
+                    limit: Some(50),
+                    importance_min,
+                    ..Default::default()
+                };
+                altevra_db::UpdatesRepository::new(&pool).query(&q).await
+            })
+        })
+        .join()
+        .unwrap_or_else(|_| Ok(vec![]));
 
+    let items = result.unwrap_or_default();
     McpResponse::ok(
         id,
         serde_json::json!({
@@ -63,36 +89,6 @@ pub fn handle_mark_updates_read(id: Value, args: &Value) -> McpResponse {
         return McpResponse::error(id, -32000, format!("write failed: {e}"));
     }
     McpResponse::ok(id, serde_json::json!({"marked_read": true}))
-}
-
-fn load_local(
-    since: chrono::DateTime<chrono::Utc>,
-    project: Option<&str>,
-    importance_min: Option<&Importance>,
-) -> Vec<UpdateFeedItem> {
-    let path = altevra_core::home_dir().join(".altevra/events/updates.jsonl");
-    if !path.exists() {
-        return vec![];
-    }
-    let content = std::fs::read_to_string(path).unwrap_or_default();
-    let mut items: Vec<UpdateFeedItem> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str(l).ok())
-        .filter(|u: &UpdateFeedItem| u.created_at >= since)
-        .filter(|u: &UpdateFeedItem| {
-            project
-                .map(|p| u.title.contains(p) || u.update_type.contains(p))
-                .unwrap_or(true)
-        })
-        .filter(|u: &UpdateFeedItem| {
-            importance_min
-                .map(|imin| &u.importance >= imin)
-                .unwrap_or(true)
-        })
-        .collect();
-    items.sort_by_key(|i| std::cmp::Reverse(i.created_at));
-    items
 }
 
 fn parse_since_str(s: &str) -> chrono::DateTime<chrono::Utc> {

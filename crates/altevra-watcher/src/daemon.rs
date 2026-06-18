@@ -33,6 +33,13 @@ const DEFAULT_IGNORES: &[&str] = &[
     ".venv",
     "dist",
     "build",
+    ".next",
+    ".cache",
+    ".turbo",
+    ".svelte-kit",
+    ".parcel-cache",
+    ".pytest_cache",
+    "venv",
 ];
 
 #[derive(Debug, Clone)]

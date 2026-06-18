@@ -40,6 +40,37 @@ impl<'a> UpdatesRepository<'a> {
         Ok(())
     }
 
+    /// Idempotent insert keyed on the update id — `INSERT OR IGNORE`. The
+    /// event_classifier derives a deterministic id (UUIDv5 of the event id) so
+    /// re-running the bridge over the same events never duplicates rows.
+    /// Returns `true` when a row was actually written.
+    pub async fn insert_or_ignore(&self, item: &UpdateFeedItem) -> anyhow::Result<bool> {
+        let res = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO update_feed (id, event_id, project_id, update_type, importance,
+                title, short_summary, agent_summary, affected_entities,
+                recommended_agent_action, visible_to_agents, sensitivity, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(item.id.to_string())
+        .bind(item.event_id.to_string())
+        .bind(item.project_id.map(|u| u.to_string()))
+        .bind(&item.update_type)
+        .bind(item.importance.to_string())
+        .bind(&item.title)
+        .bind(&item.short_summary)
+        .bind(item.agent_summary.as_deref())
+        .bind(item.affected_entities.to_string())
+        .bind(item.recommended_agent_action.as_deref())
+        .bind(if item.visible_to_agents { 1_i64 } else { 0_i64 })
+        .bind(item.sensitivity.to_string())
+        .bind(ts_to_text(&item.created_at))
+        .execute(self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn query(&self, q: &UpdatesQuery) -> anyhow::Result<Vec<UpdateFeedItem>> {
         let since = q
             .since

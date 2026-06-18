@@ -29,3 +29,4 @@ graphify-out/
 # local altevra state — never commit (sessions/DBs/quarantine)
 /.altevra/
 **/.altevra/
+.fastembed_cache/

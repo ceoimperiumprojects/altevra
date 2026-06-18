@@ -497,62 +497,37 @@ async fn run_write(args: WriteArgs) -> anyhow::Result<()> {
 pub async fn build_digest(pool: &SqlitePool) -> String {
     let mut sections: Vec<String> = Vec::new();
 
-    // Decisions.
-    if let Ok(rows) = altevra_db::ObjectIndexRepository::new(pool)
-        .candidates(None)
-        .await
+    // Decisions — read the `decisions` table directly (where personal_extractor
+    // and `altevra note` write). The old object_index path was empty because
+    // extracted decisions never enter object_index.
+    if let Ok(rows) = sqlx::query_as::<_, (String,)>(
+        "SELECT title FROM decisions ORDER BY decided_at DESC LIMIT 6",
+    )
+    .fetch_all(pool)
+    .await
     {
-        let decisions: Vec<_> = rows
-            .iter()
-            .filter(|r| {
-                r.object_type == "decision"
-                    && r.status == "active"
-                    // ExposureGate: only business/public domain; internal sensitivity max.
-                    && matches!(r.domain.as_str(), "business" | "project" | "public")
-                    && matches!(
-                        r.sensitivity.as_str(),
-                        "public" | "internal" | "confidential"
-                    )
-                    && matches!(r.redaction_status.as_str(), "clean" | "redacted")
-            })
-            .take(5)
-            .collect();
-        if !decisions.is_empty() {
+        if !rows.is_empty() {
             let mut sec = "### Recent Decisions\n".to_string();
-            for d in &decisions {
-                let title = d.title.as_deref().unwrap_or("(untitled)");
+            for (title,) in &rows {
                 sec.push_str(&format!("- {title}\n"));
             }
             sections.push(sec);
         }
     }
 
-    // Goals.
-    let goals_path = altevra_bootstrap::session_context::default_goals_path();
-    if let Ok(raw) = std::fs::read_to_string(&goals_path) {
-        if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(&raw) {
-            let open_goals: Vec<_> = arr
-                .iter()
-                .filter(|g| {
-                    let status = g.get("status").and_then(|s| s.as_str()).unwrap_or("open");
-                    let domain = g.get("domain").and_then(|d| d.as_str()).unwrap_or("business");
-                    status == "open"
-                        && matches!(domain, "business" | "project" | "public")
-                })
-                .take(5)
-                .collect();
-            if !open_goals.is_empty() {
-                let mut sec = "### Active Goals\n".to_string();
-                for g in &open_goals {
-                    let title = g
-                        .get("title")
-                        .or_else(|| g.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("(untitled)");
-                    sec.push_str(&format!("- {title}\n"));
-                }
-                sections.push(sec);
+    // Goals — read the `goals` table directly (the JSON-file path was empty).
+    if let Ok(rows) = sqlx::query_as::<_, (String,)>(
+        "SELECT title FROM goals WHERE status = 'active' ORDER BY created_at DESC LIMIT 6",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        if !rows.is_empty() {
+            let mut sec = "### Active Goals\n".to_string();
+            for (title,) in &rows {
+                sec.push_str(&format!("- {title}\n"));
             }
+            sections.push(sec);
         }
     }
 

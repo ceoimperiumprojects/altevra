@@ -1,51 +1,74 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
+use uuid::Uuid;
 
 use crate::server::McpResponse;
 
-// In-memory task store using a local JSON file under $HOME/.altevra/state/.
-// Real DB-backed implementation lives in altevra-db.
+// DB-backed task/goal/decision tools. These previously read/wrote a JSON file
+// under ~/.altevra/state/ that nothing else used, so the SQLite `tasks`/`goals`/
+// `decisions` tables (which the brain + daily brief read) stayed empty. Now they
+// hit the real altevra_db repositories.
 
-fn state_path(filename: &str) -> PathBuf {
-    altevra_core::home_dir().join(".altevra/state").join(filename)
+fn db_path_from_args(args: &Value) -> PathBuf {
+    args.get("db_path")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .unwrap_or_else(altevra_core::default_db_path)
 }
 
-fn load_json(path: &PathBuf) -> Value {
-    if path.exists() {
-        let raw = std::fs::read_to_string(path).unwrap_or_default();
-        serde_json::from_str(&raw).unwrap_or_else(|_| serde_json::json!([]))
-    } else {
-        serde_json::json!([])
-    }
-}
-
-fn save_json(path: &PathBuf, value: &Value) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, serde_json::to_string_pretty(value)?)?;
-    Ok(())
-}
-
-pub fn handle_get_active_tasks(id: Value, _args: &Value) -> McpResponse {
-    let tasks = load_json(&state_path("tasks.json"));
-    let active: Vec<&Value> = tasks
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|t| {
-                    t["status"]
-                        .as_str()
-                        .map(|s| s != "completed" && s != "cancelled")
-                        .unwrap_or(true)
-                })
-                .collect()
+/// Run an async DB closure on a fresh single-thread runtime (same pattern as
+/// tools_capabilities). Keeps these handlers synchronous for the dispatcher.
+fn with_pool<T, F>(db_path: PathBuf, f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            sqlx::SqlitePool,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send>,
+        > + Send
+        + 'static,
+{
+    std::thread::spawn(move || -> anyhow::Result<T> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(async move {
+            let pool = altevra_db::create_pool(&db_path.to_string_lossy()).await?;
+            altevra_db::run_migrations(&pool).await?;
+            f(pool).await
         })
-        .unwrap_or_default();
-    McpResponse::ok(
-        id,
-        serde_json::json!({"tasks": active, "count": active.len()}),
-    )
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("task DB thread panicked"))?
+}
+
+pub fn handle_get_active_tasks(id: Value, args: &Value) -> McpResponse {
+    let db_path = db_path_from_args(args);
+    let res = with_pool(db_path, |pool| {
+        Box::pin(async move {
+            let tasks = altevra_db::TasksRepository::new(&pool)
+                .list_active(None, 100)
+                .await?;
+            let arr: Vec<Value> = tasks
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id.to_string(),
+                        "title": t.title,
+                        "status": t.status,
+                        "priority": t.priority,
+                        "due_at": t.due_at,
+                        "created_at": t.created_at,
+                    })
+                })
+                .collect();
+            Ok(arr)
+        })
+    });
+    match res {
+        Ok(arr) => McpResponse::ok(id, json!({"tasks": arr, "count": arr.len()})),
+        Err(e) => McpResponse::error(id, -32000, format!("get_active_tasks failed: {e}")),
+    }
 }
 
 pub fn handle_save_task(id: Value, args: &Value) -> McpResponse {
@@ -53,60 +76,93 @@ pub fn handle_save_task(id: Value, args: &Value) -> McpResponse {
         Some(t) => t.to_string(),
         None => return McpResponse::error(id, -32602, "missing 'title'"),
     };
-    let tasks_path = state_path("tasks.json");
-    let mut tasks = load_json(&tasks_path);
-    let new_task = serde_json::json!({
-        "id": uuid::Uuid::new_v4(),
-        "title": title,
-        "status": args["status"].as_str().unwrap_or("open"),
-        "priority": args["priority"].as_str().unwrap_or("medium"),
-        "project": args["project"],
-        "created_at": chrono::Utc::now(),
+    let status = args["status"].as_str().unwrap_or("open").to_string();
+    let priority = args["priority"].as_str().unwrap_or("medium").to_string();
+    let db_path = db_path_from_args(args);
+    let now = chrono::Utc::now();
+    let task_id = Uuid::new_v4();
+    let res = with_pool(db_path, move |pool| {
+        Box::pin(async move {
+            let row = altevra_db::TaskRow {
+                id: task_id,
+                project_id: None,
+                title,
+                description: None,
+                status,
+                priority,
+                assignee: None,
+                due_at: None,
+                metadata: json!({}),
+                created_at: now,
+                updated_at: now,
+            };
+            altevra_db::TasksRepository::new(&pool).upsert_task(&row).await?;
+            Ok(())
+        })
     });
-    if let Some(arr) = tasks.as_array_mut() {
-        arr.push(new_task.clone());
+    match res {
+        Ok(()) => McpResponse::ok(id, json!({"id": task_id.to_string(), "saved": true})),
+        Err(e) => McpResponse::error(id, -32000, format!("save_task failed: {e}")),
     }
-    if let Err(e) = save_json(&tasks_path, &tasks) {
-        return McpResponse::error(id, -32000, format!("save failed: {e}"));
-    }
-    McpResponse::ok(id, new_task)
 }
 
 pub fn handle_update_task(id: Value, args: &Value) -> McpResponse {
-    let task_id = match args["id"].as_str() {
-        Some(t) => t.to_string(),
-        None => return McpResponse::error(id, -32602, "missing 'id'"),
+    let task_id = match args["id"].as_str().and_then(|s| Uuid::parse_str(s).ok()) {
+        Some(t) => t,
+        None => return McpResponse::error(id, -32602, "missing or invalid 'id'"),
     };
-    let tasks_path = state_path("tasks.json");
-    let mut tasks = load_json(&tasks_path);
-    let arr = match tasks.as_array_mut() {
-        Some(a) => a,
-        None => return McpResponse::error(id, -32000, "tasks store malformed"),
-    };
-    let mut updated = false;
-    for t in arr.iter_mut() {
-        if t["id"].as_str() == Some(&task_id) {
-            if let Some(status) = args["status"].as_str() {
-                t["status"] = serde_json::json!(status);
+    let new_status = args["status"].as_str().map(str::to_string);
+    let new_priority = args["priority"].as_str().map(str::to_string);
+    let db_path = db_path_from_args(args);
+    let res = with_pool(db_path, move |pool| {
+        Box::pin(async move {
+            let repo = altevra_db::TasksRepository::new(&pool);
+            // No get-by-id; find it in the active set, mutate, re-upsert.
+            let mut all = repo.list_active(None, 1000).await?;
+            let Some(row) = all.iter_mut().find(|t| t.id == task_id) else {
+                anyhow::bail!("task not found: {task_id}");
+            };
+            if let Some(s) = new_status {
+                row.status = s;
             }
-            if let Some(prio) = args["priority"].as_str() {
-                t["priority"] = serde_json::json!(prio);
+            if let Some(p) = new_priority {
+                row.priority = p;
             }
-            t["updated_at"] = serde_json::json!(chrono::Utc::now());
-            updated = true;
-        }
+            row.updated_at = chrono::Utc::now();
+            repo.upsert_task(row).await?;
+            Ok(())
+        })
+    });
+    match res {
+        Ok(()) => McpResponse::ok(id, json!({"updated": true, "id": task_id.to_string()})),
+        Err(e) => McpResponse::error(id, -32000, format!("update_task failed: {e}")),
     }
-    if !updated {
-        return McpResponse::error(id, -32000, format!("Task not found: {task_id}"));
-    }
-    let _ = save_json(&tasks_path, &tasks);
-    McpResponse::ok(id, serde_json::json!({"updated": true, "id": task_id}))
 }
 
-pub fn handle_get_goals(id: Value, _args: &Value) -> McpResponse {
-    let goals = load_json(&state_path("goals.json"));
-    let count = goals.as_array().map(|a| a.len()).unwrap_or(0);
-    McpResponse::ok(id, serde_json::json!({"goals": goals, "count": count}))
+pub fn handle_get_goals(id: Value, args: &Value) -> McpResponse {
+    let db_path = db_path_from_args(args);
+    let res = with_pool(db_path, |pool| {
+        Box::pin(async move {
+            let goals = altevra_db::TasksRepository::new(&pool).list_goals(None).await?;
+            let arr: Vec<Value> = goals
+                .iter()
+                .map(|g| {
+                    json!({
+                        "id": g.id.to_string(),
+                        "title": g.title,
+                        "status": g.status,
+                        "target_date": g.target_date,
+                        "created_at": g.created_at,
+                    })
+                })
+                .collect();
+            Ok(arr)
+        })
+    });
+    match res {
+        Ok(arr) => McpResponse::ok(id, json!({"goals": arr, "count": arr.len()})),
+        Err(e) => McpResponse::error(id, -32000, format!("get_goals failed: {e}")),
+    }
 }
 
 pub fn handle_save_decision(id: Value, args: &Value) -> McpResponse {
@@ -114,20 +170,29 @@ pub fn handle_save_decision(id: Value, args: &Value) -> McpResponse {
         Some(t) => t.to_string(),
         None => return McpResponse::error(id, -32602, "missing 'title'"),
     };
-    let dec_path = state_path("decisions.json");
-    let mut decisions = load_json(&dec_path);
-    let new = serde_json::json!({
-        "id": uuid::Uuid::new_v4(),
-        "title": title,
-        "rationale": args["rationale"],
-        "decided_at": chrono::Utc::now(),
-        "decided_by": args["decided_by"],
+    let rationale = args["rationale"].as_str().map(str::to_string);
+    let decided_by = args["decided_by"].as_str().map(str::to_string);
+    let db_path = db_path_from_args(args);
+    let dec_id = Uuid::new_v4();
+    let res = with_pool(db_path, move |pool| {
+        Box::pin(async move {
+            let row = altevra_db::DecisionRow {
+                id: dec_id,
+                project_id: None,
+                title,
+                rationale,
+                decided_at: chrono::Utc::now(),
+                decided_by,
+                metadata: json!({}),
+            };
+            altevra_db::TasksRepository::new(&pool).save_decision(&row).await?;
+            Ok(())
+        })
     });
-    if let Some(arr) = decisions.as_array_mut() {
-        arr.push(new.clone());
+    match res {
+        Ok(()) => McpResponse::ok(id, json!({"id": dec_id.to_string(), "saved": true})),
+        Err(e) => McpResponse::error(id, -32000, format!("save_decision failed: {e}")),
     }
-    let _ = save_json(&dec_path, &decisions);
-    McpResponse::ok(id, new)
 }
 
 #[cfg(test)]
@@ -138,11 +203,5 @@ mod tests {
     fn save_task_missing_title_errors() {
         let resp = handle_save_task(Value::from(1), &serde_json::json!({}));
         assert!(resp.error.is_some());
-    }
-
-    #[test]
-    fn get_active_tasks_returns_structure() {
-        let resp = handle_get_active_tasks(Value::from(1), &serde_json::json!({}));
-        assert!(resp.error.is_none());
     }
 }

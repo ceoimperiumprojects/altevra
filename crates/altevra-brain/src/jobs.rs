@@ -53,6 +53,38 @@ pub enum JobKind {
     /// goes health-red but never blocks other connectors or jobs. See
     /// [`crate::connector_sync`].
     ConnectorSync,
+    /// Personal Brain extractor: an LLM reads recent turns and materializes the
+    /// durable facts Pavle stated (people, decisions, goals) straight into the
+    /// `persons`/`decisions`/`goals` tables. Without this Altevra records raw
+    /// turns but never builds the structured second-brain (CLAUDE.md §3.1).
+    PersonalExtractor,
+    /// Skill factory: takes `triaged` skill proposals (raw cluster candidates),
+    /// has an LLM draft a real SKILL.md, writes it to a STAGING dir + the skills
+    /// table, and advances the proposal to applied. Staging (not ~/.claude) keeps
+    /// the "live external writes need Pavle's OK" rule (factory.rs §46).
+    SkillFactory,
+    /// Autonomous memory write-back: periodically renders the Altevra digest
+    /// (recent decisions + active goals + key prefs, e.g. "use minus not em-dash")
+    /// into the ALTEVRA_MANAGED block of ~/.claude/CLAUDE.md + Hermes, so every
+    /// agent inherits Pavle's preferences WITHOUT him asking. Runs as a subprocess
+    /// (`altevra memory-sync write --apply`) — the daemon does it autonomously.
+    MemoryWriteback,
+    /// Self-healing. Collects a cheap health snapshot (embedder backlog, failed
+    /// jobs, disk usage, capture freshness). When something looks wrong it asks a
+    /// Sonnet "system doctor" to diagnose, and writes an insight card with the
+    /// findings + recommended fix. By DEFAULT it is advisory-only (no system
+    /// mutation). An aggressive auto-fix mode is gated behind the operator-held
+    /// env switch `ALTEVRA_HEALER_YOLO=1`; the operator owns that switch.
+    Healer,
+    /// Reads the watcher's file_changes.jsonl and enqueues changed text/code files
+    /// into pending_indexing → embed, so ALL work outside repos (projekti, Documents,
+    /// Desktop, Obsidian) becomes recall-able, not just AI-tool sessions.
+    FileChangeIndexer,
+    /// Wiki curator: an LLM synthesizes recent decisions + learnings into LIVING
+    /// knowledge wiki pages (one per topic), written to ~/.altevra/vault/wiki and
+    /// upserted in wiki_pages (idempotent by topic). Curated, evolving pages —
+    /// distinct from raw notes (CLAUDE.md vision: Wiki Layer).
+    WikiCurator,
 }
 
 impl JobKind {
@@ -75,6 +107,12 @@ impl JobKind {
             Self::SkillReactionJudge => "skill_reaction_judge",
             Self::DbOptimize => "db_optimize",
             Self::ConnectorSync => "connector_sync",
+            Self::PersonalExtractor => "personal_extractor",
+            Self::SkillFactory => "skill_factory",
+            Self::MemoryWriteback => "memory_writeback",
+            Self::Healer => "healer",
+            Self::FileChangeIndexer => "file_change_indexer",
+            Self::WikiCurator => "wiki_curator",
         }
     }
 
@@ -97,6 +135,12 @@ impl JobKind {
             "skill_reaction_judge" => Self::SkillReactionJudge,
             "db_optimize" => Self::DbOptimize,
             "connector_sync" => Self::ConnectorSync,
+            "personal_extractor" => Self::PersonalExtractor,
+            "skill_factory" => Self::SkillFactory,
+            "memory_writeback" => Self::MemoryWriteback,
+            "healer" => Self::Healer,
+            "file_change_indexer" => Self::FileChangeIndexer,
+            "wiki_curator" => Self::WikiCurator,
             _ => return None,
         })
     }
@@ -141,6 +185,15 @@ impl JobKind {
             // only pulls connectors whose own cadence has elapsed. Cheap when
             // everything is disabled (the common default).
             Self::ConnectorSync => 900,
+            // Hourly: extract durable personal facts from the last couple hours
+            // of activity. LLM-gated; cheap (one Sonnet call) and idempotent.
+            Self::PersonalExtractor => 3600,
+            // Every 2h: drain triaged skill candidates into staged SKILL.md files.
+            Self::SkillFactory => 7200,
+            Self::MemoryWriteback => 21600,
+            Self::Healer => 1800,
+            Self::FileChangeIndexer => 120,
+            Self::WikiCurator => 10800,
         }
     }
 }
@@ -166,78 +219,702 @@ pub struct JobContext {
 /// to updates.jsonl. For a minimal pipeline we just count new lines since the
 /// last marker file at .altevra/state/last_classified_offset.
 pub async fn run_event_classifier(
-    _pool: &SqlitePool,
+    pool: &SqlitePool,
     ctx: &JobContext,
 ) -> anyhow::Result<JobResult> {
-    let events_path = ctx.vault_path.join(".altevra/events/file_changes.jsonl");
-    let updates_path = ctx.vault_path.join(".altevra/events/updates.jsonl");
-    let marker_path = ctx.vault_path.join(".altevra/state/last_classified_offset");
-    // Borrow as &Path for the remainder of the function.
-    let events_path = events_path.as_path();
-    let updates_path = updates_path.as_path();
-    let marker_path = marker_path.as_path();
-    if !events_path.exists() {
-        return Ok(JobResult {
-            summary: "no file_changes.jsonl yet".into(),
-            items_processed: 0,
-        });
-    }
-    let content = std::fs::read_to_string(events_path).unwrap_or_default();
-    let prev_offset: usize = if marker_path.exists() {
-        std::fs::read_to_string(marker_path)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    let lines: Vec<&str> = content.lines().collect();
-    let new_lines = lines.len().saturating_sub(prev_offset);
+    // Bridge the `events` table → `update_feed` (the DB table the MCP
+    // `get_last_updates` tool reads). Previously this wrote JSONL files that
+    // nothing consumed, so the agent-facing "what's new" feed was always empty.
+    // Deterministic UUIDv5(event_id) + INSERT OR IGNORE makes it idempotent, so
+    // it can re-scan the recent window every tick without duplicating rows.
+    use altevra_core::updates::{Importance, UpdateFeedItem};
+    use altevra_db::{EventsRepository, UpdatesRepository};
 
-    if new_lines > 0 {
-        if let Some(parent) = updates_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+    let since = ctx.now - chrono::Duration::hours(48);
+    let events = EventsRepository::new(pool)
+        .list_since(since, None, 500)
+        .await
+        .unwrap_or_default();
+
+    let updates = UpdatesRepository::new(pool);
+    let mut written = 0usize;
+    for ev in &events {
+        let summary = ev.summary.clone().unwrap_or_else(|| ev.title.clone());
+        // Errors/failures matter more than routine events.
+        let et = ev.event_type.to_string();
+        let importance = if et.contains("error") || et.contains("fail") {
+            Importance::High
+        } else {
+            Importance::Low
+        };
+        let mut item =
+            UpdateFeedItem::from_event(ev.id, et, importance, ev.title.clone(), summary);
+        item.id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, ev.id.as_bytes());
+        item.created_at = ev.created_at;
+        item.project_id = ev.project_id;
+        if updates.insert_or_ignore(&item).await.unwrap_or(false) {
+            written += 1;
         }
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(updates_path)
-        {
-            for line in lines.iter().skip(prev_offset) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                    let update = serde_json::json!({
-                        "id": uuid::Uuid::new_v4(),
-                        "event_id": record.get("id"),
-                        "update_type": "file_changed",
-                        "importance": "low",
-                        "title": format!("File {} {}",
-                            record.get("kind").and_then(|v| v.as_str()).unwrap_or("changed"),
-                            record.get("path").and_then(|v| v.as_str()).unwrap_or("")
-                        ),
-                        "short_summary": "tracked by watcher",
-                        "created_at": chrono::Utc::now(),
-                        "sensitivity": "internal",
-                        "visible_to_agents": true,
-                        "affected_entities": [],
-                    });
-                    let _ = writeln!(f, "{}", update);
-                }
-            }
-        }
-        if let Some(parent) = marker_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(marker_path, lines.len().to_string());
     }
 
     Ok(JobResult {
-        summary: format!("classified {new_lines} new events"),
-        items_processed: new_lines,
+        summary: format!(
+            "event_classifier: {written} new update(s) bridged from {} event(s)",
+            events.len()
+        ),
+        items_processed: written,
+    })
+}
+
+/// Personal Brain extractor: an LLM reads the last couple hours of turns and
+/// materializes the durable facts Pavle stated — people, decisions, goals —
+/// straight into the `persons`/`decisions`/`goals` tables. Idempotent: persons
+/// upsert by name; decisions/goals dedupe by title. LLM-gated (StrongReasoner).
+pub async fn run_personal_extractor(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_db::{DecisionRow, GoalRow, PersonalNotesRepository, TasksRepository};
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+    if provider.id() == "noop" {
+        return Ok(JobResult {
+            summary: "personal extraction skipped (no LLM configured)".into(),
+            items_processed: 0,
+        });
+    }
+
+    let since = (ctx.now - chrono::Duration::hours(2))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let activity: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT role || ': ' || substr(content, 1, 400) \
+         FROM turns \
+         WHERE created_at > ? AND role IN ('user', 'assistant') \
+         ORDER BY created_at DESC LIMIT 60",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    if activity.is_empty() {
+        return Ok(JobResult {
+            summary: "no recent activity for personal extraction".into(),
+            items_processed: 0,
+        });
+    }
+    let block = activity.into_iter().rev().collect::<Vec<_>>().join("\n");
+
+    let messages = vec![
+        ChatMessage::system(
+            "You extract DURABLE personal-brain facts from an activity log. Return ONLY \
+             compact JSON, no markdown, no prose: \
+             {\"persons\":[{\"name\":\"\",\"note\":\"\"}],\
+             \"decisions\":[{\"title\":\"\",\"rationale\":\"\"}],\
+             \"goals\":[{\"title\":\"\"}]}. \
+             Include ONLY things EXPLICITLY stated by the user — real people met, \
+             concrete decisions made, concrete goals set. NEVER invent. Use empty \
+             arrays when nothing qualifies. Keep each field short.",
+        ),
+        ChatMessage::user(format!("Activity log (oldest first):\n{block}")),
+    ];
+
+    let raw = match provider
+        .complete(&messages, &ChatOpts::default().with_max_tokens(800))
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(JobResult {
+                summary: format!("personal_extractor: LLM call failed ({e})"),
+                items_processed: 0,
+            })
+        }
+    };
+
+    // Pull the JSON object out of the response (tolerate stray prose/fences).
+    let json_str = match (raw.find('{'), raw.rfind('}')) {
+        (Some(s), Some(e)) if e > s => &raw[s..=e],
+        _ => "{}",
+    };
+    let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or(serde_json::json!({}));
+
+    let mut materialized = 0usize;
+    let persons = PersonalNotesRepository::new(pool);
+    if let Some(arr) = parsed.get("persons").and_then(|v| v.as_array()) {
+        for p in arr {
+            if let Some(name) = p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let note = p.get("note").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
+                if persons.upsert_person(name, note).await.is_ok() {
+                    materialized += 1;
+                }
+            }
+        }
+    }
+
+    let tasks = TasksRepository::new(pool);
+    if let Some(arr) = parsed.get("decisions").and_then(|v| v.as_array()) {
+        for d in arr {
+            if let Some(title) = d
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let exists: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM decisions WHERE title = ? LIMIT 1")
+                        .bind(title)
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap_or(None);
+                if exists.is_some() {
+                    continue;
+                }
+                let row = DecisionRow {
+                    id: uuid::Uuid::new_v4(),
+                    project_id: None,
+                    title: title.to_string(),
+                    rationale: d.get("rationale").and_then(|v| v.as_str()).map(String::from),
+                    decided_at: ctx.now,
+                    decided_by: Some("personal_extractor".into()),
+                    metadata: serde_json::json!({}),
+                };
+                if tasks.save_decision(&row).await.is_ok() {
+                    materialized += 1;
+                }
+            }
+        }
+    }
+    if let Some(arr) = parsed.get("goals").and_then(|v| v.as_array()) {
+        for g in arr {
+            if let Some(title) = g
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let exists: Option<String> =
+                    sqlx::query_scalar("SELECT id FROM goals WHERE title = ? LIMIT 1")
+                        .bind(title)
+                        .fetch_optional(pool)
+                        .await
+                        .unwrap_or(None);
+                if exists.is_some() {
+                    continue;
+                }
+                let row = GoalRow {
+                    id: uuid::Uuid::new_v4(),
+                    project_id: None,
+                    title: title.to_string(),
+                    description: None,
+                    target_date: None,
+                    status: "active".into(),
+                    metadata: serde_json::json!({}),
+                    created_at: ctx.now,
+                    updated_at: ctx.now,
+                };
+                if tasks.upsert_goal(&row).await.is_ok() {
+                    materialized += 1;
+                }
+            }
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!("personal_extractor: materialized {materialized} fact(s)"),
+        items_processed: materialized,
+    })
+}
+
+/// Turn a free-text title into a clean kebab-case skill slug (no `:` — the
+/// factory's template gate rejects session-artifact slugs with discriminators).
+fn slugify_skill(title: &str) -> String {
+    let lowered = title.to_lowercase();
+    let parts: Vec<&str> = lowered
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let slug: String = parts.join("-").chars().take(48).collect();
+    if slug.is_empty() {
+        "altevra-skill".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Skill factory: drain `triaged` skill candidates into staged SKILL.md files.
+/// The candidates are raw cluster/evidence text (not skill markdown), so an LLM
+/// drafts a real SKILL.md; we write it to a STAGING dir (~/.altevra/skills-
+/// staging, NOT ~/.claude — live tool-dir writes need Pavle's OK) + the skills
+/// table, then advance the proposal to applied. Idempotent (upsert by slug).
+pub async fn run_skill_factory(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_core::status::ProposalStatus;
+    use altevra_db::{ProposalsRepository, SkillRow, SkillsRepository};
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+    if provider.id() == "noop" {
+        return Ok(JobResult {
+            summary: "skill factory skipped (no LLM configured)".into(),
+            items_processed: 0,
+        });
+    }
+
+    let proposals = ProposalsRepository::new(pool);
+    let triaged = proposals
+        .list(Some("triaged"), Some("skill"))
+        .await
+        .unwrap_or_default();
+    if triaged.is_empty() {
+        return Ok(JobResult {
+            summary: "skill factory: no triaged candidates".into(),
+            items_processed: 0,
+        });
+    }
+
+    let staging_root = altevra_core::home_dir().join(".altevra/skills-staging");
+    let skills = SkillsRepository::new(pool);
+    let mut rendered = 0usize;
+
+    // Bound per-tick work — 2 LLM drafts at a time so a tick stays snappy and
+    // later jobs (healer) still get reached; the daemon picks up the rest next run.
+    for row in triaged.iter().take(2) {
+        let slug = slugify_skill(&row.title);
+        let messages = vec![
+            ChatMessage::system(
+                "You write Claude Code SKILL.md files. Output ONLY the markdown, no fences, \
+                 no preamble. It MUST start with a YAML frontmatter block delimited by --- \
+                 containing: slug (kebab-case, no colons), version (0.1.0), title, description. \
+                 After the frontmatter add these sections: '## When to use', '## How it works', \
+                 '## Steps', '## Example', '## Notes'. Base it strictly on the candidate; do not invent unrelated capability.",
+            ),
+            ChatMessage::user(format!(
+                "Candidate slug: {slug}\nCandidate title: {}\nEvidence/notes:\n{}",
+                row.title, row.body
+            )),
+        ];
+        let content = match provider
+            .complete(&messages, &ChatOpts::default().with_max_tokens(1200))
+            .await
+        {
+            Ok(t) if !t.trim().is_empty() => t.trim().to_string(),
+            _ => continue,
+        };
+
+        // Write to staging: ~/.altevra/skills-staging/<slug>/SKILL.md
+        let dir = staging_root.join(&slug);
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let path = dir.join("SKILL.md");
+        if std::fs::write(&path, &content).is_err() {
+            continue;
+        }
+
+        let skill = SkillRow {
+            id: uuid::Uuid::new_v4(),
+            slug: slug.clone(),
+            version: "0.1.0".into(),
+            source_path: path.to_string_lossy().to_string(),
+            checksum: format!("len{}", content.len()),
+            content,
+            metadata: serde_json::json!({"origin": "skill_factory", "proposal_id": row.id}),
+            status: "staged".into(),
+            created_at: ctx.now,
+            updated_at: ctx.now,
+        };
+        if skills.upsert(&skill).await.is_ok() {
+            let _ = proposals
+                .transition_status(&row.id, ProposalStatus::Applied, Some("skill_factory"))
+                .await;
+            rendered += 1;
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!(
+            "skill_factory: staged {rendered} skill(s) from {} triaged candidate(s)",
+            triaged.len()
+        ),
+        items_processed: rendered,
+    })
+}
+
+/// Autonomous memory write-back. Renders the Altevra digest (recent decisions +
+/// active goals + key prefs) into the ALTEVRA_MANAGED block of ~/.claude/CLAUDE.md
+/// + the Hermes memory file, so every agent inherits Pavle's preferences without
+/// him asking. Shells out to `altevra memory-sync write --apply` (the write logic
+/// lives in the CLI crate). The daemon runs this on its own cadence — the whole
+/// point is autonomy, not on-demand.
+pub async fn run_memory_writeback(
+    _pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    let out = tokio::process::Command::new("altevra")
+        .args(["memory-sync", "write", "--apply"])
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => Ok(JobResult {
+            summary: "memory_writeback: digest propagated to CLAUDE.md + Hermes".into(),
+            items_processed: 1,
+        }),
+        Ok(o) => Ok(JobResult {
+            summary: format!(
+                "memory_writeback failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            items_processed: 0,
+        }),
+        Err(e) => Ok(JobResult {
+            summary: format!("memory_writeback exec error: {e}"),
+            items_processed: 0,
+        }),
+    }
+}
+
+/// Self-healing. Collects a cheap health snapshot; if something looks wrong, a
+/// Sonnet "doctor" diagnoses it. DEFAULT = advisory: writes an insight card with
+/// the diagnosis + recommended fix, mutates nothing. AGGRESSIVE auto-fix is gated
+/// behind the operator-held env switch `ALTEVRA_HEALER_YOLO=1` — only then does it
+/// launch `claude -p --dangerously-skip-permissions` with shell access to actually
+/// restart dead services / clear regenerable caches / kick a stalled embedder.
+/// Healthy → no LLM call (relevance gate).
+pub async fn run_healer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_db::{InsightCardRow, InsightCardsRepository};
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    // ── cheap health snapshot ────────────────────────────────────────────────
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM embedder_queue WHERE status = 'pending'")
+            .fetch_one(pool)
+            .await
+            .unwrap_or(0);
+    let failed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM brain_jobs WHERE status = 'failed'")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    let newest_turn: Option<String> = sqlx::query_scalar("SELECT MAX(created_at) FROM turns")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(None);
+
+    // disk usage % of /home via df
+    let disk_pct: i64 = match tokio::process::Command::new("df")
+        .args(["-P", "/home"])
+        .output()
+        .await
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .nth(1)
+            .and_then(|l| l.split_whitespace().nth(4))
+            .and_then(|p| p.trim_end_matches('%').parse().ok())
+            .unwrap_or(0),
+        Err(_) => 0,
+    };
+
+    // capture freshness: stale if newest turn older than 6h
+    let capture_stale = newest_turn
+        .as_deref()
+        .and_then(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.replace(' ', "T"))
+                .ok()
+                .map(|t| (ctx.now - t.with_timezone(&chrono::Utc)).num_hours() > 6)
+        })
+        .unwrap_or(false);
+
+    let mut issues: Vec<String> = Vec::new();
+    if disk_pct >= 90 {
+        issues.push(format!("disk {disk_pct}% full"));
+    }
+    if pending > 5000 {
+        issues.push(format!("embedder backlog {pending} pending"));
+    }
+    if failed > 0 {
+        issues.push(format!("{failed} failed brain job(s)"));
+    }
+    if capture_stale {
+        issues.push("capture stale (no new turns in 6h+)".into());
+    }
+
+    if issues.is_empty() {
+        return Ok(JobResult {
+            summary: format!(
+                "healer: healthy (disk {disk_pct}%, pending {pending}, failed {failed})"
+            ),
+            items_processed: 0,
+        });
+    }
+
+    let snapshot = format!(
+        "disk={disk_pct}%, embedder_pending={pending}, failed_jobs={failed}, \
+         newest_turn={newest_turn:?}, issues={issues:?}"
+    );
+    let yolo = std::env::var("ALTEVRA_HEALER_YOLO")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    let report = if yolo {
+        // AGGRESSIVE: claude with shell access actually fixes things.
+        let prompt = format!(
+            "You are Altevra's autonomous system healer with full shell access on Pavle's \
+             Linux machine. Current health snapshot:\n{snapshot}\n\nDiagnose and FIX the safe \
+             issues: restart dead user services with systemctl --user; if disk >=90% clear ONLY \
+             regenerable caches under ~/.cache (uv/pip/yay/huggingface); if the embedder is \
+             stalled restart altevra-npu-embed. ABSOLUTE RULES: never delete anything under \
+             ~/.altevra except clearly-temp files, never touch ~/Obsidian or ~/projekti, never \
+             rm -rf a home/root path. Report concisely what you checked and did."
+        );
+        match tokio::process::Command::new("claude")
+            .args([
+                "-p",
+                &prompt,
+                "--dangerously-skip-permissions",
+                "--model",
+                "claude-sonnet-4-6",
+                "--output-format",
+                "text",
+            ])
+            .current_dir("/home/pavle")
+            .output()
+            .await
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(e) => format!("YOLO healer exec failed: {e}"),
+        }
+    } else {
+        // ADVISORY: isolated reasoning, no system mutation.
+        let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+        if provider.id() == "noop" {
+            format!(
+                "Issues detected ({}); no LLM configured for diagnosis. snapshot: {snapshot}",
+                issues.len()
+            )
+        } else {
+            let messages = vec![
+                ChatMessage::system(
+                    "You are Altevra's system-health doctor. Given a health snapshot, name the \
+                     most likely root cause and ONE concrete safe fix command. No preamble.",
+                ),
+                ChatMessage::user(format!("Health snapshot: {snapshot}")),
+            ];
+            provider
+                .complete(&messages, &ChatOpts::default().with_max_tokens(300))
+                .await
+                .unwrap_or_else(|e| format!("diagnosis failed: {e}"))
+        }
+    };
+
+    // Record the result as an insight card so it surfaces to Pavle.
+    let title = format!("Health: {} issue(s) — {}", issues.len(), issues.join("; "));
+    let id = format!("healer-{}", ctx.now.format("%Y%m%dT%H%M%S"));
+    let card = InsightCardRow::new(id, title, format!("{snapshot}\n\n{report}"));
+    let _ = InsightCardsRepository::new(pool).insert(&card).await;
+
+    Ok(JobResult {
+        summary: format!(
+            "healer: {} issue(s), {} mode",
+            issues.len(),
+            if yolo { "YOLO-fix" } else { "advisory" }
+        ),
+        items_processed: issues.len(),
+    })
+}
+
+/// Reads the watcher's `~/.altevra/events/file_changes.jsonl` and enqueues each
+/// changed text/code file into `pending_indexing` → embed pipeline. This is the
+/// last mile that makes ALL work outside repos (projekti, Documents, Desktop,
+/// Obsidian) recall-able — without it the watcher records changes that nothing
+/// indexes. Watermark via a byte-offset file so it only processes new lines.
+pub async fn run_file_change_indexer(
+    pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    let jsonl = altevra_core::home_dir().join(".altevra/events/file_changes.jsonl");
+    let marker = altevra_core::home_dir().join(".altevra/state/file_change_index_offset");
+    if !jsonl.exists() {
+        return Ok(JobResult {
+            summary: "file_change_indexer: no file_changes.jsonl yet".into(),
+            items_processed: 0,
+        });
+    }
+    let content = std::fs::read_to_string(&jsonl).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+    let prev: usize = std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+
+    // Only index text/code files; skip binaries, media, dbs, lockfiles.
+    let indexable = |p: &str| -> bool {
+        let lower = p.to_lowercase();
+        const EXT: &[&str] = &[
+            ".md", ".txt", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", ".go", ".json",
+            ".yaml", ".yml", ".toml", ".csv", ".html", ".css", ".sh", ".sql", ".mjs",
+        ];
+        EXT.iter().any(|e| lower.ends_with(e))
+            && !lower.contains("/node_modules/")
+            && !lower.contains("/target/")
+            && !lower.contains("/.next/")
+            && !lower.contains("/.git/")
+    };
+
+    let mut queued = 0usize;
+    for line in lines.iter().skip(prev) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let path = match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => v
+                .get("path")
+                .and_then(|p| p.as_str())
+                .map(str::to_string),
+            Err(_) => None,
+        };
+        let Some(path) = path else { continue };
+        if !indexable(&path) || !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let _ = sqlx::query(
+            r#"INSERT INTO pending_indexing (id, path, status) VALUES (?, ?, 'pending')
+               ON CONFLICT (path) DO UPDATE SET
+                   status = CASE WHEN status = 'failed' THEN 'pending' ELSE status END"#,
+        )
+        .bind(id)
+        .bind(&path)
+        .execute(pool)
+        .await;
+        queued += 1;
+    }
+
+    let _ = std::fs::write(&marker, lines.len().to_string());
+    Ok(JobResult {
+        summary: format!("file_change_indexer: queued {queued} changed file(s) for indexing"),
+        items_processed: queued,
+    })
+}
+
+/// Wiki curator: synthesize recent decisions + learnings into LIVING wiki pages.
+/// An LLM returns 1-3 topic pages as JSON; each is written to ~/.altevra/vault/wiki
+/// and upserted in wiki_pages (idempotent by topic). LLM-gated (StrongReasoner).
+pub async fn run_wiki_curator(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<JobResult> {
+    use altevra_db::WikiPagesRepository;
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+    if provider.id() == "noop" {
+        return Ok(JobResult {
+            summary: "wiki curator skipped (no LLM configured)".into(),
+            items_processed: 0,
+        });
+    }
+
+    let decisions: Vec<String> =
+        sqlx::query_scalar("SELECT title FROM decisions ORDER BY decided_at DESC LIMIT 20")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    let learnings: Vec<String> = sqlx::query_scalar(
+        "SELECT title || ': ' || substr(COALESCE(body,''), 1, 200) FROM learnings \
+         ORDER BY created_at DESC LIMIT 20",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if decisions.is_empty() && learnings.is_empty() {
+        return Ok(JobResult {
+            summary: "wiki curator: no decisions/learnings to synthesize".into(),
+            items_processed: 0,
+        });
+    }
+
+    let block = format!(
+        "DECISIONS:\n{}\n\nLEARNINGS:\n{}",
+        decisions.join("\n"),
+        learnings.join("\n")
+    );
+    let messages = vec![
+        ChatMessage::system(
+            "You maintain Pavle's living knowledge wiki. From the decisions + learnings below, \
+             produce 1 to 3 evolving knowledge pages. Return ONLY a JSON array, no prose, no \
+             fences: [{\"topic\":\"\",\"slug\":\"kebab-case\",\"title\":\"\",\"markdown\":\"\"}]. \
+             Each page synthesizes durable knowledge on ONE topic (a project, a workflow, a \
+             recurring lesson). markdown = a concise, well-structured page (## sections). Group \
+             related items; do not just list them.",
+        ),
+        ChatMessage::user(block),
+    ];
+
+    let raw = match provider
+        .complete(&messages, &ChatOpts::default().with_max_tokens(2000))
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            return Ok(JobResult {
+                summary: format!("wiki curator: LLM failed ({e})"),
+                items_processed: 0,
+            })
+        }
+    };
+    let json_str = match (raw.find('['), raw.rfind(']')) {
+        (Some(s), Some(e)) if e > s => &raw[s..=e],
+        _ => "[]",
+    };
+    let pages: serde_json::Value = serde_json::from_str(json_str).unwrap_or(serde_json::json!([]));
+
+    let wiki_dir = altevra_core::home_dir().join(".altevra/vault/wiki");
+    let _ = std::fs::create_dir_all(&wiki_dir);
+    let repo = WikiPagesRepository::new(pool);
+    let mut written = 0usize;
+
+    if let Some(arr) = pages.as_array() {
+        for p in arr {
+            let topic = p.get("topic").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let slug = p.get("slug").and_then(|v| v.as_str()).unwrap_or("").trim();
+            let title = p.get("title").and_then(|v| v.as_str()).unwrap_or(topic);
+            let markdown = p.get("markdown").and_then(|v| v.as_str()).unwrap_or("");
+            if topic.is_empty() || slug.is_empty() || markdown.is_empty() {
+                continue;
+            }
+            let path = wiki_dir.join(format!("{slug}.md"));
+            if std::fs::write(&path, markdown).is_err() {
+                continue;
+            }
+            let checksum = format!("len{}", markdown.len());
+            if repo
+                .upsert(
+                    topic,
+                    slug,
+                    &path.to_string_lossy(),
+                    "active",
+                    "medium",
+                    "internal",
+                    (decisions.len() + learnings.len()) as i64,
+                    Some(ctx.now),
+                    Some(title),
+                    &checksum,
+                )
+                .await
+                .is_ok()
+            {
+                written += 1;
+            }
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!("wiki_curator: synthesized {written} living page(s)"),
+        items_processed: written,
     })
 }
 
@@ -392,12 +1069,44 @@ pub async fn run_insight_synthesizer(
             items_processed: 0,
         });
     }
+    // Pull the ACTUAL last-hour activity so the LLM has something to distill.
+    // Without this the synthesizer used to ask the model to summarize the last
+    // hour while handing it nothing → "no activity data was provided" cards.
+    let since = (ctx.now - chrono::Duration::hours(1))
+        .format("%Y-%m-%dT%H:%M:%S")
+        .to_string();
+    let activity: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT role || ': ' || substr(content, 1, 280) \
+         FROM turns \
+         WHERE created_at > ? AND role IN ('user', 'assistant') \
+         ORDER BY created_at DESC LIMIT 40",
+    )
+    .bind(&since)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if activity.is_empty() {
+        return Ok(JobResult {
+            summary: "insight synthesis skipped (no activity in the last hour)".into(),
+            items_processed: 0,
+        });
+    }
+
+    let activity_block = activity
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
     let messages = vec![
         ChatMessage::system(
-            "You are Altevra's insight synthesizer. Distill recent activity into ONE \
-             concise, sourced sentence. No preamble.",
+            "You are Altevra's insight synthesizer. Distill the activity log below into \
+             ONE concise, sourced sentence capturing the most salient pattern or decision. \
+             No preamble.",
         ),
-        ChatMessage::user("Summarize the most salient pattern in the last hour of activity."),
+        ChatMessage::user(format!(
+            "Last hour of activity (oldest first):\n{activity_block}"
+        )),
     ];
     match provider
         .complete(&messages, &ChatOpts::default().with_max_tokens(120))
@@ -1353,6 +2062,12 @@ pub async fn dispatch(
         JobKind::SkillReactionJudge => run_skill_reaction_judge(pool, ctx).await,
         JobKind::DbOptimize => run_db_optimize(pool, ctx).await,
         JobKind::ConnectorSync => run_connector_sync(pool, ctx).await,
+        JobKind::PersonalExtractor => run_personal_extractor(pool, ctx).await,
+        JobKind::SkillFactory => run_skill_factory(pool, ctx).await,
+        JobKind::MemoryWriteback => run_memory_writeback(pool, ctx).await,
+        JobKind::Healer => run_healer(pool, ctx).await,
+        JobKind::FileChangeIndexer => run_file_change_indexer(pool, ctx).await,
+        JobKind::WikiCurator => run_wiki_curator(pool, ctx).await,
     }
 }
 
@@ -1507,7 +2222,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 17] {
+pub fn all_kinds() -> [JobKind; 23] {
     [
         JobKind::EventClassifier,
         JobKind::ObserverScan,
@@ -1526,6 +2241,12 @@ pub fn all_kinds() -> [JobKind; 17] {
         JobKind::SkillReactionJudge,
         JobKind::DbOptimize,
         JobKind::ConnectorSync,
+        JobKind::PersonalExtractor,
+        JobKind::SkillFactory,
+        JobKind::MemoryWriteback,
+        JobKind::Healer,
+        JobKind::FileChangeIndexer,
+        JobKind::WikiCurator,
     ]
 }
 
