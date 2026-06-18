@@ -110,17 +110,20 @@ If outdated → run `altevra skill refresh altevra-core` or `altevra connect --t
 - Run `altevra hook run session_end`
 - Confirm tasks are updated
 
-## Not Implemented Yet (v0.1)
+## What works now (v0.3+ — self-running second brain)
 
-These are planned but not in v0.1:
-- `altevra context` command
-- `altevra search` command
-- `altevra ingest` command
-- Full memory search (vector/pgvector)
-- Research/synthesis engine
-- Google Workspace / Slack / Linear connectors
-- Full task system with due dates and assignees
-- Goal tree system
-- Dashboard
+All live and autonomous (23 brain jobs, 0 failed):
+- **Recall + search** — `altevra recall`, `altevra turn-search`, MCP `search_turns` /
+  `recall_about` / `search_memory`; full vector search (BGE-M3, embeds on NPU/iGPU)
+- **Capture** — `altevra capture` (atomized, safety-gated) + a file **watcher** that
+  indexes ALL your work outside repos (code, docs, notes) → recall-able
+- **Personal Brain** — auto-extracts decisions / goals / people from your activity
+- **Research + synthesis** — research fetcher + insight synthesizer (strategic insights)
+- **Skill factory** — drafts new SKILL.md from observed patterns
+- **memory_writeback** — propagates your prefs into CLAUDE.md / Hermes automatically
+- **healer** — diagnoses + (opt-in YOLO) fixes system health
+- **wiki_curator** — living knowledge pages; **40 MCP tools**; connectors (obsidian/
+  ics/imap/linear); task + goal system
 
-Use what is available. Report gaps with `altevra report-gap` when you hit missing features.
+LLM runs on `claude -p` (Sonnet/Haiku, your subscription) or codex/ollama/vLLM.
+Install: `bash setup.sh` → one command → live. Report gaps with `altevra report-gap`.
