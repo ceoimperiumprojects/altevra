@@ -110,9 +110,20 @@ If outdated → run `altevra skill refresh altevra-core` or `altevra connect --t
 - Run `altevra hook run session_end`
 - Confirm tasks are updated
 
+## Source of truth: Altevra is the SOURCE, Obsidian is the SHOWCASE
+
+**Altevra (the DB + `recall`/MCP) is the single source of truth.** The Obsidian
+vault is an auto-rendered, read-only *window* onto it — `~/Obsidian/Imperium/
+00_Altevra/` pages (e.g. `Dashboard.md`, marked `ALTEVRA_GENERATED`) are written
+BY Altevra and overwritten on each refresh. So: **read context from Altevra**
+(`altevra recall`, MCP `search_turns`/`search_files`/`get_agent_bootstrap_packet`),
+NOT by parsing Obsidian. Never hand-edit an `ALTEVRA_GENERATED` page — change the
+underlying fact in Altevra (capture / save-decision / a task) and it re-renders.
+Every tool (Claude Code, Codex, Cursor, ChatGPT-via-MCP, Hermes) follows this.
+
 ## What works now (v0.3+ — self-running second brain)
 
-All live and autonomous (23 brain jobs, 0 failed):
+All live and autonomous (27 brain jobs, 0 failed):
 - **Recall + search** — `altevra recall`, `altevra turn-search`, MCP `search_turns` /
   `recall_about` / `search_memory`; full vector search (BGE-M3, embeds on NPU/iGPU)
 - **Capture** — `altevra capture` (atomized, safety-gated) + a file **watcher** that
