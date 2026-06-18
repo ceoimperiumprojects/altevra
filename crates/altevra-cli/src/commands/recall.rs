@@ -65,6 +65,12 @@ pub struct RecallArgs {
     /// Emit JSON (the same provenance-rich shape the MCP tool returns).
     #[arg(long)]
     pub json: bool,
+    /// Match indexed FILE content by MEANING (vector/semantic search over the
+    /// BGE-M3 embeddings) instead of keyword. Finds related work even when the
+    /// exact words differ. Slower (loads the embedding model). Needs a build
+    /// with `--features embedding`.
+    #[arg(long)]
+    pub semantic: bool,
 }
 
 pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
@@ -148,6 +154,8 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
     let doc_hits: Vec<(String, DateTime<Utc>, String)> =
         if args.query.trim().is_empty() || args.tool.is_some() {
             Vec::new()
+        } else if args.semantic {
+            semantic_doc_hits(&pool, &args.query, args.limit, t_since, t_until).await
         } else {
             use sqlx::Row;
             // Tokenize: every whitespace-separated term must appear (AND), in any
@@ -241,7 +249,16 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
             snippet: snippet(text, &args.query, 200),
         });
     }
-    items.sort_by_key(|it| std::cmp::Reverse(it.when));
+    // Default: most-recent-first (best for "what happened yesterday"). In
+    // --semantic mode the file hits arrive already ranked by MEANING (cosine),
+    // so lead with them in that order — a STABLE sort that only pushes non-file
+    // items after file items preserves the similarity ranking instead of letting
+    // recent turns bury the relevant files.
+    if args.semantic {
+        items.sort_by_key(|it| !it.source.starts_with("file"));
+    } else {
+        items.sort_by_key(|it| std::cmp::Reverse(it.when));
+    }
     items.truncate(args.limit as usize);
 
     if args.json {
@@ -291,6 +308,88 @@ pub async fn run(args: RecallArgs) -> anyhow::Result<()> {
         println!("    {}", it.snippet);
     }
     Ok(())
+}
+
+/// Semantic file recall: embed the query with BGE-M3 and rank indexed file
+/// chunks by cosine similarity (meaning), then map back to (text, when, path),
+/// time-windowed + deduped per file. Returns `(text, created_at, source_path)`.
+#[cfg(feature = "embedding")]
+async fn semantic_doc_hits(
+    pool: &sqlx::SqlitePool,
+    query: &str,
+    limit: i64,
+    t_since: Option<DateTime<Utc>>,
+    t_until: Option<DateTime<Utc>>,
+) -> Vec<(String, DateTime<Utc>, String)> {
+    use altevra_memory::{search_by_vector, AsyncEmbeddingProvider, Bge3Embedder, BGE_M3_MODEL};
+    use sqlx::Row;
+
+    let embedder = match Bge3Embedder::new() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[altevra] semantic recall unavailable (embedder init failed): {e}");
+            return Vec::new();
+        }
+    };
+    let emb = match embedder.embed(query).await {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("[altevra] semantic recall: query embed failed: {e}");
+            return Vec::new();
+        }
+    };
+    let ranked = search_by_vector(pool, &emb.vector, BGE_M3_MODEL, limit * 8)
+        .await
+        .unwrap_or_default();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (chunk_id, _score) in ranked {
+        let row = sqlx::query(
+            "SELECT mc.text AS text, mc.created_at AS created_at, \
+                    COALESCE(md.source_path, '') AS source_path \
+             FROM memory_chunks mc \
+             LEFT JOIN memory_documents md ON md.id = mc.document_id \
+             WHERE mc.id = ?",
+        )
+        .bind(chunk_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        let Some(r) = row else { continue };
+        let text: String = r.get("text");
+        let created_raw: String = r.get("created_at");
+        let source_path: String = r.get("source_path");
+        let created_at = chrono::DateTime::parse_from_rfc3339(&created_raw)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        if !in_window(created_at, t_since, t_until) {
+            continue;
+        }
+        let key = if source_path.is_empty() { text.clone() } else { source_path.clone() };
+        if !seen.insert(key) {
+            continue;
+        }
+        out.push((text, created_at, source_path));
+        if out.len() as i64 >= limit * 4 {
+            break;
+        }
+    }
+    out
+}
+
+/// Fallback when not built with the embedding feature.
+#[cfg(not(feature = "embedding"))]
+async fn semantic_doc_hits(
+    _pool: &sqlx::SqlitePool,
+    _query: &str,
+    _limit: i64,
+    _t_since: Option<DateTime<Utc>>,
+    _t_until: Option<DateTime<Utc>>,
+) -> Vec<(String, DateTime<Utc>, String)> {
+    eprintln!("[altevra] --semantic needs a build with `--features embedding`; falling back to no file hits.");
+    Vec::new()
 }
 
 /// Cross-link recall: list objects (and their breadcrumbs) that MENTION a known
