@@ -68,9 +68,11 @@ safe to re-run. **That's it: clone → one command → live.**
 
 `altevra setup all` also registers the Altevra **MCP server** with Claude Code
 (`claude mcp add altevra -- altevra serve`, user scope) so every session gets the
-40+ Altevra tools, and the [`altevra-core` skill](#) bootstraps automatically.
-Other tools (Codex, Cursor, Antigravity) get their MCP config written by
-`altevra connect`. Verify the server is live:
+40+ Altevra tools, and promotes the [`altevra-core` skill](#) to your user-global
+`~/.claude/skills/` so the AI knows how to use Altevra in **every** project — not
+just this repo. Other tools (Codex, Cursor, Antigravity) get their MCP config
+written by `altevra connect`. (`--no-global-skills` keeps skills project-scoped.)
+Verify the server is live:
 
 ```bash
 claude mcp list             # → altevra: … ✔ Connected

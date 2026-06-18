@@ -34,6 +34,9 @@ pub struct SetupAllArgs {
     /// Skip registering the Altevra MCP server with Claude Code.
     #[arg(long)]
     pub no_mcp: bool,
+    /// Skip promoting skills to the user-global ~/.claude/skills directory.
+    #[arg(long)]
+    pub no_global_skills: bool,
     /// Repository path used when connecting tools (defaults to cwd).
     #[arg(long, default_value = ".")]
     pub repo: std::path::PathBuf,
@@ -117,6 +120,32 @@ fn on_path(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Copy each `<slug>/SKILL.md` from a project-scope skills dir into the
+/// user-global skills dir. Returns the number of skill files copied. Only
+/// touches `SKILL.md` files under per-slug folders — never anything else.
+fn copy_skills(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<usize> {
+    let mut copied = 0;
+    for entry in std::fs::read_dir(src)? {
+        let slug_dir = entry?.path();
+        if !slug_dir.is_dir() {
+            continue;
+        }
+        let skill_md = slug_dir.join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        let slug = match slug_dir.file_name() {
+            Some(s) => s,
+            None => continue,
+        };
+        let target_dir = dst.join(slug);
+        std::fs::create_dir_all(&target_dir)?;
+        std::fs::copy(&skill_md, target_dir.join("SKILL.md"))?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
 /// One-shot post-build wizard: connect tools + configure LLM + install services.
 async fn run_all(args: SetupAllArgs) -> anyhow::Result<()> {
     println!("\n\x1b[1;31m▸ Altevra setup — connecting tools, LLM, and services\x1b[0m");
@@ -152,6 +181,25 @@ async fn run_all(args: SetupAllArgs) -> anyhow::Result<()> {
     }
     if connected.is_empty() {
         println!("  \x1b[33m!\x1b[0m no tools connected");
+    }
+
+    // ── 1b. promote skills to user scope (~/.claude/skills) ──────────────────
+    // connect renders skills into <repo>/.claude/skills (project scope), so the
+    // altevra-core skill only loads while working IN that repo. Copy them to the
+    // user-global ~/.claude/skills so the AI knows how to use Altevra in EVERY
+    // project. Touches only skill markdown — never the global settings.json.
+    if !args.no_global_skills && connected.contains(&"claude-code") {
+        let src = args.repo.join(".claude/skills");
+        let dst = altevra_core::home_dir().join(".claude/skills");
+        if src.is_dir() {
+            match copy_skills(&src, &dst) {
+                Ok(n) if n > 0 => println!(
+                    "  \x1b[32m✓\x1b[0m {n} skill(s) promoted to ~/.claude/skills (global)"
+                ),
+                Ok(_) => {}
+                Err(e) => println!("  \x1b[33m!\x1b[0m global skill promotion failed: {e}"),
+            }
+        }
     }
 
     // ── 2. LLM: Claude via `claude -p` (no API key) ──────────────────────────
