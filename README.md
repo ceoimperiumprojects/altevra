@@ -48,6 +48,13 @@ See [LICENSE](./LICENSE) for the full PolyForm Strict 1.0.0 terms.
 
 ## Quick start
 
+**Prerequisites:** [Rust](https://rustup.rs) 1.75+ (`curl https://sh.rustup.rs -sSf | sh`)
+· `git` · Linux/macOS with `systemd --user` for the background services (optional —
+falls back to `altevra brain start`). Optional but recommended: the [`claude`
+CLI](https://docs.claude.com/claude-code) for the zero-API-key LLM. First build
+downloads the ONNX runtime; the first embedding run downloads the BGE‑M3 model
+(~2 GB, one time) — so the very first run needs network + a couple GB of disk.
+
 ### 🔌 Plug-and-play (one command)
 
 ```bash
