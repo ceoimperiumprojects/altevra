@@ -85,6 +85,13 @@ pub enum JobKind {
     /// upserted in wiki_pages (idempotent by topic). Curated, evolving pages —
     /// distinct from raw notes (CLAUDE.md vision: Wiki Layer).
     WikiCurator,
+    /// Proposal materializer: durable-knowledge proposals (person, relationship,
+    /// wiki, insight) that self-improve/resident modes marked `applied` were never
+    /// landing in any queryable table — they sat inert. This drains them into the
+    /// `learnings` table (which auto-indexes into object_index + FTS, so they
+    /// become recall-able). Idempotent by title. Closes the "proposed but never
+    /// materialized" gap (workflow diagnosis 2026-06-18).
+    ProposalMaterializer,
 }
 
 impl JobKind {
@@ -113,6 +120,7 @@ impl JobKind {
             Self::Healer => "healer",
             Self::FileChangeIndexer => "file_change_indexer",
             Self::WikiCurator => "wiki_curator",
+            Self::ProposalMaterializer => "proposal_materializer",
         }
     }
 
@@ -141,6 +149,7 @@ impl JobKind {
             "healer" => Self::Healer,
             "file_change_indexer" => Self::FileChangeIndexer,
             "wiki_curator" => Self::WikiCurator,
+            "proposal_materializer" => Self::ProposalMaterializer,
             _ => return None,
         })
     }
@@ -194,6 +203,9 @@ impl JobKind {
             Self::Healer => 1800,
             Self::FileChangeIndexer => 120,
             Self::WikiCurator => 10800,
+            // Every 30 min: drain applied knowledge-proposals into learnings.
+            // Cheap (a handful of small rows), idempotent, no LLM.
+            Self::ProposalMaterializer => 1800,
         }
     }
 }
@@ -938,6 +950,69 @@ pub async fn run_wiki_curator(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Re
     Ok(JobResult {
         summary: format!("wiki_curator: synthesized {written} living page(s)"),
         items_processed: written,
+    })
+}
+
+/// Proposal materializer: drains durable-knowledge proposals (person, relationship,
+/// wiki, insight) that were marked `applied` but never landed in a queryable table
+/// into the `learnings` table — which auto-indexes into object_index + FTS, so they
+/// become recall-able / packet candidates immediately. person/relationship land as
+/// `personal`/`sensitive` learnings; wiki/insight as `business`/`internal`.
+/// Idempotent: a proposal whose title already exists as a learning is skipped, so
+/// re-scanning every tick is harmless. No LLM. (Closes the "proposed but never
+/// materialized" gap — workflow diagnosis 2026-06-18.)
+pub async fn run_proposal_materializer(
+    pool: &SqlitePool,
+    _ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_db::LearningRow;
+    use sqlx::Row;
+
+    let rows = sqlx::query(
+        "SELECT id, kind, title, body FROM proposals \
+         WHERE status = 'applied' AND kind IN ('person','relationship','wiki','insight')",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    let learnings = altevra_db::LearningsRepository::new(pool);
+    let mut materialized = 0usize;
+    for r in &rows {
+        let title: String = r.get("title");
+        let kind: String = r.get("kind");
+        let body: String = r.get("body");
+        let title = title.trim();
+        if title.is_empty() {
+            continue;
+        }
+        // Idempotent: skip if a learning with this title already exists.
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM learnings WHERE title = ? LIMIT 1")
+                .bind(title)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        if exists.is_some() {
+            continue;
+        }
+        let mut row = LearningRow::new(uuid::Uuid::new_v4().to_string(), title, body);
+        if kind == "person" || kind == "relationship" {
+            row.domain = "personal".into();
+            row.sensitivity = "sensitive".into();
+        }
+        row.provenance = "{\"origin\":\"proposal_materializer\"}".into();
+        if learnings.insert(&row).await.is_ok() {
+            materialized += 1;
+        }
+    }
+
+    Ok(JobResult {
+        summary: format!(
+            "proposal_materializer: materialized {materialized} learning(s) from {} applied proposal(s)",
+            rows.len()
+        ),
+        items_processed: materialized,
     })
 }
 
@@ -2091,6 +2166,7 @@ pub async fn dispatch(
         JobKind::Healer => run_healer(pool, ctx).await,
         JobKind::FileChangeIndexer => run_file_change_indexer(pool, ctx).await,
         JobKind::WikiCurator => run_wiki_curator(pool, ctx).await,
+        JobKind::ProposalMaterializer => run_proposal_materializer(pool, ctx).await,
     }
 }
 
@@ -2245,7 +2321,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 23] {
+pub fn all_kinds() -> [JobKind; 24] {
     [
         JobKind::EventClassifier,
         JobKind::ObserverScan,
@@ -2270,6 +2346,7 @@ pub fn all_kinds() -> [JobKind; 23] {
         JobKind::Healer,
         JobKind::FileChangeIndexer,
         JobKind::WikiCurator,
+        JobKind::ProposalMaterializer,
     ]
 }
 
