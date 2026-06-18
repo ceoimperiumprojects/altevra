@@ -99,6 +99,9 @@ pub enum JobKind {
     /// NEVER overwrites a user-authored skill (sync skips non-managed files).
     /// Pavle's 2026-06-18 directive: "da update-uje skillove, postojeće uključeno."
     SkillSync,
+    /// Resident Brain — the autonomous "what should I do for Pavle now?" loop.
+    /// PUN-YOLO (full shell) when ALTEVRA_RESIDENT_YOLO=1, advisory otherwise.
+    ResidentOrchestrator,
 }
 
 impl JobKind {
@@ -129,6 +132,7 @@ impl JobKind {
             Self::WikiCurator => "wiki_curator",
             Self::ProposalMaterializer => "proposal_materializer",
             Self::SkillSync => "skill_sync",
+            Self::ResidentOrchestrator => "resident_orchestrator",
         }
     }
 
@@ -159,6 +163,7 @@ impl JobKind {
             "wiki_curator" => Self::WikiCurator,
             "proposal_materializer" => Self::ProposalMaterializer,
             "skill_sync" => Self::SkillSync,
+            "resident_orchestrator" => Self::ResidentOrchestrator,
             _ => return None,
         })
     }
@@ -217,6 +222,8 @@ impl JobKind {
             Self::ProposalMaterializer => 1800,
             // Every 6h: keep managed skills fresh + propagated across tools.
             Self::SkillSync => 21600,
+            // Every 3h: the autonomous resident loop (full-shell when YOLO).
+            Self::ResidentOrchestrator => 10800,
         }
     }
 }
@@ -858,6 +865,138 @@ pub async fn run_healer(pool: &SqlitePool, ctx: &JobContext) -> anyhow::Result<J
             if yolo { "YOLO-fix" } else { "advisory" }
         ),
         items_processed: issues.len(),
+    })
+}
+
+/// Resident Brain orchestrator — the autonomous "what should I do for Pavle
+/// right now?" loop (Pavle's 2026-06-18 PUN-YOLO directive). Assembles a state
+/// brief (active goals, open tasks, gaps, recent activity), then a Sonnet agent
+/// with FULL SHELL (claude -p --dangerously-skip-permissions) decides the single
+/// most useful action and does it — research, inspect a folder/the ReVesta CRM,
+/// organize memory, propose a category, fix an Altevra issue. A clear CHARTER in
+/// the prompt fixes WHAT it may do, HOW, and WHEN TO STOP. Every run logs an
+/// audit insight card (kako/kad/zašto). Break-glass: only runs when
+/// `ALTEVRA_RESIDENT_YOLO=1`; advisory (no shell) otherwise.
+pub async fn run_resident_orchestrator(
+    pool: &SqlitePool,
+    ctx: &JobContext,
+) -> anyhow::Result<JobResult> {
+    use altevra_db::{InsightCardRow, InsightCardsRepository};
+    use altevra_llm::{ChatMessage, ChatOpts, ModelRole};
+
+    // --- state brief ---
+    let goals: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM goals WHERE status = 'active' ORDER BY updated_at DESC LIMIT 8",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let tasks: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM tasks WHERE status IN ('active','open','in_progress') \
+         ORDER BY updated_at DESC LIMIT 10",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM turns WHERE created_at > ?",
+    )
+    .bind((ctx.now - chrono::Duration::hours(6)).format("%Y-%m-%dT%H:%M:%S").to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let brief = format!(
+        "Active goals:\n- {}\nOpen tasks:\n- {}\nTurns in last 6h: {recent}",
+        if goals.is_empty() { "(none)".into() } else { goals.join("\n- ") },
+        if tasks.is_empty() { "(none)".into() } else { tasks.join("\n- ") },
+    );
+
+    let yolo = std::env::var("ALTEVRA_RESIDENT_YOLO").map(|v| v == "1").unwrap_or(false);
+
+    // The CHARTER: what it may do, how, and when to stop. Pavle: "pun YOLO sa
+    // jasnim stvarima koje treba da radi i kako, i kada stane."
+    let charter = format!(
+        "You are Pavle's autonomous Resident Brain on his Linux machine, with full shell. \
+         Pavle is an 18-y/o founder (Imperium Tech); active directive: STOP BUILDING, START \
+         SELLING — 2 paid ReVesta/Simple Surplus clients. His state right now:\n{brief}\n\n\
+         CHOOSE THE SINGLE most useful action and DO IT, then report what + WHY. \
+         WHAT YOU MAY DO:\n\
+         1. Research a topic that directly advances an ACTIVE goal or a stated interest.\n\
+         2. Inspect a folder or the ReVesta CRM (~/projekti/biznis/revesta-crm) and surface findings.\n\
+         3. Organize/capture memory: write a useful note, decision, or learning via `altevra` CLI.\n\
+         4. Propose a new category ONLY if recurring content clearly needs one — state the rule (when/why).\n\
+         5. Fix a clear Altevra/system issue.\n\
+         HOW:\n\
+         - RELEVANCE GATE: act ONLY if it genuinely advances a goal/interest or fixes a real problem. \
+         NO busywork, NO trivia/entertainment research (no Minecraft modpacks). \
+         - Small, single, focused action per run. Never invent facts. Respect sensitivity — never \
+         exfiltrate personal data anywhere external. \
+         WHEN TO STOP / NEVER:\n\
+         - If nothing is genuinely useful right now → DO NOTHING and say 'no useful action'. \
+         - NEVER send email/DM, make payments, deploy, or run destructive ops (rm -rf, force-push). \
+         If such a thing seems needed, just RECOMMEND it for Pavle — do not execute. \
+         - NEVER touch ~/Obsidian or ~/projekti destructively; reading is fine. \
+         - Respect GTM discipline: don't build side-quests; revenue/clients first. \
+         Report: ACTION taken (or none) + WHY, in 3-5 lines."
+    );
+
+    let report = if yolo {
+        match tokio::process::Command::new("claude")
+            .args([
+                "-p",
+                &charter,
+                "--dangerously-skip-permissions",
+                "--model",
+                "claude-sonnet-4-6",
+                "--output-format",
+                "text",
+            ])
+            .current_dir(altevra_core::home_dir())
+            .output()
+            .await
+        {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            Err(e) => format!("resident orchestrator exec failed: {e}"),
+        }
+    } else {
+        // Advisory: reason about what it WOULD do, no shell, no mutation.
+        let provider = ctx.router.resolve(ModelRole::StrongReasoner);
+        if provider.id() == "noop" {
+            "resident orchestrator: no LLM configured (advisory)".to_string()
+        } else {
+            let messages = vec![
+                ChatMessage::system(
+                    "You are Pavle's resident brain. Given his state, name the SINGLE most \
+                     useful action to take and why (or 'no useful action'). No preamble. \
+                     Advisory only — propose, don't act.",
+                ),
+                ChatMessage::user(brief.clone()),
+            ];
+            provider
+                .complete(&messages, &ChatOpts::default().with_max_tokens(300))
+                .await
+                .unwrap_or_else(|e| format!("advisory failed: {e}"))
+        }
+    };
+
+    // Audit card: kako/kad/zašto.
+    let id = format!("resident-{}", ctx.now.format("%Y%m%dT%H%M%S"));
+    let title = format!(
+        "Resident Brain ({}) — {}",
+        if yolo { "YOLO" } else { "advisory" },
+        report.lines().next().unwrap_or("").chars().take(80).collect::<String>()
+    );
+    let card = InsightCardRow::new(id, title, format!("STATE:\n{brief}\n\nACTION/REASONING:\n{report}"));
+    let _ = InsightCardsRepository::new(pool).insert(&card).await;
+
+    Ok(JobResult {
+        summary: format!(
+            "resident_orchestrator: {} mode, {} goal(s)/{} task(s) in view",
+            if yolo { "YOLO" } else { "advisory" },
+            goals.len(),
+            tasks.len()
+        ),
+        items_processed: 1,
     })
 }
 
@@ -2302,6 +2441,7 @@ pub async fn dispatch(
         JobKind::WikiCurator => run_wiki_curator(pool, ctx).await,
         JobKind::ProposalMaterializer => run_proposal_materializer(pool, ctx).await,
         JobKind::SkillSync => run_skill_sync(pool, ctx).await,
+        JobKind::ResidentOrchestrator => run_resident_orchestrator(pool, ctx).await,
     }
 }
 
@@ -2456,7 +2596,7 @@ pub async fn run_lifecycle_archiver(
 /// Iterate every job kind. Kept as a single source of truth so a new variant
 /// added to [`JobKind`] is automatically picked up by the scheduler loop AND
 /// by `roundtrip`-style tests.
-pub fn all_kinds() -> [JobKind; 25] {
+pub fn all_kinds() -> [JobKind; 26] {
     [
         JobKind::EventClassifier,
         // Cheap, no-LLM, idempotent — run early so it isn't starved behind the
@@ -2485,6 +2625,7 @@ pub fn all_kinds() -> [JobKind; 25] {
         JobKind::Healer,
         JobKind::FileChangeIndexer,
         JobKind::WikiCurator,
+        JobKind::ResidentOrchestrator,
     ]
 }
 
