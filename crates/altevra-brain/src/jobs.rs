@@ -2324,6 +2324,9 @@ pub async fn run_lifecycle_archiver(
 pub fn all_kinds() -> [JobKind; 24] {
     [
         JobKind::EventClassifier,
+        // Cheap, no-LLM, idempotent — run early so it isn't starved behind the
+        // expensive LLM jobs (a full cycle of claude -p calls can take minutes).
+        JobKind::ProposalMaterializer,
         JobKind::ObserverScan,
         JobKind::VaultIndexer,
         JobKind::InsightSynthesizer,
@@ -2346,7 +2349,6 @@ pub fn all_kinds() -> [JobKind; 24] {
         JobKind::Healer,
         JobKind::FileChangeIndexer,
         JobKind::WikiCurator,
-        JobKind::ProposalMaterializer,
     ]
 }
 
