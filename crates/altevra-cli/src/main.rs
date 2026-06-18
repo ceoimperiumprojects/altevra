@@ -152,6 +152,12 @@ enum Commands {
     /// finder: recall gives hits, `ask` gives an answer.
     Ask(commands::ask::AskArgs),
 
+    /// HUGE ASK — heavy artillery. Fans out parallel Sonnet agents (full shell)
+    /// across brain + whole computer + web, then Opus synthesizes one definitive
+    /// answer. Slow + powerful; use rarely.
+    #[command(name = "huge-ask")]
+    HugeAsk(commands::huge_ask::HugeAskArgs),
+
     /// Capture a markdown note (Obsidian etc.) into the brain through the safety
     /// gate — redacts secrets/PII, infers domain, persists + indexes for recall.
     Capture(commands::capture::CaptureArgs),
@@ -286,6 +292,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::TurnSearch(args) => commands::turn_search::run(args).await,
         Commands::Recall(args) => commands::recall::run(args).await,
         Commands::Ask(args) => commands::ask::run(args).await,
+        Commands::HugeAsk(args) => commands::huge_ask::run(args).await,
         Commands::Capture(args) => commands::capture::run(args).await,
         Commands::Files(cmd) => commands::files::run(cmd).await,
         Commands::HookHandle(args) => commands::hook_handle::run(args).await,

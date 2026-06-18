@@ -33,6 +33,7 @@ pub mod note;
 pub mod observer;
 pub mod prompt;
 pub mod ask;
+pub mod huge_ask;
 pub mod recall;
 pub mod research;
 pub mod resident;
