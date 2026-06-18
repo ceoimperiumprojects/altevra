@@ -30,3 +30,10 @@ graphify-out/
 /.altevra/
 **/.altevra/
 .fastembed_cache/
+
+# per-machine connect artifacts written by `altevra connect` / `setup all`
+# (the repo's own integration is Claude Code, tracked under .claude/; these
+# are regenerated per-user, so they're noise in a clone)
+/.cursor/
+/.gemini/
+/.agent/

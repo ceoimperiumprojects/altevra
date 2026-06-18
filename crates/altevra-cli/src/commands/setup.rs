@@ -123,6 +123,16 @@ async fn run_all(args: SetupAllArgs) -> anyhow::Result<()> {
 
     // ── 1. connect every adapter (best-effort; skip ones that fail) ──────────
     println!("\n\x1b[1;31m▸ Connecting AI tools (auto-detect)\x1b[0m");
+    // Skills are rendered from the `06-skills/` source in the connect repo dir.
+    // If it's missing, the AI-teaching skills won't render — make that visible
+    // rather than silently shipping a connect with zero skills.
+    if !args.repo.join("06-skills").is_dir() {
+        println!(
+            "  \x1b[33m!\x1b[0m no `06-skills/` in {} — skills won't render. \
+             Run this from the Altevra repo (or pass --repo <repo>).",
+            args.repo.display()
+        );
+    }
     let mut connected = Vec::new();
     for tool in ["claude-code", "codex", "cursor", "antigravity"] {
         let connect_args = ConnectArgs {

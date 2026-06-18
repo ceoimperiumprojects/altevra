@@ -44,7 +44,9 @@ ok "~/.altevra ready"
 # ── 4. connect tools + LLM + services (native one-shot wizard) ────────────────
 # Everything after the build is delegated to `altevra setup all`, the native
 # wizard — one source of truth. Re-run `altevra setup all` any time to repair.
-"$ALT" setup all
+# Run from the repo so the skills source (06-skills/) is found regardless of
+# where `bash setup.sh` was invoked from.
+( cd "$REPO" && "$ALT" setup all )
 
 say "Done. Altevra is live."
 echo "  Try:  altevra recall \"what did I work on\"  ·  altevra brain status"
