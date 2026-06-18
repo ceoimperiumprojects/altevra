@@ -206,6 +206,158 @@ pub fn handle_search_turns(id: Value, args: &Value) -> McpResponse {
     }
 }
 
+/// `search_files` — search the indexed FILE content (file-watcher: all work
+/// outside AI sessions — Desktop/Documents/projekti/Obsidian → memory_chunks).
+/// Keyword (tokenized, every term must appear) by default; `semantic=true` ranks
+/// by MEANING via BGE-M3 vectors (needs the embedding build). Time-windowable.
+/// Per Pavle's 2026-06-18 decision the MCP exposes full content (no redaction
+/// gate) — the owner authorized it.
+pub fn handle_search_files(id: Value, args: &Value) -> McpResponse {
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(10);
+    let semantic = args.get("semantic").and_then(|v| v.as_bool()).unwrap_or(false);
+    let db_path = db_path_from_args(args);
+    if query.trim().is_empty() {
+        return McpResponse::error(id, -32602, "query required");
+    }
+
+    let now = chrono::Utc::now();
+    let mut t_since = None;
+    let mut t_until = None;
+    if let Some(w) = args.get("window").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_window(w, now) {
+            Some(r) => {
+                t_since = Some(r.since);
+                t_until = Some(r.until);
+            }
+            None => return McpResponse::error(id, -32602, format!("unknown window '{w}'")),
+        }
+    }
+    if let Some(s) = args.get("since").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(s, now) {
+            Some(t) => t_since = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'since' '{s}'")),
+        }
+    }
+    if let Some(u) = args.get("until").and_then(|v| v.as_str()) {
+        match altevra_core::time_window::parse_since_until(u, now) {
+            Some(t) => t_until = Some(t),
+            None => return McpResponse::error(id, -32602, format!("invalid 'until' '{u}'")),
+        }
+    }
+
+    let in_window = |t: chrono::DateTime<chrono::Utc>| {
+        t_since.map(|s| t >= s).unwrap_or(true) && t_until.map(|u| t < u).unwrap_or(true)
+    };
+
+    let result: anyhow::Result<Value> = futures::executor::block_on(async {
+        use sqlx::Row;
+        let pool = open_pool(&db_path).await?;
+
+        // (text, created_at, source_path) candidates — semantic or keyword.
+        let mut rows: Vec<(String, chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+        let mut mode = "keyword";
+
+        #[cfg(feature = "embedding")]
+        if semantic {
+            mode = "semantic";
+            if let Ok(embedder) = altevra_memory::Bge3Embedder::new() {
+                if let Ok(emb) = altevra_memory::AsyncEmbeddingProvider::embed(&embedder, query).await {
+                    let ranked = altevra_memory::search_by_vector(
+                        &pool, &emb.vector, altevra_memory::BGE_M3_MODEL, limit * 8,
+                    )
+                    .await
+                    .unwrap_or_default();
+                    for (chunk_id, _score) in ranked {
+                        if let Ok(Some(r)) = sqlx::query(
+                            "SELECT mc.text AS text, mc.created_at AS created_at, \
+                                    COALESCE(md.source_path,'') AS source_path \
+                             FROM memory_chunks mc \
+                             LEFT JOIN memory_documents md ON md.id = mc.document_id \
+                             WHERE mc.id = ?",
+                        )
+                        .bind(chunk_id.to_string())
+                        .fetch_optional(&pool)
+                        .await
+                        {
+                            let created = chrono::DateTime::parse_from_rfc3339(
+                                &r.get::<String, _>("created_at"),
+                            )
+                            .map(|d| d.with_timezone(&chrono::Utc))
+                            .unwrap_or(now);
+                            rows.push((r.get("text"), created, r.get("source_path")));
+                        }
+                    }
+                }
+            }
+        }
+
+        if rows.is_empty() {
+            // keyword: every whitespace term must appear (AND), any order.
+            let terms: Vec<String> = query
+                .split_whitespace()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("%{t}%"))
+                .collect();
+            let where_clause = vec!["mc.text LIKE ?"; terms.len().max(1)].join(" AND ");
+            let sql = format!(
+                "SELECT mc.text AS text, mc.created_at AS created_at, \
+                        COALESCE(md.source_path,'') AS source_path \
+                 FROM memory_chunks mc \
+                 LEFT JOIN memory_documents md ON md.id = mc.document_id \
+                 WHERE {where_clause} ORDER BY mc.created_at DESC LIMIT ?"
+            );
+            let mut q = sqlx::query(&sql);
+            for t in &terms {
+                q = q.bind(t);
+            }
+            let fetched = q.bind(limit * 8).fetch_all(&pool).await.unwrap_or_default();
+            for r in fetched {
+                let created = chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("created_at"))
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .unwrap_or(now);
+                rows.push((r.get("text"), created, r.get("source_path")));
+            }
+        }
+
+        // Time-filter + dedup one hit per file, cap at limit.
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (text, created, source_path) in rows {
+            if !in_window(created) {
+                continue;
+            }
+            let key = if source_path.is_empty() { text.clone() } else { source_path.clone() };
+            if !seen.insert(key) {
+                continue;
+            }
+            let when_h = altevra_core::time_window::humanize_relative(created, now);
+            out.push(serde_json::json!({
+                "snippet": text.chars().take(220).collect::<String>(),
+                "source_path": source_path,
+                "created_at": created,
+                "provenance": { "when_human": when_h, "breadcrumb": format!("file · {when_h}") },
+            }));
+            if out.len() as i64 >= limit {
+                break;
+            }
+        }
+
+        Ok(serde_json::json!({
+            "query": query,
+            "mode": mode,
+            "count": out.len(),
+            "window": t_since.map(|s| serde_json::json!({"since": s, "until": t_until})),
+            "results": out,
+        }))
+    });
+
+    match result {
+        Ok(v) => McpResponse::ok(id, v),
+        Err(e) => McpResponse::error(id, -32603, e.to_string()),
+    }
+}
+
 /// `recall_window` — recent memory by TIME with NO search query. Lists the most
 /// recent recorded turns within a window (newest first), each gated + breadcrumbed.
 /// Defaults to `last_week` when no `window`/`since`/`until` is given. Same R11 #4

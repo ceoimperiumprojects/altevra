@@ -476,6 +476,27 @@ pub fn list_tools() -> Value {
         ),
     ));
     tools.push(tool(
+        "search_files",
+        "Search INDEXED FILE content — all work captured outside AI sessions \
+         (Desktop, Documents, projekti, Obsidian → 35k+ documents). Keyword by \
+         default (every term must appear, any order); pass `semantic: true` to \
+         rank by MEANING (BGE-M3 vectors) — finds related work even when the \
+         exact words differ. Time-windowable via `window`/`since`/`until`. \
+         Complements `search_turns` (AI sessions) for full context-based recall.",
+        obj_schema(
+            &["query"],
+            serde_json::json!({
+                "query": {"type": "string"},
+                "semantic": {"type": "boolean", "description": "Rank by meaning (vector) instead of keyword. Default false."},
+                "limit": {"type": "integer"},
+                "db_path": {"type": "string"},
+                "window": {"type": "string", "description": "Preset (last_24h|last_week|last_month|…) or duration (24h|7d|30d|3mo|1y)."},
+                "since": {"type": "string", "description": "RFC3339, YYYY-MM-DD, or duration (e.g. 30d = now-30d)."},
+                "until": {"type": "string", "description": "Same formats as since (default: now)."},
+            }),
+        ),
+    ));
+    tools.push(tool(
         "recall_window",
         "Recent memory by TIME, with NO search query — \"what happened in the last \
          week\". Lists the most recent recorded turns within a window, newest first, \
@@ -752,6 +773,7 @@ impl McpServer {
             // v0.3.7: Replay & Query
             "replay_session" => crate::tools_sessions::handle_replay_session(id, args),
             "search_turns" => crate::tools_sessions::handle_search_turns(id, args),
+            "search_files" => crate::tools_sessions::handle_search_files(id, args),
             "recall_window" => crate::tools_sessions::handle_recall_window(id, args),
             "recall_about" => {
                 crate::tools_sessions::handle_recall_about(id, args, &self.vault_path)

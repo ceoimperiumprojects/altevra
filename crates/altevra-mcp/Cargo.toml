@@ -3,6 +3,11 @@ name = "altevra-mcp"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Enables semantic (BGE-M3 vector) file search in the MCP `search_files` tool.
+# Off by default; the `altevra` binary turns it on via `--features embedding`.
+embedding = ["altevra-memory/embedding"]
+
 [dependencies]
 altevra-core = { workspace = true }
 altevra-skills = { workspace = true }

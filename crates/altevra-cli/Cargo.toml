@@ -16,7 +16,7 @@ path = "src/main.rs"
 #   ExecStart=/home/pavle/.local/bin/altevra embed run --bge \
 #             --db /home/pavle/.altevra/altevra.db
 [features]
-embedding = ["altevra-memory/embedding"]
+embedding = ["altevra-memory/embedding", "altevra-mcp/embedding"]
 
 [dependencies]
 altevra-core = { workspace = true }
