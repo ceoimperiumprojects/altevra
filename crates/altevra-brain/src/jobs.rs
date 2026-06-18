@@ -2375,6 +2375,7 @@ pub fn all_kinds() -> [JobKind; 25] {
         // Cheap, no-LLM, idempotent — run early so it isn't starved behind the
         // expensive LLM jobs (a full cycle of claude -p calls can take minutes).
         JobKind::ProposalMaterializer,
+        JobKind::SkillSync,
         JobKind::ObserverScan,
         JobKind::VaultIndexer,
         JobKind::InsightSynthesizer,
@@ -2397,7 +2398,6 @@ pub fn all_kinds() -> [JobKind; 25] {
         JobKind::Healer,
         JobKind::FileChangeIndexer,
         JobKind::WikiCurator,
-        JobKind::SkillSync,
     ]
 }
 
