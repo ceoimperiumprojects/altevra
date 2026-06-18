@@ -409,7 +409,30 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
         )
         .await?;
 
+        // Claim the WHOLE batch as in_progress in ONE write, by the exact
+        // chunk_ids we just SELECTed. Previously this was one UPDATE per chunk
+        // (100 writes/batch) — each contending for the SQLite write lock with
+        // the brain daemon, which is what produced the multi-second per-query
+        // latencies and stalled the 35k backlog. Atomic because there is only
+        // one embedder and we bind explicit ids (no LIMIT-subquery race).
+        let claimed_ids: Vec<String> =
+            rows.iter().map(|r| r.get::<String, _>("chunk_id")).collect();
+        if !claimed_ids.is_empty() {
+            let placeholders = vec!["?"; claimed_ids.len()].join(",");
+            let sql = format!(
+                "UPDATE embedder_queue \
+                 SET status = 'in_progress', started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE chunk_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in &claimed_ids {
+                q = q.bind(id);
+            }
+            let _ = q.execute(&self.pool).await;
+        }
+
         let mut success = 0usize;
+        let mut done_ids: Vec<String> = Vec::with_capacity(rows.len());
         for row in rows {
             let chunk_id_text: String = row.get("chunk_id");
             let text: String = row.get("text");
@@ -417,17 +440,6 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
                 Ok(id) => id,
                 Err(_) => continue,
             };
-
-            // Mark in_progress.
-            let _ = sqlx::query(
-                r#"UPDATE embedder_queue
-                   SET status = 'in_progress',
-                       started_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                   WHERE chunk_id = ?"#,
-            )
-            .bind(&chunk_id_text)
-            .execute(&self.pool)
-            .await;
 
             // Rate-limit before each embed call.
             // Manual snapshot/drop pattern: pull state from the guard, drop it
@@ -471,22 +483,34 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
                             .await;
                         continue;
                     }
-                    let _ = sqlx::query(
-                        r#"UPDATE embedder_queue
-                           SET status = 'done',
-                               finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                               last_error = NULL
-                           WHERE chunk_id = ?"#,
-                    )
-                    .bind(&chunk_id_text)
-                    .execute(&self.pool)
-                    .await;
+                    // Defer the 'done' write — collected and flushed in ONE
+                    // batched UPDATE after the loop (see below) to cut write-lock
+                    // contention. The vector itself is already durably written
+                    // above, so a crash before the flush just re-embeds (the
+                    // vector write is an idempotent upsert) — never data loss.
+                    done_ids.push(chunk_id_text);
                     success += 1;
                 }
                 Err(e) => {
                     self.mark_failed(&chunk_id_text, &e.to_string()).await;
                 }
             }
+        }
+
+        // Flush all successes to 'done' in ONE write.
+        if !done_ids.is_empty() {
+            let placeholders = vec!["?"; done_ids.len()].join(",");
+            let sql = format!(
+                "UPDATE embedder_queue \
+                 SET status = 'done', finished_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                     last_error = NULL \
+                 WHERE chunk_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(&sql);
+            for id in &done_ids {
+                q = q.bind(id);
+            }
+            let _ = q.execute(&self.pool).await;
         }
         Ok(success)
     }
@@ -540,6 +564,13 @@ impl<E: AsyncEmbeddingProvider + 'static> EmbedderWorker<E> {
 
     /// Loop forever until shutdown_rx flips to true.
     pub async fn run(self, mut shutdown_rx: watch::Receiver<bool>) -> anyhow::Result<()> {
+        // Crash recovery: a previous run may have died mid-batch, leaving rows
+        // stranded in 'in_progress'. There is only ever one embedder, so at
+        // startup any 'in_progress' row is stale — reset it to 'pending' so the
+        // batched claim/done path (below) can't permanently strand work.
+        let _ = sqlx::query("UPDATE embedder_queue SET status = 'pending' WHERE status = 'in_progress'")
+            .execute(&self.pool)
+            .await;
         loop {
             if *shutdown_rx.borrow() {
                 break;
