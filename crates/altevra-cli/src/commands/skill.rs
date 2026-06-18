@@ -24,6 +24,31 @@ pub enum SkillCommands {
     /// Propagate skills across tools. DRY-RUN by default — pass --apply to write.
     /// Never overwrites a non-managed (user-authored) file.
     Sync(SkillSyncArgs),
+    /// Review + promote skill-factory drafts. Lists `staged` skills (the factory's
+    /// auto-drafted candidates) so you can review them; `--apply` writes the
+    /// approved one(s) to the vault `06-skills/` source (cleaning the LLM preamble
+    /// and using the real frontmatter slug) and marks them active. After promoting,
+    /// run `altevra setup` / `altevra connect` to render them to your AI tools.
+    /// Honors the review gate — nothing reaches an adapter without this step.
+    Promote(SkillPromoteArgs),
+}
+
+#[derive(Args)]
+pub struct SkillPromoteArgs {
+    /// Only act on the staged skill whose DB slug or frontmatter slug contains this.
+    #[arg(long)]
+    pub slug: Option<String>,
+    /// Actually write to 06-skills/ + mark active. Without it, only previews.
+    #[arg(long)]
+    pub apply: bool,
+    /// Vault root (06-skills/ lives under it). Defaults to the USER vault
+    /// (~/.altevra/vault) — NOT the repo's tracked 06-skills/ — so personal
+    /// factory drafts never get committed to the shipped skill source.
+    #[arg(long, default_value_os_t = altevra_core::default_vault_path())]
+    pub vault: PathBuf,
+    /// Path to the Altevra SQLite database.
+    #[arg(long, default_value_os_t = altevra_core::default_db_path())]
+    pub db: PathBuf,
 }
 
 #[derive(Args)]
@@ -122,7 +147,83 @@ pub async fn run(cmd: SkillCommands) -> anyhow::Result<()> {
         SkillCommands::Refresh(args) => run_refresh(args).await,
         SkillCommands::Inventory(args) => run_inventory(args).await,
         SkillCommands::Sync(args) => run_sync(args).await,
+        SkillCommands::Promote(args) => run_promote(args).await,
     }
+}
+
+/// A SKILL.md drafted by the LLM factory often has a one-line preamble before the
+/// `---` frontmatter ("Based on the project context, I have enough to draft…").
+/// Return the markdown from the first `---` line onward so the promoted file is a
+/// clean, parseable SKILL.md.
+fn clean_skill_md(content: &str) -> &str {
+    match content.find("\n---") {
+        // preamble + "\n---…" → keep from the "---"
+        Some(_) if !content.trim_start().starts_with("---") => {
+            let idx = content.find("---").unwrap_or(0);
+            content[idx..].trim_start()
+        }
+        _ => content.trim_start(),
+    }
+}
+
+async fn run_promote(args: SkillPromoteArgs) -> anyhow::Result<()> {
+    use sqlx::Row;
+    let pool = altevra_db::create_pool(&args.db.to_string_lossy()).await?;
+    let staged = sqlx::query("SELECT slug, content FROM skills WHERE status = 'staged' ORDER BY created_at")
+        .fetch_all(&pool)
+        .await?;
+    if staged.is_empty() {
+        println!("No staged skills. (The skill factory drafts candidates here once it sees repeated tool-use patterns.)");
+        return Ok(());
+    }
+
+    let dir = args.vault.join("06-skills");
+    let mut promoted = 0usize;
+    println!(
+        "{} staged skill(s){}:\n",
+        staged.len(),
+        if args.apply { " — promoting" } else { " (preview; pass --apply to promote)" }
+    );
+    for row in &staged {
+        let db_slug: String = row.get("slug");
+        let content: String = row.get("content");
+        let clean = clean_skill_md(&content);
+        // Validate + get the real slug from the frontmatter.
+        let parsed = match parse_skill(clean) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("  ✗ {db_slug} — unparseable, skipped ({e})");
+                continue;
+            }
+        };
+        let real_slug = parsed.slug();
+        if let Some(filter) = args.slug.as_deref() {
+            if !db_slug.contains(filter) && !real_slug.contains(filter) {
+                continue;
+            }
+        }
+        let title = &parsed.frontmatter.title;
+        if !args.apply {
+            println!("  • {real_slug} — {title}\n      (db: {db_slug}, {} bytes)", clean.len());
+            continue;
+        }
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{real_slug}.md"));
+        std::fs::write(&path, clean)?;
+        sqlx::query("UPDATE skills SET status = 'active', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE slug = ?")
+            .bind(&db_slug)
+            .execute(&pool)
+            .await?;
+        println!("  ✓ {real_slug} → {}", path.display());
+        promoted += 1;
+    }
+    if args.apply {
+        println!(
+            "\nPromoted {promoted} skill(s) to {}. Run `altevra setup` (or `altevra connect --tool <tool>`) to render them to your AI tools.",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Resolve where a tool keeps its skills on disk. Mirrors `default_skill_dirs`
