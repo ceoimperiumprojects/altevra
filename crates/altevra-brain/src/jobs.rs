@@ -309,13 +309,17 @@ pub async fn run_personal_extractor(
     let messages = vec![
         ChatMessage::system(
             "You extract DURABLE personal-brain facts from an activity log. Return ONLY \
-             compact JSON, no markdown, no prose: \
+             compact JSON, no markdown, no prose. ALWAYS include all three keys, using \
+             empty arrays when nothing qualifies: \
              {\"persons\":[{\"name\":\"\",\"note\":\"\"}],\
              \"decisions\":[{\"title\":\"\",\"rationale\":\"\"}],\
              \"goals\":[{\"title\":\"\"}]}. \
-             Include ONLY things EXPLICITLY stated by the user — real people met, \
-             concrete decisions made, concrete goals set. NEVER invent. Use empty \
-             arrays when nothing qualifies. Keep each field short.",
+             persons = any REAL named person mentioned with context — mentors, partner, \
+             family, clients, colleagues, friends, investors, contacts. Capture their \
+             name and a short note on who they are or why they matter. \
+             decisions = concrete decisions made. goals = concrete goals set. \
+             Base everything ONLY on what the activity log actually says — NEVER invent \
+             people, decisions, or goals that aren't there. Keep each field short.",
         ),
         ChatMessage::user(format!("Activity log (oldest first):\n{block}")),
     ];
@@ -340,7 +344,21 @@ pub async fn run_personal_extractor(
     };
     let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap_or(serde_json::json!({}));
 
+    // Per-category counts of what the LLM actually returned — so a stuck category
+    // (e.g. persons always 0) is visible in the job summary instead of hidden
+    // behind a single "materialized N" number.
+    let llm_persons = parsed.get("persons").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+    let llm_decisions = parsed.get("decisions").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+    let llm_goals = parsed.get("goals").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+    tracing::debug!(
+        persons = llm_persons,
+        decisions = llm_decisions,
+        goals = llm_goals,
+        "personal_extractor: LLM returned"
+    );
+
     let mut materialized = 0usize;
+    let mut persons_saved = 0usize;
     let persons = PersonalNotesRepository::new(pool);
     if let Some(arr) = parsed.get("persons").and_then(|v| v.as_array()) {
         for p in arr {
@@ -353,6 +371,7 @@ pub async fn run_personal_extractor(
                 let note = p.get("note").and_then(|v| v.as_str()).filter(|s| !s.is_empty());
                 if persons.upsert_person(name, note).await.is_ok() {
                     materialized += 1;
+                    persons_saved += 1;
                 }
             }
         }
@@ -427,7 +446,11 @@ pub async fn run_personal_extractor(
     }
 
     Ok(JobResult {
-        summary: format!("personal_extractor: materialized {materialized} fact(s)"),
+        summary: format!(
+            "personal_extractor: materialized {materialized} fact(s) \
+             (persons {persons_saved}/{llm_persons}, decisions+goals from {} llm items)",
+            llm_decisions + llm_goals
+        ),
         items_processed: materialized,
     })
 }
