@@ -133,6 +133,49 @@ pub async fn run(args: AskArgs) -> anyhow::Result<()> {
         }
     }
 
+    // 4. SEMANTIC file content — embed the question and pull nearest chunks by
+    //    meaning. Catches paraphrase + cross-language (a Serbian question hitting
+    //    an English note) that keyword retrieval misses. The smarter half of the
+    //    finder. (Only when built with the embedding feature.)
+    #[cfg(feature = "embedding")]
+    {
+        use altevra_memory::{search_by_vector, AsyncEmbeddingProvider, Bge3Embedder, BGE_M3_MODEL};
+        use sqlx::Row;
+        if let Ok(embedder) = Bge3Embedder::new() {
+            if let Ok(emb) = embedder.embed(&args.question).await {
+                let ranked = search_by_vector(&pool, &emb.vector, BGE_M3_MODEL, args.limit)
+                    .await
+                    .unwrap_or_default();
+                for (chunk_id, _score) in ranked {
+                    if let Ok(Some(r)) = sqlx::query(
+                        "SELECT mc.text AS text, mc.created_at AS created_at, \
+                                COALESCE(md.source_path,'') AS source_path \
+                         FROM memory_chunks mc LEFT JOIN memory_documents md ON md.id = mc.document_id \
+                         WHERE mc.id = ?",
+                    )
+                    .bind(chunk_id.to_string())
+                    .fetch_optional(&pool)
+                    .await
+                    {
+                        let when = chrono::DateTime::parse_from_rfc3339(&r.get::<String, _>("created_at"))
+                            .map(|d| d.with_timezone(&Utc))
+                            .unwrap_or(now);
+                        if !in_window(when, t_since, t_until) {
+                            continue;
+                        }
+                        let path: String = r.get("source_path");
+                        let label = path.trim_start_matches("./");
+                        let snip = r.get::<String, _>("text").chars().take(400).collect::<String>();
+                        ctx_lines.push(format!("[~meaning · {label}] {snip}"));
+                        if !label.is_empty() {
+                            sources.push(label.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if ctx_lines.is_empty() {
         println!("No matching context in your second brain for: \"{}\"", args.question);
         return Ok(());
